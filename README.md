@@ -76,7 +76,7 @@ public int[] processFrame(byte[] rawGrayscaleData, int width, int height)
 | Index | Name | Range | Meaning |
 |---|---|---|---|
 | `result[0]` | **Steering** | `-100 … +100` | `0` = line is centred. Negative = line is to the left, turn left. Positive = line is to the right, turn right. |
-| `result[1]` | **Tracking** | `0 … 100` | `100` = straight path ahead, full speed. Drops toward `0` as a turn or curve is detected. `0` = hard turn or line lost, brake/stop. |
+| `result[1]` | **Tracking** | `2 … 100` | `100` = straight path ahead, full speed. Drops as a turn or curve is detected. Never falls below `Config.trackingMinValue` (default **2**), so the robot is never sent a full stop. Set that field to `0` for the full 0–100 range. |
 
 **Typical robot wiring:**
 
@@ -132,9 +132,24 @@ pipeline.configure(cfg);  // must be called BEFORE the first processFrame()
 | Field | Type | Default | Description |
 |---|---|---|---|
 | `minWeightFrac` | `float` | `0.01f` | Minimum fraction of scan strip pixels that must be "track" to trust the detection. Raise to reject weak signals. |
-| `trackOffsetFullFrac` | `float` | `1.0f` | How far the look-ahead line must lean (as a fraction of half-frame width) to push Tracking to `0`. Lower (e.g. `0.6`) makes turns read earlier. |
+| `trackOffsetFullFrac` | `float` | `1.0f` | How far the look-ahead line must lean (as a fraction of half-frame width) to push Tracking to its minimum. Lower (e.g. `0.6`) makes turns read earlier. |
+| `trackingMinValue` | `int` | `2` | Floor for the Tracking output. `result[1]` will never go below this value, so the robot never receives a full stop signal. Set to `0` to allow the full 0–100 range. |
 
-### Calibration
+### Tracking Minimum Value
+
+By default the Tracking output **never reaches zero**. `result[1]` is clamped to a floor of **2**, so the robot always receives at least a small speed signal. This prevents mechanical problems caused by a complete stop command.
+
+| Value | Effect |
+|---|---|
+| `2` *(default)* | Tracking minimum is 2 — the robot always gets at least a tiny speed signal. |
+| `3` | Raise the floor further. |
+| `0` | Disable the floor — allow the full 0–100 range. |
+
+```java
+cfg.trackingMinValue = 2;   // set before calling pipeline.configure(cfg)
+```
+
+### Calibration Frames
 
 | Field | Type | Default | Description |
 |---|---|---|---|
@@ -179,6 +194,128 @@ pipeline.getElapsedSeconds()    // wall-clock seconds since first frame
 pipeline.isCalibrated()         // true once the straight-ahead reference is captured
 pipeline.requestRecalibration() // resets calibration — must call calibrate() again before processFrame()
 pipeline.release()              // shut down and reset
+pipeline.setFrameCallback(cb)   // register overlay callback; pass null to unregister
+```
+
+---
+
+## Frame Callback — Overlay Geometry
+
+Register a single callback once, and the library calls it automatically on **every calibration frame and every `processFrame()` frame**, passing a `FrameData` object with all the geometry needed to draw a visual overlay: the H-ROI strip, the V-ROI look-ahead band, the dynamic road path, and the live centroid.
+
+> 💡 No extra computation is added. The data already exists inside the pipeline — the callback just packages and delivers it. Performance impact is roughly **0.02 ms per frame**.
+
+### Register the callback
+
+```java
+pipeline.setFrameCallback(data -> {
+    // called automatically every frame
+    // use data fields to draw your overlay
+});
+
+// To unregister:
+pipeline.setFrameCallback(null);
+```
+
+> ⚠️ **Important:** the same `FrameData` instance is reused on every call. Copy any fields you need to keep beyond the current frame.
+
+### FrameData Fields
+
+| Field | Type | Description |
+|---|---|---|
+| `hRoiTopFrac` | `float` | H-ROI top edge — fraction of frame height. |
+| `hRoiBotFrac` | `float` | H-ROI bottom edge — fraction of frame height. |
+| `vRoiTopFrac` | `float` | V-ROI far (top) edge — fraction of frame height. |
+| `steerRefXFrac` | `float` | Calibrated straight-ahead column for steering — fraction of frame width. |
+| `trackRefXFrac` | `float` | Calibrated straight-ahead column for look-ahead — fraction of frame width. |
+| `halfBotFrac` | `float` | Near (bottom) half-width of the V-ROI box — fraction of frame width. |
+| `halfTopFrac` | `float` | Far (top) half-width of the V-ROI box — fraction of frame width. Smaller than `halfBotFrac` due to perspective taper. |
+| `centroidXFrac` | `float` | Live detected line position — fraction of frame width. `-1` if the line was not found. |
+| `lookAheadColFrac[]` | `float[]` | Column positions of the dynamic road poly-line, nearest to farthest. Array size **48**. |
+| `lookAheadRowFrac[]` | `float[]` | Row positions of the dynamic road poly-line, nearest to farthest. Array size **48**. |
+| `lookAheadPointCount` | `int` | Number of valid points in the path arrays. Only read up to this index. |
+| `trackFound` | `boolean` | `true` when the line was detected in the H-ROI this frame. |
+| `isCalibrated` | `boolean` | `true` once the straight-ahead reference is locked. |
+| `steering` | `int` | Steering value, `-100 … +100` — same as `result[0]`. |
+| `tracking` | `int` | Tracking value, `min … 100` — same as `result[1]`. |
+
+### Drawing the overlay
+
+Every field is a **fraction**, so convert to screen pixels first:
+
+```java
+float screenX = data.someXFrac * screenWidth;
+float screenY = data.someYFrac * screenHeight;
+```
+
+**H-ROI strip** (a full-width horizontal band):
+
+```java
+float top    = data.hRoiTopFrac * screenHeight;
+float bottom = data.hRoiBotFrac * screenHeight;
+canvas.drawRect(0, top, screenWidth, bottom, paint);
+```
+
+**V-ROI trapezoid** (perspective-tapered box — the far edge is narrower, and leans toward `trackRefX`):
+
+```java
+float centre = data.steerRefXFrac * screenWidth;
+float shear  = (data.trackRefXFrac - data.steerRefXFrac) * screenWidth;
+
+// Near (wide) bottom corners — sit at the H-ROI top edge
+float hTop = data.hRoiTopFrac * screenHeight;
+float blX  = centre - data.halfBotFrac * screenWidth;
+float brX  = centre + data.halfBotFrac * screenWidth;
+
+// Far (narrow) top corners — shifted by shear so the box leans with the road
+float vTop = data.vRoiTopFrac * screenHeight;
+float tlX  = centre + shear - data.halfTopFrac * screenWidth;
+float trX  = centre + shear + data.halfTopFrac * screenWidth;
+
+// Connect the 4 corners:
+//   bottom-left (blX, hTop) → bottom-right (brX, hTop)
+//   → top-right (trX, vTop) → top-left (tlX, vTop) → close
+```
+
+**Dynamic road band** (bends through curves):
+
+```java
+int n = data.lookAheadPointCount;
+if (n >= 2) {
+    for (int i = 0; i < n; i++) {
+        float x = data.lookAheadColFrac[i] * screenWidth;
+        float y = data.lookAheadRowFrac[i] * screenHeight;
+        // connect points with a poly-line
+        // i = 0 is nearest (bottom), i = n-1 is farthest (top)
+    }
+    // To draw as a band: trace the left edge (x - halfWidth) forward,
+    // then the right edge (x + halfWidth) backward.
+    // halfWidth tapers from halfBotFrac (near) to halfTopFrac (far).
+}
+```
+
+**Centroid indicator** (live line position):
+
+```java
+if (data.centroidXFrac >= 0) {
+    float cx  = data.centroidXFrac * screenWidth;
+    float top = data.vRoiTopFrac   * screenHeight;
+    float bot = data.hRoiBotFrac   * screenHeight;
+    // vertical line at cx, from top to bot
+    // colour: green if data.trackFound, orange if not
+}
+```
+
+**State readout:**
+
+```java
+if (!data.isCalibrated) {
+    status.setText("Calibrating...");
+} else if (!data.trackFound) {
+    status.setText("Track lost");
+} else {
+    status.setText("Tracking  S=" + data.steering + "  T=" + data.tracking);
+}
 ```
 
 ---
@@ -194,21 +331,34 @@ cfg.trackIsBright    = true;    // white line on black floor
 cfg.cameraTiltDeg    = 45f;     // phone mount angle
 cfg.bottomIgnoreFrac = 0.20f;   // hide robot body from scan
 cfg.trackMemory      = true;    // lock onto line, ignore reflections
+cfg.trackingMinValue = 2;       // never send a full stop
 pipeline.configure(cfg);
 
-// Step 1 — Calibrate (robot must be correctly placed on the line)
+// Register overlay callback — fires automatically on every frame
+pipeline.setFrameCallback(data -> {
+    myOverlay.drawHRoi(data.hRoiTopFrac, data.hRoiBotFrac);
+    myOverlay.drawVRoi(data.vRoiTopFrac, data.steerRefXFrac,
+                       data.trackRefXFrac, data.halfBotFrac, data.halfTopFrac);
+    myOverlay.drawRoadPath(data.lookAheadColFrac,
+                           data.lookAheadRowFrac,
+                           data.lookAheadPointCount);
+    myOverlay.drawCentroid(data.centroidXFrac, data.trackFound);
+
+    robot.setSteeringAngle(data.steering);
+    robot.setSpeed(data.tracking);
+});
+
+// Phase 1 — Calibration (place robot correctly on the line first)
 byte[] frame = camera.getGrayscaleFrame();
 while (!pipeline.calibrate(frame, 1280, 720)) {
     frame = camera.getGrayscaleFrame();
 }
 
-// Step 2 — Normal operation
+// Phase 2 — Normal operation
 while (running) {
     frame = camera.getGrayscaleFrame();
-    int[] result = pipeline.processFrame(frame, 1280, 720);
-
-    robot.setSteeringAngle(result[0]);  // -100 … +100
-    robot.setSpeed(result[1]);          //    0 … 100
+    pipeline.processFrame(frame, 1280, 720);
+    // all results and overlay data delivered automatically via the callback
 }
 ```
 
@@ -220,9 +370,9 @@ while (running) {
 |---|:---:|:---:|
 | Straight line, centred | `~0` | `~100` |
 | Line drifting to one side | `± small` | `high` |
-| Curve approaching (line leaning) | `varies` | `dropping toward 0` |
-| Hard turn | `±100` | `0–30` |
-| Line completely lost | `±100` | `0` |
+| Curve approaching (line leaning) | `varies` | `dropping toward the floor` |
+| Hard turn | `±100` | `2–30` |
+| Line completely lost | `±100` | `2` *(the floor)* |
 
 ---
 
