@@ -1,0 +1,93 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  ============================================================================
+   line_follower.xml  —  Blockly XML for the "line follower" SENSOR block
+   Backed by: LineFollowerPipeline.java
+  ============================================================================
+
+   This file defines ONLY the line follower block. It does not reference any
+   of your app's existing blocks.
+
+   NOTE: XML cannot define what the block IS (shape, colour, dropdown).
+   That lives in the JSON definition, which must be registered FIRST —
+   see line_follower_block.js, or the copy below:
+
+       {
+         "type": "line_follower_read",
+         "message0": "line follower %1",
+         "args0": [
+           {
+             "type": "field_dropdown",
+             "name": "VALUE",
+             "options": [ ["Steer","STEER"], ["Power","POWER"] ]
+           }
+         ],
+         "inputsInline": true,
+         "output": "Number",
+         "colour": "#CA8A4D",
+         "tooltip": "Reads one camera frame and reports a line-following value."
+       }
+
+   The key line is  "output": "Number"  — that makes it a reporter with an
+   output plug and NO statement connectors, so it drops into a socket
+   (e.g. the steering / power sockets of "move steering") instead of sitting
+   in the script stack.
+  ============================================================================
+-->
+
+<!-- ==========================================================================
+     TOOLBOX ENTRY  —  what students see in the flyout
+
+     Listed TWICE: once preset to Steer, once preset to Power, so a student
+     can grab either without opening the dropdown.
+
+     Paste this <category> into your existing toolbox XML.
+     ====================================================================== -->
+<xml xmlns="https://developers.google.com/blockly/xml" id="toolbox" style="display: none">
+
+  <category name="Line Following" colour="#CA8A4D">
+
+    <block type="line_follower_read">
+      <field name="VALUE">STEER</field>
+    </block>
+
+    <block type="line_follower_read">
+      <field name="VALUE">POWER</field>
+    </block>
+
+  </category>
+
+</xml>
+
+
+<!--
+  ============================================================================
+   HOW THE STUDENT USES IT
+
+   The block has no inputs and one output, so it plugs into any numeric
+   socket in your existing blocks:
+
+       move steering  on  steering ( line follower[Steer]  )
+                          power    ( line follower[Power]  )
+
+   Or with their own math, exactly like the hand-built version:
+
+       move steering  on  steering ( line follower[Steer]  x  Ks )
+                          power    ( line follower[Power]  x  Kp )
+
+
+   GENERATED JAVA:
+
+       robot.moveSteering(LineFollowerHelper.getSteer(),
+                          LineFollowerHelper.getPower());
+
+   Steer  : -100 ... +100   (0 = centred)
+   Power  :    0 ... 100    (100 = straight, drops before turns, 0 = line lost)
+
+
+   IMPORTANT — call LineFollowerHelper.newFrame() once per loop iteration,
+   before reading either value. getSteer() and getPower() are usually called
+   twice in the same statement; the helper caches so the pipeline runs only
+   ONCE per camera frame. See line_follower_block.js for the helper class.
+  ============================================================================
+-->

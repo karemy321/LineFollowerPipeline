@@ -1,0 +1,284 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Line Follower — Blockly Preview</title>
+
+<!-- Blockly, loaded straight from the CDN (per docs.blockly.com "Unpkg" section) -->
+<script src="https://unpkg.com/blockly/blockly_compressed.js"></script>
+<script src="https://unpkg.com/blockly/blocks_compressed.js"></script>
+<script src="https://unpkg.com/blockly/javascript_compressed.js"></script>
+<script src="https://unpkg.com/blockly/msg/en.js"></script>
+
+<style>
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: -apple-system, "Segoe UI", Roboto, sans-serif;
+    background: #f8fafc;
+    color: #0f172a;
+  }
+  header {
+    background: #fff;
+    border-bottom: 1px solid #e2e8f0;
+    padding: 14px 20px;
+  }
+  header h1 { margin: 0; font-size: 17px; font-weight: 600; }
+  header p  { margin: 3px 0 0; font-size: 13px; color: #64748b; }
+
+  .wrap { display: flex; height: calc(100vh - 66px); }
+  #blocklyDiv { flex: 1 1 62%; }
+  .panel {
+    flex: 1 1 38%;
+    border-left: 1px solid #e2e8f0;
+    background: #fff;
+    padding: 16px 18px;
+    overflow-y: auto;
+  }
+  .panel h2 {
+    margin: 0 0 8px;
+    font-size: 12px;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    color: #2563eb;
+    font-weight: 700;
+  }
+  pre {
+    background: #0f172a;
+    color: #e2e8f0;
+    padding: 12px;
+    border-radius: 6px;
+    font-family: Consolas, Monaco, monospace;
+    font-size: 12.5px;
+    line-height: 1.5;
+    white-space: pre-wrap;
+    margin: 0 0 20px;
+    min-height: 60px;
+  }
+  .btn {
+    display: inline-block;
+    background: #2563eb;
+    color: #fff;
+    border: none;
+    border-radius: 6px;
+    padding: 9px 16px;
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+    margin: 0 6px 16px 0;
+    font-family: inherit;
+  }
+  .btn:hover { background: #1d4ed8; }
+  .btn.alt { background: #475569; }
+  .btn.alt:hover { background: #334155; }
+
+  .hint {
+    background: #fef9c3;
+    border-left: 4px solid #eab308;
+    padding: 10px 12px;
+    font-size: 13px;
+    line-height: 1.5;
+    color: #713f12;
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>Line Follower — Blockly block preview</h1>
+  <p>Sensor block: no inputs, one output. Drag it into any socket. Generated code appears on the right.</p>
+</header>
+
+<div class="wrap">
+  <div id="blocklyDiv"></div>
+  <div class="panel">
+    <h2>Generated Java</h2>
+    <pre id="javaOut">// drag a block into the workspace</pre>
+
+    <h2>Workspace XML <span style="text-transform:none;letter-spacing:0;color:#64748b;font-weight:400">(live)</span></h2>
+    <pre id="xmlOut"></pre>
+
+    <button class="btn" onclick="downloadXml()">Download XML</button>
+    <button class="btn alt" onclick="copyXml()">Copy XML</button>
+
+    <h2>Block definition (JSON)</h2>
+    <pre id="jsonOut"></pre>
+
+    <div class="hint">
+      <strong>Export:</strong> Drag the block around, set the power value, then click
+      <b>Download XML</b>. That is the same XML your engineer's editor exports.<br><br>
+      <strong>Note:</strong> the XML says <i>where</i> blocks sit. It cannot define
+      <i>what</i> the block is — that is the JSON above, which must be registered first.
+    </div>
+  </div>
+</div>
+
+<!-- The toolbox: what appears in the left-hand flyout -->
+<xml id="toolbox" style="display: none">
+  <category name="Line Following" colour="#CA8A4D">
+    <block type="line_follower_read"><field name="VALUE">STEER</field></block>
+    <block type="line_follower_read"><field name="VALUE">POWER</field></block>
+  </category>
+  <category name="Motors" colour="30">
+    <block type="move_steering"></block>
+  </category>
+  <category name="Loops" colour="120">
+    <block type="controls_whileUntil"></block>
+  </category>
+  <category name="Math" colour="230">
+    <block type="math_number"><field name="NUM">1</field></block>
+    <block type="math_arithmetic">
+      <field name="OP">MULTIPLY</field>
+      <value name="A"><shadow type="math_number"><field name="NUM">1</field></shadow></value>
+      <value name="B"><shadow type="math_number"><field name="NUM">1</field></shadow></value>
+    </block>
+  </category>
+</xml>
+
+<script>
+/* ---------------------------------------------------------------
+   1. THE BLOCK DEFINITION
+   --------------------------------------------------------------- */
+const BLOCK_JSON = {
+  "type": "line_follower_read",
+  "message0": "line follower %1",
+  "args0": [
+    {
+      "type": "field_dropdown",
+      "name": "VALUE",
+      "options": [ ["Steer","STEER"], ["Power","POWER"] ]
+    }
+  ],
+  "inputsInline": true,
+  "output": "Number",
+  "colour": "#CA8A4D",
+  "tooltip": "Reads one camera frame and reports a line-following value."
+};
+
+Blockly.defineBlocksWithJsonArray([BLOCK_JSON, {
+  "type": "move_steering",
+  "message0": "move steering  steering %1 power %2",
+  "args0": [
+    { "type": "input_value", "name": "STEERING", "check": "Number" },
+    { "type": "input_value", "name": "POWER",    "check": "Number" }
+  ],
+  "inputsInline": true,
+  "previousStatement": null,
+  "nextStatement": null,
+  "colour": 30,
+  "tooltip": "Stand-in for your app's move steering block."
+}]);
+document.getElementById('jsonOut').textContent = JSON.stringify(BLOCK_JSON, null, 2);
+
+
+/* ---------------------------------------------------------------
+   2. THE JAVA GENERATOR
+   --------------------------------------------------------------- */
+const javaGen = new Blockly.Generator('Java');
+javaGen.INDENT = '    ';
+
+javaGen.forBlock['line_follower_read'] = function (block) {
+  const which = block.getFieldValue('VALUE');
+  const code = (which === 'STEER')
+    ? 'LineFollowerHelper.getSteer()'
+    : 'LineFollowerHelper.getPower()';
+  return [code, 2];
+};
+javaGen.forBlock['math_number'] = function (block) {
+  return [String(block.getFieldValue('NUM')), 0];
+};
+javaGen.forBlock['math_arithmetic'] = function (block, gen) {
+  const a = gen.valueToCode(block, 'A', 3) || '0';
+  const b = gen.valueToCode(block, 'B', 3) || '0';
+  const ops = { ADD:'+', MINUS:'-', MULTIPLY:'*', DIVIDE:'/' };
+  const op = ops[block.getFieldValue('OP')] || '*';
+  return ['(' + a + ' ' + op + ' ' + b + ')', 3];
+};
+javaGen.forBlock['move_steering'] = function (block, gen) {
+  const s = gen.valueToCode(block, 'STEERING', 0) || '0';
+  const p = gen.valueToCode(block, 'POWER', 0) || '0';
+  return 'LineFollowerHelper.newFrame();\n' +
+         'robot.moveSteering(' + s + ', ' + p + ');\n';
+};
+javaGen.forBlock['controls_whileUntil'] = function (block, gen) {
+  const body = gen.statementToCode(block, 'DO');
+  return 'while (true) {\n' + body + '}\n';
+};
+javaGen.forBlock['controls_repeat_ext'] = function (block, gen) {
+  const times = gen.valueToCode(block, 'TIMES', 0) || '10';
+  const body  = gen.statementToCode(block, 'DO');
+  return 'for (int i = 0; i < ' + times + '; i++) {\n' + body + '}\n';
+};
+javaGen.scrub_ = function (block, code) {
+  const next = block.getNextBlock();
+  return code + (next ? javaGen.blockToCode(next) : '');
+};
+
+
+/* ---------------------------------------------------------------
+   3. INJECT THE WORKSPACE
+   --------------------------------------------------------------- */
+const workspace = Blockly.inject('blocklyDiv', {
+  toolbox: document.getElementById('toolbox'),
+  grid:  { spacing: 22, length: 3, colour: '#e2e8f0', snap: true },
+  zoom:  { controls: true, wheel: true, startScale: 1.1 },
+  trashcan: true
+});
+
+// Start with a loop + the block already inside, so you see it immediately
+const startBlocks = `
+<xml xmlns="https://developers.google.com/blockly/xml">
+  <block type="controls_whileUntil" x="50" y="50">
+    <statement name="DO">
+      <block type="move_steering">
+        <value name="STEERING">
+          <block type="line_follower_read"><field name="VALUE">STEER</field></block>
+        </value>
+        <value name="POWER">
+          <block type="line_follower_read"><field name="VALUE">POWER</field></block>
+        </value>
+      </block>
+    </statement>
+  </block>
+</xml>`;
+Blockly.Xml.domToWorkspace(Blockly.utils.xml.textToDom(startBlocks), workspace);
+
+
+/* ---------------------------------------------------------------
+   4. LIVE CODE OUTPUT
+   --------------------------------------------------------------- */
+function currentXml() {
+  const dom = Blockly.Xml.workspaceToDom(workspace);
+  return Blockly.Xml.domToPrettyText(dom);
+}
+
+function updateCode() {
+  const code = javaGen.workspaceToCode(workspace);
+  document.getElementById('javaOut').textContent =
+    code.trim() || '// drag a block into the workspace';
+  document.getElementById('xmlOut').textContent = currentXml();
+}
+
+function downloadXml() {
+  const blob = new Blob([currentXml()], { type: 'text/xml' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'line_follower_workspace.xml';
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
+function copyXml() {
+  navigator.clipboard.writeText(currentXml());
+  const b = event.target;
+  const old = b.textContent;
+  b.textContent = 'Copied';
+  setTimeout(() => { b.textContent = old; }, 1200);
+}
+
+workspace.addChangeListener(updateCode);
+updateCode();
+</script>
+
+</body>
+</html>
