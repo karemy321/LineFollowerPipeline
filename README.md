@@ -20,7 +20,7 @@ No OpenCV. No Android APIs. No native libraries.
 
 ---
 
-## Minimal Integration (3 Steps)
+## Minimal Integration (4 Steps)
 
 ### 1. Create one instance (keep it alive for the session)
 
@@ -28,20 +28,28 @@ No OpenCV. No Android APIs. No native libraries.
 LineFollowerPipeline pipeline = new LineFollowerPipeline();
 ```
 
-### 2. Call `processFrame()` on every camera frame
+### 2. Calibrate — feed frames until it returns `true`
+
+```java
+while (!pipeline.calibrate(grayscaleBytes, width, height)) {
+    grayscaleBytes = camera.getGrayscaleFrame();
+}
+```
+
+### 3. Call `processFrame()` on every camera frame
 
 ```java
 int[] result = pipeline.processFrame(grayscaleBytes, width, height);
 ```
 
-### 3. Read the two output values
+### 4. Read the two output values
 
 ```java
 int steering = result[0];  // use for direction control
 int tracking = result[1];  // use for speed control
 ```
 
-> 💡 The pipeline auto-initialises on the first call. No setup is required unless you want custom tuning.
+> ⚠️ **Calibration is required.** `processFrame()` must not be called until `calibrate()` has returned `true`. The robot must be correctly placed on the line while calibrating. See [Calibration](#calibration) below.
 
 ---
 
@@ -126,11 +134,37 @@ pipeline.configure(cfg);  // must be called BEFORE the first processFrame()
 | `minWeightFrac` | `float` | `0.01f` | Minimum fraction of scan strip pixels that must be "track" to trust the detection. Raise to reject weak signals. |
 | `trackOffsetFullFrac` | `float` | `1.0f` | How far the look-ahead line must lean (as a fraction of half-frame width) to push Tracking to `0`. Lower (e.g. `0.6`) makes turns read earlier. |
 
-### Auto-Calibration
+### Calibration
 
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `calibFrames` | `int` | `10` | Number of solid detections to average for the straight-ahead zero reference. Assumes the robot starts correctly placed on the line. Increase for more robust calibration. |
+| `calibFrames` | `int` | `10` | Number of solid detections `calibrate()` collects before locking the straight-ahead zero reference (it takes their median). Assumes the robot is correctly placed on the line. Increase for more robust calibration. |
+
+---
+
+## Calibration
+
+Before calling `processFrame()` you must first calibrate the pipeline. Place the robot correctly on the line, then call `calibrate()` once per camera frame until it returns `true`:
+
+```java
+// Phase 1 — Calibration (at startup, or when the user presses calibrate)
+while (!pipeline.calibrate(grayscaleBytes, width, height)) {
+    // keep feeding frames until calibration is complete
+    grayscaleBytes = camera.getGrayscaleFrame();
+}
+
+// Phase 2 — Normal operation
+int[] result = pipeline.processFrame(grayscaleBytes, width, height);
+```
+
+`calibrate()` collects a set number of solid line detections (default: **10 frames**, controlled by `Config.calibFrames`), takes their **median** position, and locks it as the straight-ahead zero reference. It returns `true` once this is done.
+
+If the robot needs to re-calibrate mid-run:
+
+```java
+pipeline.requestRecalibration();
+// then feed frames to calibrate() again before resuming processFrame()
+```
 
 ---
 
@@ -143,7 +177,7 @@ pipeline.getFramesPerSecond()   // frames processed in the last completed second
 pipeline.getTotalFrames()       // cumulative frame count since init
 pipeline.getElapsedSeconds()    // wall-clock seconds since first frame
 pipeline.isCalibrated()         // true once the straight-ahead reference is captured
-pipeline.requestRecalibration() // force the pipeline to re-learn the straight-ahead zero
+pipeline.requestRecalibration() // resets calibration — must call calibrate() again before processFrame()
 pipeline.release()              // shut down and reset
 ```
 
@@ -162,16 +196,19 @@ cfg.bottomIgnoreFrac = 0.20f;   // hide robot body from scan
 cfg.trackMemory      = true;    // lock onto line, ignore reflections
 pipeline.configure(cfg);
 
-// Inside your camera loop:
+// Step 1 — Calibrate (robot must be correctly placed on the line)
+byte[] frame = camera.getGrayscaleFrame();
+while (!pipeline.calibrate(frame, 1280, 720)) {
+    frame = camera.getGrayscaleFrame();
+}
+
+// Step 2 — Normal operation
 while (running) {
-    byte[] frame  = camera.getGrayscaleFrame();
-    int[]  result = pipeline.processFrame(frame, 1280, 720);
+    frame = camera.getGrayscaleFrame();
+    int[] result = pipeline.processFrame(frame, 1280, 720);
 
-    int steering = result[0];  // -100 … +100
-    int tracking = result[1];  //    0 … 100
-
-    robot.setSteeringAngle(steering);
-    robot.setSpeed(tracking);
+    robot.setSteeringAngle(result[0]);  // -100 … +100
+    robot.setSpeed(result[1]);          //    0 … 100
 }
 ```
 
@@ -193,4 +230,4 @@ while (running) {
 
 - ⚠️ The pipeline is **not thread-safe**. Call `processFrame()` from a single thread only.
 - The returned `int[]` is **reused** on every call. Copy the values if you need them past the next frame.
-- Auto-calibration assumes the robot starts correctly centred on the line. If it does not, call `requestRecalibration()` once it is repositioned.
+- Calibration assumes the robot is correctly placed on the line while `calibrate()` is running. If it is not, call `requestRecalibration()` once it is repositioned, then calibrate again.
