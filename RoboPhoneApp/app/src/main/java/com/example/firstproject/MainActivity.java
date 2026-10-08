@@ -12,7 +12,9 @@ import android.os.Bundle;
 import android.util.Log;
 import android.util.Range;
 import android.util.Size;
+import android.view.View;
 import android.view.WindowManager;
+import android.widget.Button;
 import android.widget.ProgressBar;
 import android.widget.SeekBar;
 import android.widget.TextView;
@@ -47,13 +49,17 @@ import java.util.concurrent.Executors;
  * RoboPhone main activity.
  *
  * Camera: CameraX (no OpenCV).  Works on any Android device with Camera2 support.
- * Processing: LineFollowerPipeline (pure Java, no native libraries).
- * Track colour: WHITE line on BLACK floor — set trackIsBright=false for the opposite.
+ * Processing: LineFollowerPipeline (pure Java, no native libraries), fed full
+ * colour YUV frames. The line and floor colours are learned during calibration,
+ * so any two different colours work (white on black, black on blue, …).
  *
- * On-screen HUD shows:
- *   STEER  — SeekBar + number [-100…+100]
- *   TRACK  — ProgressBar + percentage [0…100%]
- *   Status — TRACKING (green) or TRACK LOST (orange)
+ * All display data comes from the library's FrameCallback:
+ *   Overlay — ⊥ sensor, look-ahead band, calibrated reference (OverlayView)
+ *   STEER   — SeekBar + number [-100…+100]
+ *   TRACK   — ProgressBar + percentage [min…100%]
+ *   Status  — calibration progress / TRACKING (green) / TRACK LOST (orange)
+ *   Colours — learned line + floor swatches, threshold, colour separation
+ *   RECALIBRATE — re-learns colours and straight-ahead reference
  */
 public class MainActivity extends AppCompatActivity {
 
@@ -99,21 +105,39 @@ public class MainActivity extends AppCompatActivity {
     private TextView    tvIntersection;
     private TextView    tvStatus;
     private TextView    tvFrames;
+    private TextView    tvDebug;
+    private View        swatchLine;
+    private View        swatchFloor;
 
     // ── Values shared between camera thread → UI thread ───────────────────────
+    // Written by the pipeline's FrameCallback, read by applyHud().
     private volatile float   hudSteering     = 0f;
     private volatile float   hudIntersection = 0f;
     private volatile boolean hudTrackFound   = false;
+    private volatile boolean hudCalibrated   = false;
+    private volatile int     hudCalibPhase   = LineFollowerPipeline.CALIB_LEARNING_COLORS;
+    private volatile float   hudCalibProgress = 0f;
+    private volatile int     hudCalibIssue   = LineFollowerPipeline.ISSUE_NONE;
+    private volatile boolean hudColorReady   = false;
+    private volatile int     hudLineColor    = 0;
+    private volatile int     hudFloorColor   = 0;
+    private volatile float   hudSeparation   = 0f;
+    private volatile int     hudThreshold    = 0;
     private volatile int     hudFps          = 0;
     private volatile long    hudTotalFrames  = 0L;
     private volatile double  hudElapsedSec   = 0.0;
     private volatile boolean hudPending      = false;
 
+    // Set by the RECALIBRATE button (UI thread), consumed on the camera thread so
+    // the pipeline is only ever touched from one thread.
+    private volatile boolean recalibrateRequested = false;
+
     // Pre-allocated Runnable — zero heap allocation per frame on camera thread
     private final Runnable hudRunnable = this::applyHud;
 
-    // Pre-allocated pixel buffer — filled each frame from the camera Y-plane.
-    private byte[] frameBuffer;
+    // Pre-allocated pixel buffers — filled each frame from the camera planes
+    // (padding stripped): full-res Y, half-res U and V, and one row scratch.
+    private byte[] yFrame, uFrame, vFrame, rowScratch;
 
     // ── Profiling accumulators (camera thread only — no synchronisation needed) ─
     private long profLastStartNs   = 0L;   // start timestamp of the previous frame
@@ -139,6 +163,14 @@ public class MainActivity extends AppCompatActivity {
         tvIntersection = findViewById(R.id.tv_intersection);
         tvStatus       = findViewById(R.id.tv_status);
         tvFrames       = findViewById(R.id.tv_frames);
+        tvDebug        = findViewById(R.id.tv_debug);
+        swatchLine     = findViewById(R.id.swatch_line);
+        swatchFloor    = findViewById(R.id.swatch_floor);
+        Button btnRecalibrate = findViewById(R.id.btn_recalibrate);
+        btnRecalibrate.setOnClickListener(v -> recalibrateRequested = true);
+
+        // Every calibration and processing frame reports here (camera thread).
+        pipeline.setFrameCallback(this::onPipelineFrame);
 
         // Dedicated background thread for image analysis
         cameraExecutor = Executors.newSingleThreadExecutor();
@@ -305,16 +337,14 @@ public class MainActivity extends AppCompatActivity {
     private void analyzeFrame(ImageProxy imageProxy) {
         final long frameStartNs = System.nanoTime();
         try {
-            final int width     = imageProxy.getWidth();
-            final int height    = imageProxy.getHeight();
-            final ImageProxy.PlaneProxy yPlane    = imageProxy.getPlanes()[0];
-            final ByteBuffer            yBuffer   = yPlane.getBuffer();
-            final int                   rowStride = yPlane.getRowStride();
+            final int width  = imageProxy.getWidth();
+            final int height = imageProxy.getHeight();
+            final ImageProxy.PlaneProxy[] planes = imageProxy.getPlanes();
 
             // Lazy-configure the library on the first frame when dimensions are known.
             if (!pipeline.isInitialized()) {
                 LineFollowerPipeline.Config cfg = new LineFollowerPipeline.Config();
-                cfg.trackIsBright    = true;
+                cfg.autoColor        = true;    // learn line + floor colours at calibration
                 cfg.thresholdMargin  = 0;
                 cfg.hRoiCenterYFrac  = 0.85f;
                 cfg.hRoiThickPx      = 24;
@@ -323,94 +353,113 @@ public class MainActivity extends AppCompatActivity {
                 cfg.cameraTiltDeg    = 45f;
                 cfg.verticalFovDeg   = 60f;
                 pipeline.configure(cfg);
-                frameBuffer = new byte[width * height];
+                final int cw = (width + 1) / 2, ch = (height + 1) / 2;
+                yFrame     = new byte[width * height];
+                uFrame     = new byte[cw * ch];
+                vFrame     = new byte[cw * ch];
+                rowScratch = new byte[Math.max(planes[1].getRowStride(), planes[2].getRowStride())];
                 Log.i(TAG, "Pipeline configured: " + width + "x" + height
-                        + "  rowStride=" + rowStride);
-                final float ignoreFrac = cfg.bottomIgnoreFrac;
-                runOnUiThread(() -> {
-                    tvStatus.setText("Calibrating...");
-                    if (overlayView != null) overlayView.setBottomIgnoreFrac(ignoreFrac);
-                });
+                        + "  yRowStride=" + planes[0].getRowStride()
+                        + "  uvPixelStride=" + planes[1].getPixelStride());
             }
 
-            // Extract grayscale bytes into the pre-allocated buffer, stripping padding.
-            yBuffer.rewind();
-            if (rowStride == width) {
-                yBuffer.get(frameBuffer);
-            } else {
-                for (int row = 0; row < height; row++) {
-                    yBuffer.position(row * rowStride);
-                    yBuffer.get(frameBuffer, row * width, width);
-                }
+            if (recalibrateRequested) {
+                recalibrateRequested = false;
+                pipeline.requestRecalibration();
+                Log.i(TAG, "Recalibration requested");
             }
 
-            // Calibration phase — feed frames until the straight-ahead reference is locked.
+            // Copy the three planes into packed buffers, stripping row padding.
+            copyLumaPlane(planes[0], yFrame, width, height);
+            copyChromaPlane(planes[1], uFrame, (width + 1) / 2, (height + 1) / 2, rowScratch);
+            copyChromaPlane(planes[2], vFrame, (width + 1) / 2, (height + 1) / 2, rowScratch);
+
+            // Calibration phase — learns the colours, then the straight-ahead
+            // reference. The FrameCallback reports progress to the HUD/overlay.
             if (!pipeline.isCalibrated()) {
-                final boolean done = pipeline.calibrate(frameBuffer, width, height);
-                runOnUiThread(() -> tvStatus.setText(done ? "Calibrated" : "Calibrating..."));
-                profileFrame(frameStartNs, System.nanoTime());
-                return;
+                pipeline.calibrateYuv420(yFrame, uFrame, vFrame, width, height);
+            } else {
+                // Run the library — returns [steering, tracking]. Overlay + HUD are
+                // updated from the FrameCallback fired inside this call.
+                final int[] result = pipeline.processFrameYuv420(yFrame, uFrame, vFrame, width, height);
+                if (VERBOSE) Log.d(TAG, "S=" + result[0] + "  T=" + result[1]);
             }
 
-            // Run the library — returns [steering, tracking]
-            final int[]   result    = pipeline.processFrame(frameBuffer, width, height);
-            final int     steering  = result[0];
-            final int     tracking  = result[1];
-            final boolean trackFound = tracking > 2;
-
-            if (VERBOSE) Log.d(TAG, "S=" + steering + "  T=" + tracking + "  found=" + trackFound);
-
-            // ── Update overlay ────────────────────────────────────────────────
-            if (overlayView != null) {
-                final int   w = pipeline.getImgW();
-                final int   h = pipeline.getImgH();
-                final float trackWidthPx = pipeline.getVRoiHalfWidthPx() * 2f;
-                final float boxWidthPx   = Math.max(12f, trackWidthPx * 1.3f);
-                final float halfBotFrac  = (boxWidthPx * 0.5f) / w;
-                final float hTopFrac     = pipeline.getHRoiTop() / (float) h;
-                final float vTopFrac     = pipeline.getVRoiTop() / (float) h;
-                final float scaleNear    = pipeline.perspectiveWidthScale(hTopFrac);
-                final float scaleFar     = pipeline.perspectiveWidthScale(vTopFrac);
-                final float taper        = (scaleNear > 1e-4f) ? (scaleFar / scaleNear) : 1f;
-                final float halfTopFrac  = halfBotFrac * taper;
-                final float steerRefX    = pipeline.getSteerRefXFrac() * w;
-                final int   cx           = (int)(steerRefX + (steering / 100f) * (w * 0.5f));
-                final float boxCenterFrac = pipeline.getSteerRefXFrac();
-                final float shearFrac     = pipeline.getTrackRefXFrac() - boxCenterFrac;
-
-                overlayView.setLookAheadPath(
-                        pipeline.getLookAheadColFracs(),
-                        pipeline.getLookAheadRowFracs(),
-                        pipeline.getLookAheadPointCount());
-                overlayView.update(
-                        hTopFrac,
-                        pipeline.getHRoiBot() / (float) h,
-                        vTopFrac,
-                        boxCenterFrac,
-                        halfBotFrac,
-                        halfTopFrac,
-                        cx / (float) w,
-                        shearFrac,
-                        trackFound);
-            }
-
-            // ── Schedule HUD update ───────────────────────────────────────────
-            hudSteering     = steering;
-            hudIntersection = tracking;
-            hudTrackFound   = trackFound;
-            hudFps          = pipeline.getFramesPerSecond();
-            hudTotalFrames  = pipeline.getTotalFrames();
-            hudElapsedSec   = pipeline.getElapsedSeconds();
-            if (!hudPending) {
-                hudPending = true;
-                runOnUiThread(hudRunnable);
-            }
-
-            final long frameEndNs = System.nanoTime();
-            profileFrame(frameStartNs, frameEndNs);
+            profileFrame(frameStartNs, System.nanoTime());
 
         } finally {
             imageProxy.close();
+        }
+    }
+
+    /** Copy the Y plane into {@code dst} (width × height, no padding). */
+    private static void copyLumaPlane(ImageProxy.PlaneProxy plane, byte[] dst, int width, int height) {
+        final ByteBuffer buf = plane.getBuffer();
+        final int rowStride  = plane.getRowStride();
+        buf.rewind();
+        if (rowStride == width) {
+            buf.get(dst, 0, width * height);
+        } else {
+            for (int row = 0; row < height; row++) {
+                buf.position(row * rowStride);
+                buf.get(dst, row * width, width);
+            }
+        }
+    }
+
+    /**
+     * Copy a half-resolution chroma plane (U or V) into {@code dst} (cw × ch,
+     * packed). Handles both planar (pixelStride 1) and interleaved (pixelStride 2,
+     * NV12/NV21-style) layouts that YUV_420_888 devices deliver.
+     */
+    private static void copyChromaPlane(ImageProxy.PlaneProxy plane, byte[] dst,
+                                        int cw, int ch, byte[] scratch) {
+        final ByteBuffer buf = plane.getBuffer();
+        final int rowStride  = plane.getRowStride();
+        final int pixStride  = plane.getPixelStride();
+        buf.rewind();
+        if (pixStride == 1 && rowStride == cw) {
+            buf.get(dst, 0, cw * ch);
+            return;
+        }
+        final int rowLen = (cw - 1) * pixStride + 1;   // last row may be shorter than rowStride
+        for (int row = 0; row < ch; row++) {
+            buf.position(row * rowStride);
+            if (pixStride == 1) {
+                buf.get(dst, row * cw, cw);
+            } else {
+                buf.get(scratch, 0, rowLen);
+                final int base = row * cw;
+                for (int col = 0; col < cw; col++) dst[base + col] = scratch[col * pixStride];
+            }
+        }
+    }
+
+    // =========================================================================
+    //  Pipeline callback — camera thread, fired by calibrate / processFrame
+    // =========================================================================
+
+    private void onPipelineFrame(LineFollowerPipeline.FrameData d) {
+        if (overlayView != null) overlayView.setFrame(d);
+
+        hudSteering      = d.steering;
+        hudIntersection  = d.tracking;
+        hudTrackFound    = d.trackFound;
+        hudCalibrated    = d.isCalibrated;
+        hudCalibPhase    = d.calibPhase;
+        hudCalibProgress = d.calibProgress;
+        hudCalibIssue    = d.calibIssue;
+        hudColorReady    = d.colorModelReady;
+        hudLineColor     = d.lineColorArgb;
+        hudFloorColor    = d.floorColorArgb;
+        hudSeparation    = d.colorSeparation;
+        hudThreshold     = d.threshold;
+        hudFps           = pipeline.getFramesPerSecond();
+        hudTotalFrames   = pipeline.getTotalFrames();
+        hudElapsedSec    = pipeline.getElapsedSeconds();
+        if (!hudPending) {
+            hudPending = true;
+            runOnUiThread(hudRunnable);
         }
     }
 
@@ -508,15 +557,47 @@ public class MainActivity extends AppCompatActivity {
                 android.content.res.ColorStateList.valueOf(trackColor));
         tvIntersection.setTextColor(trackColor);
 
-        tvStatus.setText(found ? "TRACKING" : "TRACK LOST");
-        tvStatus.setTextColor(found ? Color.parseColor("#00E676")
-                                    : Color.parseColor("#FF6D00"));
+        if (hudCalibrated) {
+            tvStatus.setText(found ? "TRACKING" : "TRACK LOST");
+            tvStatus.setTextColor(found ? Color.parseColor("#00E676")
+                                        : Color.parseColor("#FF6D00"));
+        } else {
+            tvStatus.setText(calibrationMessage());
+            tvStatus.setTextColor(hudCalibIssue == LineFollowerPipeline.ISSUE_NONE
+                    ? Color.parseColor("#FFD600") : Color.parseColor("#FF6D00"));
+        }
 
         tvFrames.setText(String.format(Locale.US,
                 "FPS: %d    total: %d    time: %.1fs",
                 hudFps, hudTotalFrames, hudElapsedSec));
 
+        // Learned colours + vision debug
+        final boolean colors = hudColorReady;
+        swatchLine.setBackgroundColor(colors ? hudLineColor : Color.DKGRAY);
+        swatchFloor.setBackgroundColor(colors ? hudFloorColor : Color.DKGRAY);
+        final String thr = hudThreshold < 0 ? "none" : String.valueOf(hudThreshold);
+        tvDebug.setText(colors
+                ? String.format(Locale.US, "thr: %s  sep: %.1fσ", thr, hudSeparation)
+                : String.format(Locale.US, "thr: %s  sep: --", thr));
+
         hudPending = false;
+    }
+
+    /** Status text while calibrating: phase, progress, and any problem detected. */
+    private String calibrationMessage() {
+        final int pct = Math.round(hudCalibProgress * 100f);
+        switch (hudCalibIssue) {
+            case LineFollowerPipeline.ISSUE_LOW_CONTRAST:
+                return "CALIBRATING " + pct + "% — line and floor colours too similar, retrying";
+            case LineFollowerPipeline.ISSUE_NO_FLOOR:
+                return "CALIBRATING " + pct + "% — place the robot ON the line (floor on both sides)";
+            case LineFollowerPipeline.ISSUE_NO_LINE:
+                return "CALIBRATING " + pct + "% — line not visible in the STEER strip";
+            default:
+                return hudCalibPhase == LineFollowerPipeline.CALIB_LEARNING_COLORS
+                        ? "CALIBRATING " + pct + "% — learning line / floor colours"
+                        : "CALIBRATING " + pct + "% — finding straight-ahead";
+        }
     }
 
     // =========================================================================

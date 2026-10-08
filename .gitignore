@@ -1,0 +1,10 @@
+# Gradle / build output (both projects build to C:/RoboPhoneBuild, but keep any
+# stray local output out of git too)
+.gradle/
+build/
+**/build/
+local.properties
+
+# IDE
+.idea/
+*.iml

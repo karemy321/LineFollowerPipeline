@@ -5,9 +5,25 @@ plugins {
 group   = 'com.example.linefollower'
 version = '1.0.0'
 
+// Build outside OneDrive: OneDrive's sync locks build intermediates, which makes
+// Gradle fail with "Unable to delete directory". Same approach as RoboPhoneApp.
+layout.buildDirectory.set(file("C:/RoboPhoneBuild/library"))
+
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+    testImplementation 'junit:junit:4.13.2'
+}
+
 java {
     sourceCompatibility = JavaVersion.VERSION_11
     targetCompatibility = JavaVersion.VERSION_11
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = 'UTF-8'
 }
 
 jar {

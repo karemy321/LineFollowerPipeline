@@ -9,85 +9,103 @@ import android.graphics.Path;
 import android.util.AttributeSet;
 import android.view.View;
 
+import com.example.linefollower.LineFollowerPipeline;
+
 /**
  * Transparent overlay drawn on top of the camera PreviewView.
  *
- * Shows the inverted-T (⊥) virtual sensor so you can position the phone:
+ * Everything drawn here comes straight from the library's
+ * {@link LineFollowerPipeline.FrameData} — no geometry is recomputed in the app:
  *
  *   ┌──────────────────────────────────────────┐
- *   │   ║                              ║       │
- *   │   ║   V-ROI  (magenta box)       ║       │  fixed at frame centre
- *   │   ║   Track-continuity sensor    ║       │
- *   │   ║                              ║       │
- *   │   ║         │ centroid           ║       │  green/orange — moves with line
- *   │   ║         │                   ║       │
- *   │   ╚═════════╪═══════════════════╝       │
- *   ╠═════════════╪═════════════════════════════╣  H-ROI (cyan) — full-width strip
- *   │    · · · · ·┼· · · · · · · · ·           │  dashed white = frame centre ref
+ *   │        ╲   V-ROI (magenta) band   ╱       │  bends along the detected line
+ *   │         ╲  look-ahead / TRACK    ╱        │
+ *   │          ╲        │ centre line ╱         │  green = tracking, orange = lost
+ *   ╠═══════════════════╪══════════════════════╣  H-ROI (cyan) — STEER strip
+ *   │                   ┊ dashed = calibrated straight-ahead
+ *   │▒▒▒▒▒▒▒▒▒▒▒▒ IGNORED (robot) ▒▒▒▒▒▒▒▒▒▒▒▒▒│  red — excluded robot body
  *   └──────────────────────────────────────────┘
  *
- * The T is FIXED at the frame centre so you can use it to aim the camera.
- * When the road line sits inside the T and the green centroid line is in the
- * middle of the H-ROI, steering = 0 and the camera is correctly positioned.
+ * The camera image is mapped to the view exactly as PreviewView's default
+ * FILL_CENTER scale type does (scale to cover, centre, crop the overflow), so
+ * the overlay lines up with the preview even when the aspect ratios differ.
  *
- * {@link #update} is safe to call from any thread.
+ * {@link #setFrame} is safe to call from any thread.
  */
 public final class OverlayView extends View {
 
     // ── Paints (pre-allocated — never created inside onDraw) ──────────────────
 
-    private final Paint hFillPaint    = new Paint(Paint.ANTI_ALIAS_FLAG);
-    private final Paint hStrokePaint  = new Paint(Paint.ANTI_ALIAS_FLAG);
-    private final Paint vFillPaint    = new Paint(Paint.ANTI_ALIAS_FLAG);
-    private final Paint vStrokePaint  = new Paint(Paint.ANTI_ALIAS_FLAG);
-    private final Paint centroidPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
-    private final Paint centerRefPaint= new Paint(Paint.ANTI_ALIAS_FLAG);
-    private final Paint cornerPaint   = new Paint(Paint.ANTI_ALIAS_FLAG);
-    private final Paint labelPaint    = new Paint(Paint.ANTI_ALIAS_FLAG);
-    private final Paint ignorePaint   = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private final Paint hFillPaint      = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private final Paint hStrokePaint    = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private final Paint vFillPaint      = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private final Paint vStrokePaint    = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private final Paint centroidPaint   = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private final Paint refPaint        = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private final Paint cornerPaint     = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private final Paint labelPaint      = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private final Paint ignorePaint     = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint ignoreLinePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
-    private final Path  arrowPath    = new Path();  // reused in onDraw — no allocation
-    private final Path  vRoiPath     = new Path();  // reused — sheared V-ROI outline
-    private final Path  bandPath     = new Path();  // reused — dynamic (curved) V-ROI band
-    private final Path  centerPath   = new Path();  // reused — dynamic centroid poly-line
+    private final Path  arrowPath  = new Path();  // reused in onDraw — no allocation
+    private final Path  vRoiPath   = new Path();  // reused — straight V-ROI trapezoid
+    private final Path  bandPath   = new Path();  // reused — dynamic (curved) V-ROI band
+    private final Path  centerPath = new Path();  // reused — dynamic centroid poly-line
 
-    // ── Geometry set by update() — fractional [0,1] of frame dimensions ───────
+    private static final int COLOR_TRACKING    = Color.parseColor("#00E676");
+    private static final int COLOR_LOST        = Color.parseColor("#FF6D00");
+    private static final int COLOR_CALIBRATING = Color.parseColor("#FFD600");
 
-    // H-ROI: fixed Y position (matches pipeline's hRoiCenterYFrac)
-    private volatile float hRoiTopFrac = 0.82f;
-    private volatile float hRoiBotFrac = 0.88f;
+    // ── Frame snapshots ───────────────────────────────────────────────────────
+    // The camera thread writes into `pending` under the lock; onDraw copies it
+    // into `drawn` under the same lock and then draws without holding it.
+    private final Object   lock    = new Object();
+    private final Snapshot pending = new Snapshot();
+    private final Snapshot drawn   = new Snapshot();
 
-    // V-ROI: a perspective TRAPEZOID. Centred horizontally at vRoiCenterFrac, with
-    // a half-width that tapers from vRoiHalfBotFrac at the near (H-ROI) edge to the
-    // smaller vRoiHalfTopFrac at the far (top) edge — modelling how the fixed-width
-    // track projects narrower the farther ahead the tilted camera looks.
-    private volatile float vRoiCenterFrac  = 0.50f;
-    private volatile float vRoiHalfBotFrac = 0.15f;
-    private volatile float vRoiHalfTopFrac = 0.05f;
-    // Top (far) edge of the V-ROI as a fraction of frame height. The look-ahead no
-    // longer spans to the frame top (0f); it stops short so the noisy far region is
-    // excluded. Matches the pipeline's vRoiTop.
-    private volatile float vRoiTopFrac     = 0.40f;
+    /** Copy of the FrameData fields the overlay draws. */
+    private static final class Snapshot {
+        boolean valid;
+        int     imgW, imgH;
+        float   hRoiTopFrac, hRoiBotFrac, vRoiTopFrac, ignoreTopFrac;
+        float   steerRefXFrac, trackRefXFrac, halfBotFrac, halfTopFrac;
+        float   centroidXFrac;
+        int     steering;
+        boolean trackFound, isCalibrated;
+        final float[] laCol = new float[48];
+        final float[] laRow = new float[48];
+        int     laCount;
 
-    // Centroid: dynamic — moves left/right as the detected line moves
-    private volatile float   centroidXFrac = 0.50f;
-    private volatile boolean trackFound    = false;
+        void copyFrom(LineFollowerPipeline.FrameData d) {
+            valid         = true;
+            imgW          = d.imgW;          imgH          = d.imgH;
+            hRoiTopFrac   = d.hRoiTopFrac;   hRoiBotFrac   = d.hRoiBotFrac;
+            vRoiTopFrac   = d.vRoiTopFrac;   ignoreTopFrac = d.ignoreTopFrac;
+            steerRefXFrac = d.steerRefXFrac; trackRefXFrac = d.trackRefXFrac;
+            halfBotFrac   = d.halfBotFrac;   halfTopFrac   = d.halfTopFrac;
+            centroidXFrac = d.centroidXFrac; steering      = d.steering;
+            trackFound    = d.trackFound;    isCalibrated  = d.isCalibrated;
+            laCount = Math.min(d.lookAheadPointCount, laCol.length);
+            System.arraycopy(d.lookAheadColFrac, 0, laCol, 0, laCount);
+            System.arraycopy(d.lookAheadRowFrac, 0, laRow, 0, laCount);
+        }
 
-    // Tilt shear: horizontal offset (fraction of frame width) applied to the TOP
-    // edge of the V-ROI relative to its bottom, so the box leans with the line.
-    private volatile float   vRoiShearFrac = 0f;
+        void copyFrom(Snapshot s) {
+            valid         = s.valid;
+            imgW          = s.imgW;          imgH          = s.imgH;
+            hRoiTopFrac   = s.hRoiTopFrac;   hRoiBotFrac   = s.hRoiBotFrac;
+            vRoiTopFrac   = s.vRoiTopFrac;   ignoreTopFrac = s.ignoreTopFrac;
+            steerRefXFrac = s.steerRefXFrac; trackRefXFrac = s.trackRefXFrac;
+            halfBotFrac   = s.halfBotFrac;   halfTopFrac   = s.halfTopFrac;
+            centroidXFrac = s.centroidXFrac; steering      = s.steering;
+            trackFound    = s.trackFound;    isCalibrated  = s.isCalibrated;
+            laCount = s.laCount;
+            System.arraycopy(s.laCol, 0, laCol, 0, laCount);
+            System.arraycopy(s.laRow, 0, laRow, 0, laCount);
+        }
+    }
 
-    // Dynamic look-ahead path (nearest → farthest), fractional image coords. When
-    // present (laPointCount ≥ 2) the V-ROI is drawn as a band that BENDS along these
-    // points — following the real tape through a curve — instead of a straight box.
-    private final float[]  laColFrac   = new float[48];
-    private final float[]  laRowFrac   = new float[48];
-    private volatile int   laPointCount = 0;
-
-    // Bottom band (fraction of frame height) that is EXCLUDED from all processing
-    // because the robot's own body is visible there. Drawn as a dim shaded strip
-    // so the exclusion line can be tuned until the robot is fully covered.
-    private volatile float   bottomIgnoreFrac = 0f;
+    // Image → view mapping for the current draw (FILL_CENTER).
+    private float mapScaleX, mapScaleY, mapOffX, mapOffY;
 
     // =========================================================================
 
@@ -102,15 +120,13 @@ public final class OverlayView extends View {
     }
 
     private void initPaints() {
-        // H-ROI — cyan fill + stroke
+        // H-ROI — cyan fill + stroke (stroke turns yellow while calibrating)
         hFillPaint.setStyle(Paint.Style.FILL);
         hFillPaint.setColor(Color.CYAN);
         hFillPaint.setAlpha(45);
 
         hStrokePaint.setStyle(Paint.Style.STROKE);
-        hStrokePaint.setColor(Color.CYAN);
         hStrokePaint.setStrokeWidth(4f);
-        hStrokePaint.setAlpha(230);
 
         // V-ROI — magenta fill + stroke
         vFillPaint.setStyle(Paint.Style.FILL);
@@ -122,16 +138,16 @@ public final class OverlayView extends View {
         vStrokePaint.setStrokeWidth(4f);
         vStrokePaint.setAlpha(230);
 
-        // Centroid vertical line — green when tracking, orange when lost
+        // Centroid line — green when tracking, orange when lost
         centroidPaint.setStyle(Paint.Style.STROKE);
         centroidPaint.setStrokeWidth(5f);
 
-        // Frame-centre dashed reference
-        centerRefPaint.setStyle(Paint.Style.STROKE);
-        centerRefPaint.setColor(Color.WHITE);
-        centerRefPaint.setAlpha(110);
-        centerRefPaint.setStrokeWidth(2f);
-        centerRefPaint.setPathEffect(new DashPathEffect(new float[]{14f, 9f}, 0f));
+        // Calibrated straight-ahead dashed reference
+        refPaint.setStyle(Paint.Style.STROKE);
+        refPaint.setColor(Color.WHITE);
+        refPaint.setAlpha(140);
+        refPaint.setStrokeWidth(2f);
+        refPaint.setPathEffect(new DashPathEffect(new float[]{14f, 9f}, 0f));
 
         // Corner accent marks at T-junction
         cornerPaint.setStyle(Paint.Style.STROKE);
@@ -157,50 +173,15 @@ public final class OverlayView extends View {
         ignoreLinePaint.setStrokeWidth(3f);
     }
 
-    /** Set the excluded bottom band (fraction of frame height) and redraw. */
-    public void setBottomIgnoreFrac(float frac) {
-        this.bottomIgnoreFrac = frac;
-        postInvalidate();
-    }
-
-    /**
-     * Supply the dynamic look-ahead path (nearest → farthest, fractional image
-     * coords) that the purple V-ROI band should bend along. The arrays are COPIED,
-     * so the caller may reuse them on the next frame. Call before {@link #update}.
-     */
-    public void setLookAheadPath(float[] col, float[] row, int count) {
-        final int n = Math.max(0, Math.min(count, laColFrac.length));
-        System.arraycopy(col, 0, laColFrac, 0, n);
-        System.arraycopy(row, 0, laRowFrac, 0, n);
-        laPointCount = n;
-    }
-
     // =========================================================================
-    //  Call from the camera analysis thread
+    //  Call from the pipeline's FrameCallback (camera thread)
     // =========================================================================
 
-    /**
-     * Update sensor geometry and schedule a redraw.  Safe to call from any thread.
-     *
-     * The V-ROI is a perspective trapezoid: centred at {@code vRoiCenterFrac} with
-     * a near (bottom) half-width {@code vRoiHalfBotFrac} that tapers to the smaller
-     * far (top) half-width {@code vRoiHalfTopFrac}, so it matches how the track
-     * narrows with distance under the camera's tilt.
-     */
-    public void update(float hRoiTopFrac, float hRoiBotFrac,
-                       float vRoiTopFrac, float vRoiCenterFrac,
-                       float vRoiHalfBotFrac, float vRoiHalfTopFrac,
-                       float centroidXFrac, float vRoiShearFrac,
-                       boolean trackFound) {
-        this.hRoiTopFrac     = hRoiTopFrac;
-        this.hRoiBotFrac     = hRoiBotFrac;
-        this.vRoiTopFrac     = vRoiTopFrac;
-        this.vRoiCenterFrac  = vRoiCenterFrac;
-        this.vRoiHalfBotFrac = vRoiHalfBotFrac;
-        this.vRoiHalfTopFrac = vRoiHalfTopFrac;
-        this.centroidXFrac   = centroidXFrac;
-        this.vRoiShearFrac   = vRoiShearFrac;
-        this.trackFound      = trackFound;
+    /** Take a copy of this frame's overlay data and schedule a redraw. Any thread. */
+    public void setFrame(LineFollowerPipeline.FrameData data) {
+        synchronized (lock) {
+            pending.copyFrom(data);
+        }
         postInvalidate();
     }
 
@@ -208,70 +189,79 @@ public final class OverlayView extends View {
     //  Drawing — no allocations here
     // =========================================================================
 
+    private float mx(float xFrac) { return mapOffX + xFrac * mapScaleX; }
+    private float my(float yFrac) { return mapOffY + yFrac * mapScaleY; }
+
     @Override
     protected void onDraw(Canvas canvas) {
-        final float W = getWidth();
-        final float H = getHeight();
+        synchronized (lock) {
+            drawn.copyFrom(pending);
+        }
+        final Snapshot s = drawn;
+        if (!s.valid || s.imgW <= 0 || s.imgH <= 0) return;
 
-        final float hTop = hRoiTopFrac   * H;
-        final float hBot = hRoiBotFrac   * H;
-        final float vTop = vRoiTopFrac   * H;        // far (top) edge of the V-ROI
-        final float vC   = vRoiCenterFrac * W;
-        final float halfBot = vRoiHalfBotFrac * W;   // near (bottom) half-width
-        final float halfTop = vRoiHalfTopFrac * W;   // far  (top)    half-width
-        final float cx   = centroidXFrac * W;
-        final float cxMid = W * 0.5f;
-        // Horizontal offset of the V-ROI top edge so the box leans with the line.
-        final float shear = vRoiShearFrac * W;
+        // FILL_CENTER: scale the image to cover the view, centre it, crop overflow.
+        final float W = getWidth(), H = getHeight();
+        final float scale = Math.max(W / s.imgW, H / s.imgH);
+        mapScaleX = s.imgW * scale;
+        mapScaleY = s.imgH * scale;
+        mapOffX   = (W - mapScaleX) * 0.5f;
+        mapOffY   = (H - mapScaleY) * 0.5f;
 
-        // Trapezoid corners: wide near edge at the H-ROI, narrow far edge at the top.
-        final float blX = vC - halfBot,          brX = vC + halfBot;          // bottom
-        final float tlX = vC + shear - halfTop,  trX = vC + shear + halfTop;  // top
+        final float hTop = my(s.hRoiTopFrac);
+        final float hBot = my(s.hRoiBotFrac);
+        final float vTop = my(s.vRoiTopFrac);
+        final float halfBot = s.halfBotFrac * mapScaleX;   // near (bottom) half-width
+        final float halfTop = s.halfTopFrac * mapScaleX;   // far  (top)    half-width
+        final float refX = mx(s.steerRefXFrac);
+        final int   stateColor = !s.isCalibrated ? COLOR_CALIBRATING
+                               : s.trackFound    ? COLOR_TRACKING : COLOR_LOST;
 
         // ── 0. Ignored bottom band (red) — robot body, excluded from processing ─
-        if (bottomIgnoreFrac > 0f) {
-            final float ignoreTop = (1f - bottomIgnoreFrac) * H;
+        if (s.ignoreTopFrac < 1f) {
+            final float ignoreTop = my(s.ignoreTopFrac);
             canvas.drawRect(0f, ignoreTop, W, H, ignorePaint);
             canvas.drawLine(0f, ignoreTop, W, ignoreTop, ignoreLinePaint);
             canvas.drawText("IGNORED (robot)", 8f, ignoreTop + 34f, labelPaint);
         }
 
-        // ── 1. V-ROI column (magenta) — vertical leg of ⊥ ─────────────────────
-        // When a live look-ahead path is available we draw the V-ROI as a BAND that
-        // bends along the detected tape (curves with the road); otherwise we fall
-        // back to the straight perspective trapezoid (before first detection / lost).
-        final int   n       = laPointCount;
-        final boolean dynamic = trackFound && n >= 2;
-        final float span    = (hTop - vTop);         // near→far vertical extent (>0)
+        // ── 1. V-ROI (magenta) — vertical leg of ⊥ ────────────────────────────
+        // With a live look-ahead path the V-ROI is drawn as a BAND that bends along
+        // the detected line; otherwise as the straight perspective trapezoid from
+        // the calibrated steering reference, leaning toward the look-ahead reference.
+        final int     n       = s.laCount;
+        final boolean dynamic = s.trackFound && n >= 2;
+        final float   span    = Math.max(1f, hTop - vTop);   // near→far vertical extent
 
         if (dynamic) {
             // Band outline: left edge nearest→farthest, then right edge back. The
             // half-width tapers per row between the near (wide) and far (narrow) ends.
             bandPath.rewind();
             for (int i = 0; i < n; i++) {
-                final float y = laRowFrac[i] * H;
-                final float x = laColFrac[i] * W;
-                final float t = clamp01((hTop - y) / span);
-                final float half = halfBot + (halfTop - halfBot) * t;
+                final float y = my(s.laRow[i]);
+                final float x = mx(s.laCol[i]);
+                final float half = halfBot + (halfTop - halfBot) * clamp01((hTop - y) / span);
                 if (i == 0) bandPath.moveTo(x - half, y);
                 else        bandPath.lineTo(x - half, y);
             }
             for (int i = n - 1; i >= 0; i--) {
-                final float y = laRowFrac[i] * H;
-                final float x = laColFrac[i] * W;
-                final float t = clamp01((hTop - y) / span);
-                final float half = halfBot + (halfTop - halfBot) * t;
+                final float y = my(s.laRow[i]);
+                final float x = mx(s.laCol[i]);
+                final float half = halfBot + (halfTop - halfBot) * clamp01((hTop - y) / span);
                 bandPath.lineTo(x + half, y);
             }
             bandPath.close();
             canvas.drawPath(bandPath, vFillPaint);
             canvas.drawPath(bandPath, vStrokePaint);
         } else {
+            final float topX = mx(s.trackRefXFrac);
+            final float blX = refX - halfBot, brX = refX + halfBot;   // bottom (near)
+            final float tlX = topX - halfTop, trX = topX + halfTop;   // top    (far)
             vRoiPath.rewind();
-            vRoiPath.moveTo(blX, hTop);           // bottom-left  (at the H-ROI, near)
-            vRoiPath.lineTo(brX, hTop);           // bottom-right
-            vRoiPath.lineTo(trX, vTop);           // top-right    (narrow + leaned, far)
-            vRoiPath.lineTo(tlX, vTop);           // top-left
+            vRoiPath.moveTo(blX, hTop);
+            vRoiPath.lineTo(brX, hTop);
+            vRoiPath.lineTo(trX, vTop);
+            vRoiPath.lineTo(tlX, vTop);
             vRoiPath.close();
             canvas.drawPath(vRoiPath, vFillPaint);
             canvas.drawPath(vRoiPath, vStrokePaint);
@@ -284,44 +274,52 @@ public final class OverlayView extends View {
             canvas.drawLine(trX + 2f, vTop, trX + 2f, vTop + arm, cornerPaint);
         }
 
-        // ── 2. H-ROI strip (cyan) — horizontal bar of ⊥ ──────────────────────
+        // ── 2. H-ROI strip (cyan; yellow outline while calibrating) ───────────
+        hStrokePaint.setColor(s.isCalibrated ? Color.CYAN : COLOR_CALIBRATING);
+        hStrokePaint.setAlpha(230);
         canvas.drawRect(0f, hTop, W, hBot, hFillPaint);
         canvas.drawRect(0f, hTop, W, hBot, hStrokePaint);
 
-        // ── 4. Frame-centre dashed reference (white) ─────────────────────────
-        canvas.drawLine(cxMid, hTop, cxMid, hBot, centerRefPaint);
+        // ── 3. Calibrated straight-ahead reference (dashed white) ─────────────
+        canvas.drawLine(refX, hTop - 20f, refX, hBot + 20f, refPaint);
 
-        // ── 5. Centroid (dynamic) — follows the tape through the curve ─────────
-        centroidPaint.setColor(trackFound
-                ? Color.parseColor("#00E676")    // bright green = tracking
-                : Color.parseColor("#FF6D00"));  // orange = lost
+        // ── 4. Centroid — follows the line through the curve ──────────────────
+        centroidPaint.setColor(stateColor);
+        final float cx;
+        if (s.centroidXFrac >= 0f) {
+            cx = mx(s.centroidXFrac);                  // real detected position
+        } else {
+            // Lost: point at the edge the line left (steering is pinned to ±100).
+            cx = mx(clamp01(s.steerRefXFrac + s.steering / 200f));
+        }
         if (dynamic) {
             centerPath.rewind();
             for (int i = 0; i < n; i++) {
-                final float y = laRowFrac[i] * H;
-                final float x = laColFrac[i] * W;
+                final float y = my(s.laRow[i]);
+                final float x = mx(s.laCol[i]);
                 if (i == 0) centerPath.moveTo(x, y);
                 else        centerPath.lineTo(x, y);
             }
             canvas.drawPath(centerPath, centroidPaint);
-        } else {
-            canvas.drawLine(cx, vTop, cx, hBot, centroidPaint);
+        } else if (s.centroidXFrac >= 0f) {
+            canvas.drawLine(cx, hTop, cx, hBot, centroidPaint);
         }
 
         // Small triangle pointer at the H-ROI to highlight the near centroid.
-        final float tri = 18f;
-        arrowPath.rewind();
-        arrowPath.moveTo(cx, hTop - 4f);
-        arrowPath.lineTo(cx - tri * 0.6f, hTop - tri);
-        arrowPath.lineTo(cx + tri * 0.6f, hTop - tri);
-        arrowPath.close();
-        canvas.drawPath(arrowPath, centroidPaint);   // reuse same colour paint
+        if (s.centroidXFrac >= 0f || s.isCalibrated) {
+            final float tri = 18f;
+            arrowPath.rewind();
+            arrowPath.moveTo(cx, hTop - 4f);
+            arrowPath.lineTo(cx - tri * 0.6f, hTop - tri);
+            arrowPath.lineTo(cx + tri * 0.6f, hTop - tri);
+            arrowPath.close();
+            canvas.drawPath(arrowPath, centroidPaint);   // reuse same colour paint
+        }
 
-        // ── 6. Labels ─────────────────────────────────────────────────────────
-        // Anchor "TURN" to the far end of whichever V-ROI shape we drew.
-        final float turnX = dynamic ? laColFrac[n - 1] * W - halfTop : tlX;
+        // ── 5. Labels ─────────────────────────────────────────────────────────
+        final float turnX = dynamic ? mx(s.laCol[n - 1]) - halfTop : mx(s.trackRefXFrac) - halfTop;
         canvas.drawText("TURN", turnX + 6f, vTop + 30f, labelPaint);
-        canvas.drawText("STEER", 6f, hTop - 10f, labelPaint);
+        canvas.drawText(s.isCalibrated ? "STEER" : "CALIBRATING", 6f, hTop - 10f, labelPaint);
     }
 
     /** Clamp to the unit interval [0,1]. */

@@ -40,7 +40,8 @@ android {
 }
 
 dependencies {
-    implementation(files("libs/LineFollowerPipeline-1.0.0.jar"))
+    // Resolved from the included build ../LineFollowerLibrary (see settings.gradle.kts)
+    implementation("com.example.linefollower:LineFollowerLibrary:1.0.0")
     // CameraX — reliable Camera2-backed camera API, works on all modern Android devices
     implementation(libs.camera.core)
     implementation(libs.camera.camera2)
