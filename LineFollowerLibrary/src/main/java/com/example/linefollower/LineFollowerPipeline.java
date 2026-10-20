@@ -33,11 +33,19 @@ package com.example.linefollower;
  *   2. Threshold: pixels on the track side of (Otsu ± bias) are "track".
  *   3. Line-lock: collapse the H-ROI to a per-column track profile and select the
  *      strongest contiguous BAND. With track memory on, only a gate around the
- *      band's last position is searched, so reflections elsewhere are ignored and
- *      the band is followed to the frame edge → steering [-100 … +100]. When the
- *      band finally leaves the gate, steering pins to that edge (±100) and a new
- *      line is re-acquired (full-width) only after a short grace period.
- *   4. V-ROI look-ahead → tracking value (100 = straight path ahead).
+ *      band's predicted position is searched, so reflections elsewhere are ignored
+ *      and the band is followed to the frame edge. When the band finally leaves the
+ *      gate at the frame edge, steering pins to that edge and a new line is
+ *      re-acquired (full-width) only after a short grace period; if it vanishes
+ *      mid-image (hidden) the last output is held for a few frames instead.
+ *      Distractor rejection: a band only counts as the line if its width and
+ *      "line-ness" match what calibration learned about the line; a line merged
+ *      with a dark object or shadow is cut back to the part that continues it.
+ *   4. V-ROI look-ahead: the line is followed row by row up the frame (same width
+ *      rules, so the tracker cannot step onto a nearby object) → tracking value
+ *      (100 = straight path ahead) and the line's heading on the floor.
+ *   5. Steering = H-ROI offset + heading part (pure-pursuit target point), internal
+ *      [-100 … +100], output scaled to [-50 … +50].
  *
  * All per-frame buffers are pre-allocated in init(); the processFrame methods
  * perform zero heap allocations.
@@ -182,6 +190,70 @@ public final class LineFollowerPipeline {
         // consecutive frames, the lock moves to it. 0 = never correct the lock.
         public int trackRelockFrames = 6;
 
+        // ── Distractor rejection (dark chair, bag, shadow, table edge …) ─────
+        // Objects with a colour close to the line's pass the threshold just like
+        // the line. When ON, a candidate band only counts as the line if it LOOKS
+        // like the line learned at calibration: its width (corrected for the
+        // line's current slant in the image) and how line-like its pixels are.
+        // A band that is too wide (the line merged with a blob or shadow) is cut
+        // back to the part that continues the line from the previous frame, and
+        // the look-ahead tracker applies the same width test row by row. Turn OFF
+        // for the original (v1) band selection.
+        public boolean rejectDistractors = true;
+
+        // Widest band still accepted as the line, as a multiple of the expected
+        // (calibrated, slant-corrected) line width. A real line stays within
+        // about ±30 %; a line merged with a blob or shadow is at least ~2.5×.
+        public float bandMaxWidthMult = 2.0f;
+
+        // Narrowest band accepted as the line, as a fraction of the calibrated
+        // width (bands cut by the frame edge are exempt). Rejects specks / legs
+        // seen end-on that are much thinner than the tape.
+        public float bandMinWidthMult = 0.3f;
+
+        // When the locked line disappears in the MIDDLE of the image (hidden by a
+        // shadow, glare or an object passing over it) the last steering and
+        // tracking values are HELD for up to this many frames instead of jumping
+        // to a full turn. A line that leaves at the frame EDGE (a real turn) is
+        // still pinned to that edge at once. 6 frames = 0.1 s at 60 Hz.
+        public int trackHoldFrames = 6;
+
+        // ── Steering from the whole ⊥ (offset + heading) ─────────────────────
+        // Steering = offset part + heading part:
+        //   offset  = steerOffsetWeight × (line column in the H-ROI − calibrated
+        //             column) / half the frame width            (v1 steering)
+        //   heading = steerHeadingWeight × L × tan(line heading) / (half the
+        //             floor width seen by the H-ROI)
+        // The line heading is the direction of the line where it crosses the
+        // H-ROI, from a least-squares parabola through the H-ROI centroid and the
+        // near look-ahead rows, projected onto the floor with the camera geometry
+        // (cameraTiltDeg, verticalFovDeg) so perspective does not bend it, minus
+        // the heading seen at calibration. Together the two parts are the lateral
+        // position of a pure-pursuit target L further along the line, in the same
+        // units as the v1 steering, so a robot correctly placed on a straight line
+        // still reads 0. steerHeadingWeight = 0 gives exactly the v1 steering.
+        public float steerOffsetWeight  = 1.0f;
+        public float steerHeadingWeight = 1.0f;
+
+        // L, the look-ahead distance of the target point, as a multiple of the
+        // floor distance from the camera to the H-ROI. Larger = the heading counts
+        // more: a robot at an angle to the line straightens out sooner, but on
+        // tight curves the robot runs a little more on the inside, and with a high
+        // steering gain plus delay it can start to weave. 0.5 was the best balance
+        // in the closed-loop simulation (see _investigation/CHANGES_v2.md).
+        public float steerLookAhead = 0.5f;
+
+        // Minimum number of look-ahead rows on the line (plus the H-ROI) for the
+        // heading to be used at full weight. With fewer (end of the line, a very
+        // sharp turn, line leaving the frame) the heading part fades out and the
+        // steering falls back to the offset only.
+        public int steerHeadingMinRows = 24;
+
+        // The line heading seen during calibration is the heading zero (phone
+        // yaw on its mount). It is ignored if larger than this many degrees, as
+        // the robot was then clearly not placed straight on a straight line.
+        public float steerHeadingCalibMaxDeg = 10f;
+
         // ── Track value (look-ahead position) calibration ───────────────────
         // The tracking output is derived from STEERING applied to the LOOK-AHEAD —
         // the V-ROI in front of the robot — using the same band-lock memory as
@@ -260,6 +332,12 @@ public final class LineFollowerPipeline {
         float   tiltDeg      = 0f;
         float   trackWidthPx = 0f;
         int     threshold    = 128;
+        float   offsetTerm   = 0f;    // internal units [-100 … 100]
+        float   headingTerm  = 0f;    // internal units
+        float   headingDeg   = 0f;
+        float   headingConf  = 0f;
+        boolean held         = false;
+        int     rejected     = 0;
     }
 
     // =========================================================================
@@ -338,6 +416,19 @@ public final class LineFollowerPipeline {
         public int steering;
         /** Tracking value [min … 100]; 100 = straight road ahead, low = turn / line lost. */
         public int tracking;
+        /** Offset part of the steering (H-ROI position), in steering output units. */
+        public float steerOffsetTerm;
+        /** Heading part of the steering (line direction from the whole ⊥), in steering output units. */
+        public float steerHeadingTerm;
+        /** Line heading relative to the robot on the floor, perspective-corrected, minus the
+         *  calibrated zero; degrees, positive = line heads to the right. 0 when unknown. */
+        public float headingDeg;
+        /** Weight [0 … 1] the heading got this frame (0 = too little look-ahead, offset only). */
+        public float headingConfidence;
+        /** True when the line is momentarily hidden and the last values are being held. */
+        public boolean lineHeld;
+        /** Number of candidate bands rejected or trimmed as distractors this frame (H-ROI). */
+        public int rejectedBands;
     }
 
     // =========================================================================
@@ -393,6 +484,28 @@ public final class LineFollowerPipeline {
     private float   learnedLineX, learnedLineW;
     // Consecutive frames a better line candidate was seen outside the line lock.
     private int     relockCount;
+    // Typical "line-ness" of line pixels in the H-ROI (0–255, track side = high),
+    // median over calibration (0 = unknown). A band whose pixels only just pass
+    // the threshold (shadowed floor) is less line-like than the real line.
+    private float   calibLevel;
+    private int[]   calibLevelSamples;
+    // Line heading (deg) seen during calibration = heading zero; samples for its median.
+    private float   headingRefDeg;
+    private float[] calibHeadingSamples;
+    private int     calibHeadingCount;
+
+    // ── Distractor rejection / short-term prediction ────────────────────────
+    // centroidVel: smoothed per-frame motion of the line in the H-ROI (px/frame),
+    //   so the gate and the band preference follow the PREDICTED position.
+    // lastImgSlope: image slope d(col)/d(row) of the line near the H-ROI, from the
+    //   previous frame; a slanted line crosses the strip as a wider band.
+    // holdFrames: consecutive frames the line has been held (hidden mid-image).
+    private float   centroidVel;
+    private float   lastImgSlope;
+    private int     holdFrames;
+    private float   lastSteering, lastIntersection;
+    private int     rejectedBands;
+    private boolean bandTrimmed;     // set by findBand: the chosen band was cut out of a wider one
 
     // ── Colour model (learned during calibration, or preset) ────────────────
     // The line-ness value of a pixel is a linear function of its colour:
@@ -458,10 +571,38 @@ public final class LineFollowerPipeline {
     // Pre-allocated per-row centroid buffer for the V-ROI tilt fit (sized in init).
     private float[] rowCx;
 
+    // Floor geometry per image row (exact pinhole model from cameraTiltDeg and
+    // verticalFovDeg, sized in init). A pixel (col, row) sees the floor point
+    //   forward = rowFwd[row],   lateral = rowScale[row] × (col + 0.5 − W/2)
+    // in units of the camera height (lateral positive = right). rowScale also
+    // gives the apparent width of the line: width_px ∝ 1 / rowScale.
+    private float[] rowFwd, rowScale;
+    private float   floorFwdH, floorScaleH;   // the same at the H-ROI centre row
+
+    // Least-squares sums of the line on the FLOOR (lateral vs forward), filled by
+    // traceLookAhead() together with the image-space fit.
+    private int     floorN;
+    // Sums over u = forward − (forward at the H-ROI) for a parabola fit x = A + B·u + C·u².
+    private double  fU, fUU, fUUU, fUUUU, fX, fUX, fUUX, fXX;
+    private float   fUmin, fUmax;
+    private float   floorSpan;     // forward extent of the fitted points (camera heights)
+    // Heading of the last trace (deg, before the calibrated zero) and its weight [0 … 1].
+    private float   fitHeadingDeg, fitConfidence;
+    // Only the line up to this many H-ROI distances beyond the H-ROI is fitted: the
+    // heading is wanted near the robot, and far rows may already be in the next turn.
+    private static final float FIT_DEPTH = 1.5f;
+
+    // Look-ahead trace results (set by traceLookAhead).
+    private int     traceFitN, traceFarRow, traceLaCount;
+    private double  traceSlope, traceNearSlope, traceLaW, traceLaM;
+
     // Pre-allocated per-column "track pixel count" profile of the H-ROI (sized in
     // init). Lets Stage 2 isolate the strongest contiguous BAND instead of
     // averaging every track pixel, which is what makes the line-lock possible.
     private int[] colWeight;
+    // Per-column sum of the line-ness of those track pixels (same strip), so the
+    // mean line-ness of any band is colLevel / colWeight summed over its columns.
+    private int[] colLevel;
 
     // Result of the most recent findBand() call.
     private long   bandSum;
@@ -478,6 +619,8 @@ public final class LineFollowerPipeline {
     private FrameCallback    frameCallback;
     // Pre-allocated FrameData — filled and passed to the callback each frame.
     private final FrameData  frameData = new FrameData();
+    // True while fireCallback runs for a processFrame call (not a calibration frame).
+    private boolean          isProcessing;
 
     // =========================================================================
     //  Public API — setup
@@ -701,8 +844,36 @@ public final class LineFollowerPipeline {
             laPerspectiveRatio = (scaleNear > 1e-4f) ? scaleFar / scaleNear : 1f;
         }
 
+        // Exact pinhole floor geometry per row (used by the heading and the width
+        // tests). Focal length from the vertical FOV; a row at normalised offset
+        // yn below the image centre looks down at (tilt + atan yn), so a floor
+        // point there lies forward = (cos t − yn·sin t)/(yn·cos t + sin t) and a
+        // column offset of 1 px is 1/(f·(yn·cos t + sin t)) camera heights sideways.
+        // Rows at or above the horizon get NaN (never used: the V-ROI is below it).
+        {
+            final double f  = (height * 0.5) / Math.tan(Math.toRadians(fov * 0.5));
+            final double t  = Math.toRadians(config.cameraTiltDeg);
+            final double st = Math.sin(t), ct = Math.cos(t);
+            rowFwd   = new float[height];
+            rowScale = new float[height];
+            for (int r = 0; r < height; r++) {
+                final double yn = (r + 0.5 - height * 0.5) / f;
+                final double down = yn * ct + st;
+                if (down > 1e-3) {
+                    rowFwd[r]   = (float) ((ct - yn * st) / down);
+                    rowScale[r] = (float) (1.0 / (f * down));
+                } else {
+                    rowFwd[r] = Float.NaN; rowScale[r] = Float.NaN;
+                }
+            }
+            final int hc = Math.min(height - 1, (hRoiTop + hRoiBot) / 2);
+            floorFwdH   = rowFwd[hc];
+            floorScaleH = rowScale[hc];
+        }
+
         rowCx             = new float[height];
         colWeight         = new int[width];
+        colLevel          = new int[width];
         work              = new byte[width * height];
         final int maxSamples = Math.max(1, config.colorCalibFrames) * SAMPLES_PER_FRAME;
         sampY             = new short[maxSamples];
@@ -729,6 +900,9 @@ public final class LineFollowerPipeline {
         learnedLineX      = 0f;
         learnedLineW      = 0f;
         relockCount       = 0;
+        calibLevelSamples   = new int[Math.max(1, config.calibFrames)];
+        calibHeadingSamples = new float[Math.max(1, config.calibFrames)];
+        resetLineModel();
         laPathCount       = 0;
         steerRefX         = width * 0.5f;   // default = image centre until calibrated
         trackRefX         = width * 0.5f;
@@ -791,6 +965,7 @@ public final class LineFollowerPipeline {
         learnedLineX       = 0f;
         learnedLineW       = 0f;
         relockCount        = 0;
+        resetLineModel();
         trackAcquired      = false;
         lostFrames         = 0;
         laPathCount        = 0;
@@ -889,7 +1064,10 @@ public final class LineFollowerPipeline {
             }
         } else {
             // Phase 2: find the line band (full-width) and record its centroid.
-            final byte[] pix = prepareWorkImage(hRoiTop, hRoiBot);
+            // With the heading term on, the look-ahead rows are prepared too, so the
+            // line heading seen while the robot stands straight becomes the zero.
+            final boolean wantHeading = cfg.steerHeadingWeight != 0f;
+            final byte[] pix = prepareWorkImage(wantHeading ? vRoiTop : hRoiTop, hRoiBot);
             final int threshold = stripThreshold(pix, workBright);
             output.threshold = threshold;
             buildColumnProfile(pix, threshold, workBright);
@@ -897,7 +1075,11 @@ public final class LineFollowerPipeline {
             // so a shadow edge or a neighbouring tape is not taken as the line.
             final float prefX = learnedLineW > 0f ? learnedLineX : imgW * 0.5f;
             final double minWeight = (double) cfg.minWeightFrac * Math.max(1, hRoiBot - hRoiTop) * imgW;
-            findBand(0, imgW, minWeight, prefX, imgW * 0.25f, learnedLineW);
+            // Width test against the width colour learning saw (when known): a band
+            // merged with a neighbouring dark area must not become the reference.
+            final boolean filter = cfg.rejectDistractors && learnedLineW > 0f;
+            setBandLimits(threshold, workBright, learnedLineW, 0f);
+            findBand(0, imgW, minWeight, prefX, imgW * 0.25f, learnedLineW, filter, false);
 
             if (bandStart >= 0) {
                 lineFound = true;
@@ -908,14 +1090,34 @@ public final class LineFollowerPipeline {
                 if (calibCount < calibSteerSamples.length) {
                     calibSteerSamples[calibCount] = centroidX;
                     calibWidthSamples[calibCount] = bandEnd - bandStart;
+                    calibLevelSamples[calibCount] = Math.round(bandLevel(bandStart, bandEnd));
+                }
+                if (wantHeading) {
+                    final int vThr = lookAheadThreshold(pix, threshold, workBright);
+                    traceLookAhead(pix, vThr, workBright, centroidX, false);
+                    laPathCount = 0;   // calibration draws no look-ahead path
+                    computeHeading();
+                    if (fitConfidence >= 0.999f && calibHeadingCount < calibHeadingSamples.length) {
+                        calibHeadingSamples[calibHeadingCount++] = fitHeadingDeg;
+                    }
                 }
                 if (++calibCount >= Math.max(1, cfg.calibFrames)) {
                     final int n = Math.min(calibCount, calibSteerSamples.length);
                     java.util.Arrays.sort(calibSteerSamples, 0, n);
                     java.util.Arrays.sort(calibWidthSamples, 0, n);
+                    java.util.Arrays.sort(calibLevelSamples, 0, n);
                     steerRefX    = calibSteerSamples[n / 2];                // robust median
                     calibWidthPx = calibWidthSamples[n / 2];
+                    calibLevel   = calibLevelSamples[n / 2];
                     trackRefX    = imgW * 0.5f + (steerRefX - imgW * 0.5f) * laPerspectiveRatio;
+                    // Heading zero: median heading of the calibration frames, used only
+                    // if most frames saw enough look-ahead and it is plausibly small.
+                    headingRefDeg = 0f;
+                    if (calibHeadingCount * 2 >= n) {
+                        java.util.Arrays.sort(calibHeadingSamples, 0, calibHeadingCount);
+                        final float h = calibHeadingSamples[calibHeadingCount / 2];
+                        if (Math.abs(h) <= cfg.steerHeadingCalibMaxDeg) headingRefDeg = h;
+                    }
                     calibrated   = true;
                 }
             } else {
@@ -938,7 +1140,9 @@ public final class LineFollowerPipeline {
         //   internal 0   (straight) → output 100 (no braking needed)
         //   internal 100 (hard turn / lost) → output min (brake / slow down)
         result[1] = Math.max(cfg.trackingMinValue, Math.round(100f - output.intersection));
+        isProcessing = true;
         fireCallback(result[0], result[1], output.trackFound, output.centroidX);
+        isProcessing = false;
         return result;
     }
 
@@ -1406,19 +1610,35 @@ public final class LineFollowerPipeline {
         return bright ? (px >= threshold) : (px <= threshold);
     }
 
-    /** Collapse the H-ROI into a per-column count of track pixels (colWeight). */
+    /**
+     * Collapse the H-ROI into a per-column count of track pixels (colWeight) and
+     * the sum of their line-ness (colLevel; line-ness = pixel value for a bright
+     * track, 255 − value for a dark one, so "more line-like" is always higher).
+     */
     private void buildColumnProfile(byte[] pixels, int threshold, boolean bright) {
         final int W = imgW;
         final int[] colW = colWeight;
+        final int[] colL = colLevel;
         java.util.Arrays.fill(colW, 0, W, 0);
+        java.util.Arrays.fill(colL, 0, W, 0);
         if (threshold == NO_TRACK) return;
         for (int row = hRoiTop; row < hRoiBot; row++) {
             final int base = row * W;
             for (int col = 0; col < W; col++) {
                 final int px = pixels[base + col] & 0xFF;
-                if (bright ? (px >= threshold) : (px <= threshold)) colW[col]++;
+                if (bright ? (px >= threshold) : (px <= threshold)) {
+                    colW[col]++;
+                    colL[col] += bright ? px : 255 - px;
+                }
             }
         }
+    }
+
+    /** Mean line-ness of the track pixels in columns [start, end). */
+    private float bandLevel(int start, int end) {
+        long n = 0, s = 0;
+        for (int c = Math.max(0, start), e = Math.min(imgW, end); c < e; c++) { n += colWeight[c]; s += colLevel[c]; }
+        return n > 0 ? (float) s / n : 0f;
     }
 
     /**
@@ -1433,13 +1653,20 @@ public final class LineFollowerPipeline {
      * Writes bandSum / bandMoment / bandStart / bandEnd / bandScore
      * (bandStart = -1 if no run qualifies).
      */
-    private void findBand(int lo, int hi, double minWeight, float prefX, float scale, float expectW) {
+    //
+    // With {@code filter} (Config.rejectDistractors) a run must also look like the
+    // line learned at calibration (see setBandLimits): runs narrower than fMinW
+    // are skipped, runs wider than fMaxW are skipped too — or, with {@code trim}
+    // (line locked), cut back to the part that continues the predicted line —
+    // and the score is weighted by how line-like the run's pixels are.
+    private void findBand(int lo, int hi, double minWeight, float prefX, float scale, float expectW,
+                          boolean filter, boolean trim) {
         final int[] colW = colWeight;
         final int runGapTol = runGapTol();
         long   curSum = 0;
         double curMoment = 0;
         int    curStart = -1, curLast = -1, gapCols = 0;
-        bandSum = 0; bandMoment = 0; bandStart = -1; bandEnd = -1; bandScore = -1f;
+        bandSum = 0; bandMoment = 0; bandStart = -1; bandEnd = -1; bandScore = -1f; bandTrimmed = false;
         for (int col = lo; col <= hi; col++) {
             final int w = (col < hi) ? colW[col] : 0;
             if (w > 0) {
@@ -1447,16 +1674,135 @@ public final class LineFollowerPipeline {
                 curSum += w; curMoment += (double) col * w; gapCols = 0; curLast = col;
             } else if (curStart >= 0 && (col == hi || ++gapCols > runGapTol)) {   // run ends
                 if (curSum >= minWeight) {
-                    final float s = scoreBand(curSum, (float) (curMoment / curSum),
-                                              curLast + 1 - curStart, prefX, scale, expectW);
-                    if (s > bandScore) {
-                        bandScore = s; bandSum = curSum; bandMoment = curMoment;
-                        bandStart = curStart; bandEnd = curLast + 1;
+                    if (filter) {
+                        considerRun(curStart, curLast + 1, curSum, curMoment, minWeight, prefX, scale, expectW, trim);
+                    } else {
+                        final float s = scoreBand(curSum, (float) (curMoment / curSum),
+                                                  curLast + 1 - curStart, prefX, scale, expectW);
+                        if (s > bandScore) {
+                            bandScore = s; bandSum = curSum; bandMoment = curMoment;
+                            bandStart = curStart; bandEnd = curLast + 1;
+                        }
                     }
                 }
                 curStart = -1;
             }
         }
+    }
+
+    // ── Distractor rejection: what the line must look like (set per frame) ──
+    private float fMinW, fMaxW;           // accepted band width range (px)
+    private float fExpW;                  // expected band width for the current slant (px; 0 = unknown)
+    private float fPredX, fPredW;         // predicted line centre and width (px), for trimming
+    private float fLevelThr, fLevelLine;  // line-ness at the threshold / of the calibrated line
+    // Sub-band written by trimBand().
+    private int    trimStart, trimEnd;
+    private long   trimSum;
+    private double trimMoment;
+
+    /**
+     * Set the width / line-ness limits for the next findBand calls.
+     * {@code slantW}: expected band width (px) for the line's current slant
+     * (0 = unknown → no width limits); {@code minRefW}: width the minimum is
+     * relative to (0 = no minimum).
+     */
+    private void setBandLimits(int threshold, boolean bright, float slantW, float minRefW) {
+        fExpW = slantW;
+        fMaxW = slantW > 0f ? cfg.bandMaxWidthMult * slantW + 4f : Float.MAX_VALUE;
+        fMinW = minRefW > 0f ? cfg.bandMinWidthMult * minRefW : 0f;
+        fLevelThr  = threshold == NO_TRACK ? 0f : (bright ? threshold : 255 - threshold);
+        fLevelLine = calibLevel;
+    }
+
+    /** Line-likeness [0.1 … 1] of a band with mean line-ness {@code level}; 1 when unknown. */
+    private float levelFactor(float level) {
+        final float span = fLevelLine - fLevelThr;
+        if (span < 8f) return 1f;                         // line level unknown / too close to threshold
+        return Math.max(0.1f, Math.min(1f, (level - fLevelThr) / span));
+    }
+
+    /** Score one run under the distractor rules (filter on) and keep it if best so far. */
+    private void considerRun(int start, int end, long sum, double moment, double minWeight,
+                             float prefX, float scale, float expectW, boolean trim) {
+        boolean trimmed = false;
+        final int width = end - start;
+        if (width > fMaxW) {
+            // Too wide for the line: a line merged with a blob / shadow, or a blob.
+            rejectedBands++;
+            if (!trim || !trimBand(start, end)) return;
+            start = trimStart; end = trimEnd; sum = trimSum; moment = trimMoment;
+            if (sum < minWeight * 0.5 || sum <= 0) return;
+            trimmed = true;
+        } else if (trim && fExpW > 0f && width > 1.3f * fExpW && trimBand(start, end)
+                   && trimEnd - trimStart < width) {
+            // Wider than the line but not impossibly so: the line has started to
+            // merge with something beside it. Keep the part that continues the
+            // line, so the centroid does not creep toward the object.
+            rejectedBands++;
+            start = trimStart; end = trimEnd; sum = trimSum; moment = trimMoment;
+            trimmed = true;
+        } else if (width < fMinW && start > 0 && end < imgW) {
+            rejectedBands++;                               // much thinner than the tape
+            return;
+        }
+        final int w = end - start;
+        // Pixel count, capped at what a line of the expected width can hold, so a
+        // bigger object of acceptable width does not win just by being bigger.
+        long s = sum;
+        if (expectW > 0f) s = Math.min(s, (long) (1.2f * expectW * Math.max(1, hRoiBot - hRoiTop)));
+        float score = scoreBand(s, (float) (moment / sum), w, prefX, scale, expectW);
+        score *= levelFactor(bandLevel(start, end));
+        if (score > bandScore) {
+            bandScore = score; bandSum = sum; bandMoment = moment;
+            bandStart = start; bandEnd = end; bandTrimmed = trimmed;
+        }
+    }
+
+    /**
+     * Cut the line out of an over-wide run [start, end) using the prediction
+     * (fPredX, fPredW). First try the "strong core": columns whose pixels are as
+     * line-like as the calibrated line (a shadow or dark floor next to the line is
+     * usually less so). Otherwise keep the edge that sits where the predicted
+     * line edge is (the line merged with an object on its OTHER side).
+     * Writes trimStart / trimEnd / trimSum / trimMoment; false if neither works.
+     */
+    private boolean trimBand(int start, int end) {
+        final int[] colW = colWeight, colL = colLevel;
+        final int rows = Math.max(1, hRoiBot - hRoiTop);
+        final float predW = Math.max(4f, fPredW);
+        // (1) strong core
+        final float span = fLevelLine - fLevelThr;
+        if (span >= 8f) {
+            final float strong = fLevelThr + 0.6f * span;
+            final int gapTol = runGapTol();
+            int bestS = -1, bestE = -1; float bestD = Float.MAX_VALUE;
+            int cs = -1, cl = -1;
+            for (int c = start; c <= end; c++) {
+                final boolean ok = c < end && colW[c] * 2 >= rows && colL[c] >= strong * colW[c];
+                if (ok) { if (cs < 0) cs = c; cl = c; }
+                else if (cs >= 0 && (c == end || c - cl > gapTol)) {
+                    final int w = cl + 1 - cs;
+                    final float d = Math.abs((cs + cl + 1) * 0.5f - fPredX);
+                    if (w >= fMinW && w <= fMaxW && d <= Math.max(predW, 24f) && d < bestD) { bestD = d; bestS = cs; bestE = cl + 1; }
+                    cs = -1;
+                }
+            }
+            if (bestS >= 0) return sumRange(bestS, bestE);
+        }
+        // (2) the edge that continues the predicted line
+        final float tol = Math.max(8f, 0.3f * predW);
+        final boolean leftOk  = Math.abs(start - (fPredX - predW * 0.5f)) <= tol;
+        final boolean rightOk = Math.abs(end   - (fPredX + predW * 0.5f)) <= tol;
+        if (leftOk && !rightOk)  return sumRange(start, Math.min(end, start + Math.round(predW)));
+        if (rightOk && !leftOk)  return sumRange(Math.max(start, end - Math.round(predW)), end);
+        return false;
+    }
+
+    private boolean sumRange(int s, int e) {
+        long sum = 0; double m = 0;
+        for (int c = s; c < e; c++) { sum += colWeight[c]; m += (double) c * colWeight[c]; }
+        trimStart = s; trimEnd = e; trimSum = sum; trimMoment = m;
+        return sum > 0;
     }
 
     /**
@@ -1517,8 +1863,8 @@ public final class LineFollowerPipeline {
      */
     private void runPipeline(byte[] pixels, int width, int height, boolean bright) {
         final int   W     = width;
-        final int   rowStride = width;
         final float halfW = W * 0.5f;
+        final boolean filter = cfg.rejectDistractors;
 
         // ── Stage 1: Otsu adaptive threshold from the H-ROI histogram ──────────
         // Recalibrates every frame, so uneven / changing lighting is handled.
@@ -1536,58 +1882,105 @@ public final class LineFollowerPipeline {
         // Instead of averaging EVERY track pixel across the strip (which lets a
         // reflection anywhere drag the centroid toward the middle), we collapse the
         // H-ROI into a per-column profile and lock onto ONE contiguous band — the
-        // track. With track memory on we only scan a gate around the band's last
-        // known position, so spots outside the gate are ignored and steering can
-        // run all the way to the edge. The lock is held until the line has been
+        // track. With track memory on we only scan a gate around the band's
+        // PREDICTED position, so spots outside the gate are ignored and steering
+        // can run all the way to the edge. The lock is held until the line has been
         // gone for trackLostGraceFrames (you have moved fully off it); only then do
         // we search the whole width for a new line.
+        //
+        // Distractor rejection (rejectDistractors): a dark chair, bag or shadow
+        // passes the threshold just like the line, so a band only counts as the
+        // line if its width matches the calibrated line width (corrected for the
+        // line's slant) and its pixels are as line-like as the calibrated line.
+        // A band that is the line MERGED with such an object is cut back to the
+        // part that continues the predicted line.
         buildColumnProfile(pixels, threshold, bright);
+        rejectedBands = 0;
 
         final int    hRoiRows  = Math.max(1, hRoiBot - hRoiTop);
         final double minWeight = (double) cfg.minWeightFrac * hRoiRows * W;
+        final float  expectW   = expectedLineWidth();
 
-        // Search window: a gate around the remembered line when locked, otherwise
-        // the full width (fresh start, or re-acquiring after the line was lost).
+        // Expected band width for the line's current slant in the strip: a line
+        // crossing at image slope s (columns per row) is wider by sqrt(1+s²), plus
+        // s × the strip height. The slope comes from the previous frame's fit.
+        float slantW = expectW;
+        if (filter && expectW > 0f) {
+            final float s = Math.max(-3f, Math.min(3f, lastImgSlope));
+            slantW = expectW * (float) Math.sqrt(1f + s * s) + hRoiRows * Math.abs(s);
+        }
+        setBandLimits(threshold, bright, filter ? slantW : 0f, filter ? expectW : 0f);
+
+        // Search window: a gate around the remembered (predicted) line when locked,
+        // otherwise the full width (fresh start, or re-acquiring after a loss).
         final boolean locked = cfg.trackMemory && trackAcquired;
+        final float predX = (locked && filter)
+                ? Math.max(0f, Math.min(W - 1f, lastCentroidX + centroidVel)) : lastCentroidX;
+        fPredX = predX;
+        fPredW = lastTrackWidthPx;
         int gateHalf = W;
         if (locked) {
-            gateHalf = Math.max(cfg.trackMemoryMinGatePx,
-                                Math.round(cfg.trackMemoryGateMult * lastTrackWidthPx));
+            // Gate from the measured line width — with distractor rejection never
+            // wider than an acceptable band, so it cannot grow to the whole frame.
+            final float refW = (filter && expectW > 0f) ? Math.min(lastTrackWidthPx, fMaxW) : lastTrackWidthPx;
+            gateHalf = Math.max(cfg.trackMemoryMinGatePx, Math.round(cfg.trackMemoryGateMult * refW));
             gateHalf = Math.min(gateHalf, W / 2);
         }
-        final int searchLo = locked ? Math.max(0, lastCentroidX - gateHalf) : 0;
-        final int searchHi = locked ? Math.min(W, lastCentroidX + gateHalf) : W;
+        final int gateC    = Math.round(predX);
+        final int searchLo = locked ? Math.max(0, gateC - gateHalf) : 0;
+        final int searchHi = locked ? Math.min(W, gateC + gateHalf) : W;
         // Candidate scoring (see scoreBand):
-        //   • locked    — inside the gate, prefer the band nearest the last position.
+        //   • locked    — inside the gate, prefer the band nearest the predicted
+        //                 position (with distractor rejection: on the scale of one
+        //                 line width, with the expected width and line-ness).
         //   • searching — across the frame, prefer a band near the calibrated
         //                 straight-ahead column with the calibrated line width, so a
         //                 reflection or a neighbouring tape is not grabbed just
         //                 because it happens to be the biggest thing in view.
-        final float expectW    = expectedLineWidth();
         final float lineScale  = W * 0.25f;
-        if (locked) findBand(searchLo, searchHi, minWeight, lastCentroidX, gateHalf, 0f);
-        else        findBand(0, W, minWeight, steerRefX, lineScale, expectW);
-        final int runGapTol = runGapTol();
+        if (locked) {
+            if (filter) findBand(searchLo, searchHi, minWeight, predX,
+                                 Math.max(24f, slantW > 0f ? slantW : lastTrackWidthPx), slantW, true, true);
+            else        findBand(searchLo, searchHi, minWeight, lastCentroidX, gateHalf, 0f, false, false);
+        } else {
+            findBand(0, W, minWeight, steerRefX, lineScale, expectW, filter, false);
+        }
 
         // Lock correction: while locked, also look at the whole strip. If a band that
         // is clearly a better line candidate (by the "searching" score) sits outside
         // the locked band for trackRelockFrames frames in a row, the lock was on the
-        // wrong thing — move it there.
+        // wrong thing — move it there. With distractor rejection the locked band must
+        // ALSO look doubtful (trimmed / wrong width / not line-like), or the better
+        // candidate must persist three times longer: a chair leg near the centre must
+        // not steal the lock from the real line during a turn.
         if (locked && bandStart >= 0 && cfg.trackRelockFrames > 0) {
-            final long   lockSum   = bandSum;
-            final double lockMom   = bandMoment;
-            final int    lockStart = bandStart, lockEnd = bandEnd;
-            final float  lockScore = scoreBand(lockSum, (float) (lockMom / lockSum),
-                                               lockEnd - lockStart, steerRefX, lineScale, expectW);
-            findBand(0, W, minWeight, steerRefX, lineScale, expectW);
+            final long    lockSum   = bandSum;
+            final double  lockMom   = bandMoment;
+            final int     lockStart = bandStart, lockEnd = bandEnd;
+            final boolean lockTrim  = bandTrimmed;
+            float lockScore = scoreBand(lockSum, (float) (lockMom / lockSum),
+                                        lockEnd - lockStart, steerRefX, lineScale, expectW);
+            boolean doubtful = true;
+            if (filter) {
+                final float lvl = levelFactor(bandLevel(lockStart, lockEnd));
+                lockScore *= lvl;
+                final float ratio = slantW > 0f ? (lockEnd - lockStart) / slantW : 1f;
+                doubtful = lockTrim || lvl < 0.5f || ratio < 0.6f || ratio > 1.6f;
+            }
+            final int savedRejected = rejectedBands;
+            findBand(0, W, minWeight, steerRefX, lineScale, expectW, filter, false);
+            rejectedBands = savedRejected;
             final boolean better = bandStart >= 0
                     && (bandEnd <= lockStart || bandStart >= lockEnd)
                     && bandScore > RELOCK_RATIO * lockScore;
-            if (better && ++relockCount >= cfg.trackRelockFrames) {
+            final int need = doubtful ? cfg.trackRelockFrames : 3 * cfg.trackRelockFrames;
+            if (better && ++relockCount >= need) {
                 relockCount = 0;                          // adopt the candidate (already in band*)
+                centroidVel = 0f;
             } else {
                 if (!better) relockCount = 0;
                 bandSum = lockSum; bandMoment = lockMom; bandStart = lockStart; bandEnd = lockEnd;
+                bandTrimmed = lockTrim;
             }
         } else {
             relockCount = 0;
@@ -1595,6 +1988,7 @@ public final class LineFollowerPipeline {
 
         boolean trackFound;
         int     centroidX;
+        boolean held               = false;
         float   forcedIntersection = -1f;   // ≥ 0 overrides the look-ahead stage
         float   pinnedSteering     = 0f;    // ±100 while the locked line is lost
 
@@ -1602,26 +1996,49 @@ public final class LineFollowerPipeline {
             // Locked onto the line this frame.
             trackFound       = true;
             centroidX        = (int) (bandMoment / bandSum);
+            if (filter) {
+                // Short-term motion of the line (px/frame) for the next prediction;
+                // a fresh lock starts at rest. Clamped so one odd frame cannot fling it.
+                float d = locked ? centroidX - lastCentroidX : 0f;
+                final float lim = 0.5f * Math.max(20f, slantW > 0f ? slantW : lastTrackWidthPx);
+                d = Math.max(-lim, Math.min(lim, d));
+                centroidVel = locked ? 0.5f * centroidVel + 0.5f * d : 0f;
+            }
             lastCentroidX    = centroidX;
             lastTrackWidthPx = Math.max(1, bandEnd - bandStart);
             trackAcquired    = true;
             lostFrames       = 0;
+            holdFrames       = 0;
         } else if (locked) {
-            // The line we were following just left the gate → you have moved fully
-            // off it. Pin steering hard toward the edge it exited and flag a 100 %
-            // turn. Keep the gate parked at that edge so the SAME line re-locks if
-            // it comes back; only after the grace period do we hunt a new one.
             trackFound  = false;
             lostFrames++;
-            // Pin toward the edge it exited, RELATIVE to the calibrated centre. The
-            // steering is set to exactly ±100 below (the clamped pixel column alone
-            // would read less than 100 when the calibrated centre is off-centre).
-            final boolean onRight = lastCentroidX >= Math.round(steerRefX);
-            centroidX     = onRight ? Math.min(W - 1, Math.round(steerRefX + halfW))
-                                    : Math.max(0,     Math.round(steerRefX - halfW));
-            lastCentroidX = centroidX;
-            pinnedSteering     = onRight ? 100f : -100f;
-            forcedIntersection = 100f;
+            // Where the line should be now. If that is well inside the image, the
+            // line did not leave the view — it is hidden (shadow, glare, an object
+            // over it) or briefly unreadable: hold the last output for a few frames.
+            final float edgeZone = Math.max(lastTrackWidthPx, 0.12f * W);
+            final boolean midImage = filter && predX > edgeZone && predX < W - edgeZone;
+            if (midImage && holdFrames < cfg.trackHoldFrames) {
+                holdFrames++;
+                held          = true;
+                lastCentroidX = Math.round(predX);
+                centroidVel  *= 0.8f;
+                centroidX     = lastCentroidX;
+            } else {
+                // The line we were following just left the gate → you have moved fully
+                // off it. Pin steering hard toward the edge it exited and flag a 100 %
+                // turn. Keep the gate parked at that edge so the SAME line re-locks if
+                // it comes back; only after the grace period do we hunt a new one.
+                // Pin toward the edge it exited, RELATIVE to the calibrated centre. The
+                // steering is set to exactly ±100 below (the clamped pixel column alone
+                // would read less than 100 when the calibrated centre is off-centre).
+                final boolean onRight = lastCentroidX >= Math.round(steerRefX);
+                centroidX     = onRight ? Math.min(W - 1, Math.round(steerRefX + halfW))
+                                        : Math.max(0,     Math.round(steerRefX - halfW));
+                lastCentroidX = centroidX;
+                centroidVel   = 0f;
+                pinnedSteering     = onRight ? 100f : -100f;
+                forcedIntersection = 100f;
+            }
             if (lostFrames > cfg.trackLostGraceFrames) {
                 trackAcquired = false;     // release lock → full-width re-acquire next frame
             }
@@ -1634,155 +2051,51 @@ public final class LineFollowerPipeline {
         // (Steering & track values are computed after Stage 3, once the look-ahead
         //  position is known.)
 
-        // ── Stage 3 threshold: adaptive to the (dimmer, farther) look-ahead ───
-        // The far look-ahead line is dimmer than the near line, so the H-ROI Otsu
-        // can miss it — the tracker then loses the line early and the track value
-        // plateaus. Build a subsampled histogram of the whole V-ROI band and run
-        // Otsu again to get a threshold matched to the look-ahead's own lighting.
-        int vThreshold = threshold;
-        if (cfg.vRoiAdaptiveThreshold && vRoiBot > vRoiTop) {
-            final int[] histV = histogramV;
-            java.util.Arrays.fill(histV, 0);
-            final int stepR = Math.max(1, (vRoiBot - vRoiTop) / 240);   // ~240 rows sampled
-            final int stepC = Math.max(1, W / 240);                     // ~240 cols sampled
-            long cntV = 0;
-            for (int row = vRoiTop; row < vRoiBot; row += stepR) {
-                final int base = row * rowStride;
-                for (int col = 0; col < W; col += stepC) {
-                    histV[pixels[base + col] & 0xFF]++; cntV++;
-                }
-            }
-            final int t = finishThreshold(otsuThreshold(histV, cntV), bright);
-            if (t != NO_TRACK) vThreshold = t;   // flat look-ahead → keep the strip threshold
-        }
-
-        // ── Stage 3: look-ahead along the line → intersection ──────────────────
-        //
-        // We TRACK the line up through the V-ROI, recentring the scan window on
-        // the previous row's centroid, so curves and a skewed approach are
-        // followed instead of leaking out of a fixed column. Only rows where the
-        // line is actually VISIBLE are used; empty far-away rows are never counted.
-        //
-        final int     half   = cfg.vRoiHalfWidthPx;
-        final float[] rowCx  = this.rowCx;
-        final int     maxGap = Math.max(8, cfg.hRoiThickPx);   // stop after this many empty rows
-
-        // Per-row line-lock limits (same memory idea as Stage 2, applied upward):
-        //   • minRowW   — a row's run must be at least this many pixels to count,
-        //                 so 1-px specular noise never seeds the tracker.
-        //   • vMaxDrift — the run's centre may sit at most this far from where the
-        //                 line was on the row below. A real line drifts only a few
-        //                 px per row even on curves, so this is what stops the
-        //                 tracker from JUMPING onto a separate object (table)
-        //                 that happens to fall inside the scan window.
-        final int minRowW   = Math.max(1, Math.round(0.25f * lastTrackWidthPx));
-        final int vMaxDrift = Math.max(8, Math.round(0.75f * lastTrackWidthPx));
-
-        // Least-squares accumulators over rows with a detected centroid (y = row).
-        int    fitN = 0;
-        double sY = 0.0, sYY = 0.0, sC = 0.0, sYC = 0.0;
-
-        // Anchor the fit with the H-ROI centroid (longest, most reliable baseline).
-        if (trackFound) {
-            final double yH = (hRoiTop + hRoiBot) * 0.5;
-            fitN++; sY += yH; sYY += yH * yH; sC += centroidX; sYC += yH * centroidX;
-        }
-
-        // 3a. Track the line from the bottom of the V-ROI upward, following drift.
-        //     Each row we lock onto the contiguous RUN closest to the line's
-        //     position on the row below — never the average of everything in the
-        //     window — and reject any run that is too small or too far (a different
-        //     object). Stop once the line has been missing for maxGap rows (end /
-        //     off the road), so empty frame above is never mistaken for the track.
-        int trackCenter = centroidX;
-        int gap         = 0;
-        int farRow      = -1;   // farthest (topmost) V-ROI row where the line was accepted
-        // Look-ahead position accumulators: a centroid of the band-locked line over
-        // the V-ROI, weighting FARTHER-ahead rows more so the value previews the
-        // road in front of the robot rather than what is right under it.
-        double laW = 0.0, laM = 0.0;
-
-        // Dynamic look-ahead path (nearest → farthest) for the overlay to follow.
-        // Seed it with the near H-ROI centroid so the drawn band starts on the line,
-        // then push one point every laStride accepted rows (subsampled to LA_MAX_PTS).
-        int laCount = 0;
-        final int laStride = Math.max(1, (vRoiBot - vRoiTop) / Math.max(1, LA_MAX_PTS - 2));
-        int laNext = 0;
-        if (trackFound) {
-            laPathRowFrac[laCount] = (float) ((hRoiTop + hRoiBot) * 0.5) / imgH;
-            laPathColFrac[laCount] = centroidX / (float) imgW;
-            laCount++;
-        }
-
-        for (int row = vRoiBot - 1; row >= vRoiTop && trackFound; row--) {
-            final int vLeft  = Math.max(0,     trackCenter - half);
-            final int vRight = Math.min(width, trackCenter + half);
-            final int base   = row * rowStride;
-
-            // Scan the window, picking the run whose centre is nearest the
-            // predicted centre (trackCenter). Small gaps inside a run are bridged.
-            long   runW = 0;   double runM = 0;   int runStart = -1, runGap = 0;
-            double bestC = Double.NaN; long bestW = 0; double bestDist = Double.MAX_VALUE;
-            for (int col = vLeft; col < vRight; col++) {
-                final int px = pixels[base + col] & 0xFF;
-                if (isTrack(px, vThreshold, bright)) {
-                    if (runStart < 0) { runStart = col; runW = 0; runM = 0; }
-                    runW++; runM += col; runGap = 0;
-                } else if (runStart >= 0 && ++runGap > runGapTol) {
-                    final double c = runM / runW, d = Math.abs(c - trackCenter);
-                    if (d < bestDist) { bestDist = d; bestC = c; bestW = runW; }
-                    runStart = -1;
-                }
-            }
-            if (runStart >= 0) {
-                final double c = runM / runW, d = Math.abs(c - trackCenter);
-                if (d < bestDist) { bestDist = d; bestC = c; bestW = runW; }
-            }
-
-            // Accept only a run that is big enough AND close enough to the line we
-            // are following; otherwise this row has no usable track → count a gap.
-            if (bestW >= minRowW && bestDist <= vMaxDrift) {
-                rowCx[row]  = (float) bestC;
-                trackCenter = (int) (bestC + 0.5);        // follow the line upward
-                gap = 0;
-                farRow = row;                             // farthest row the line reaches
-                final double laWeight = vRoiBot - row;    // farther ahead → weighted more
-                laW += laWeight; laM += laWeight * bestC;
-                fitN++; sY += row; sYY += (double) row * row;
-                sC += bestC;       sYC += (double) row * bestC;
-                // Subsample this row into the overlay path (current-frame data only).
-                if (laCount < LA_MAX_PTS && --laNext <= 0) {
-                    laPathRowFrac[laCount] = row / (float) imgH;
-                    laPathColFrac[laCount] = (float) bestC / (float) imgW;
-                    laCount++;
-                    laNext = laStride;
-                }
-            } else {
-                rowCx[row] = Float.NaN;                    // no line in this row
-                if (++gap > maxGap) break;                 // line ended → stop look-ahead
-            }
-        }
-        laPathCount = laCount;   // publish the path for any external overlay
+        // ── Stage 3: look-ahead along the line (the vertical part of the ⊥) ────
+        final int vThreshold = lookAheadThreshold(pixels, threshold, bright);
+        traceLookAhead(pixels, vThreshold, bright, trackFound ? centroidX : -1, filter);
+        laPathCount = traceLaCount;   // publish the path for any external overlay
+        final int    farRow = traceFarRow;
+        final double slope  = traceSlope;
+        if (trackFound && traceFitN >= 2) lastImgSlope = (float) -traceNearSlope;   // columns per row, upward, near the strip
 
         // 3b. Line tilt from the least-squares slope  b = d(col)/d(row) = tan(θ).
-        //     Reported for overlays only — it does not feed the track value.
         //     Rows grow downward, so a line leaning right has a NEGATIVE slope.
-        double slope = 0.0;
-        if (fitN >= 2) {
-            final double denom = (double) fitN * sYY - sY * sY;
-            if (Math.abs(denom) > 1e-6) {
-                slope = ((double) fitN * sYC - sY * sC) / denom;
-            }
-        }
+        //     (Image-space; for the overlay. Steering uses the floor heading below.)
         final float tiltDeg = (float) Math.toDegrees(Math.atan(-slope));
 
         // 3c. Look-ahead line position (band-locked, far-weighted centroid).
-        final boolean lookAheadValid = (laW > 0.0);
-        final float   lookAheadX     = lookAheadValid ? (float) (laM / laW) : steerRefX;
+        final boolean lookAheadValid = (traceLaW > 0.0);
+        final float   lookAheadX     = lookAheadValid ? (float) (traceLaM / traceLaW) : steerRefX;
 
-        // ── Steering: signed offset from the calibrated straight-ahead column ──
-        final float steering = (pinnedSteering != 0f) ? pinnedSteering
-                : Math.max(-100f, Math.min(100f, (centroidX - steerRefX) / halfW * 100f));
+        // ── Steering: offset of the ⊥ base + heading of the whole ⊥ ─────────────
+        //   offset  = (centroid − calibrated column) / half width × 100      (v1)
+        //   heading = 100 × L × tan(ψ − ψ₀) / (floor half-width at the H-ROI)
+        // ψ is the direction of the line ON THE FLOOR relative to the robot, where it
+        // crosses the H-ROI: a parabola is fitted through the H-ROI centroid and the
+        // near look-ahead rows on the line (perspective removed with the camera
+        // geometry), see computeHeading. ψ₀ is the calibrated zero and
+        // L = steerLookAhead × floor distance from the camera to the H-ROI. The sum
+        // is the lateral position, in v1 steering units, of a pure-pursuit target
+        // point L further along the line. The heading part fades out
+        // (headingConfidence) when too little of the line is visible ahead or the
+        // line is not a smooth curve (a corner), leaving the v1 offset-only steering.
+        final float offsetTerm = (centroidX - steerRefX) / halfW * 100f;
+        float headingTerm = 0f, headingDeg = 0f, conf = 0f;
+        if (trackFound && cfg.steerHeadingWeight != 0f) {
+            computeHeading();
+            conf = fitConfidence;
+            if (conf > 0f) {
+                headingDeg = fitHeadingDeg - headingRefDeg;
+                final double psi = Math.toRadians(Math.max(-75f, Math.min(75f, headingDeg)));
+                final double lookAhead = cfg.steerLookAhead * floorFwdH;
+                final double halfFloor = floorScaleH * halfW;
+                headingTerm = (float) (100.0 * lookAhead * Math.tan(psi) / Math.max(1e-6, halfFloor));
+            }
+        }
+        float steering = (pinnedSteering != 0f) ? pinnedSteering
+                : Math.max(-100f, Math.min(100f, cfg.steerOffsetWeight * offsetTerm
+                                                + cfg.steerHeadingWeight * conf * headingTerm));
 
         // 3d. Intersection — internal scale (0 = straight, 100 = hard turn / lost).
         //     Inverted to the TRACKING output in processBound().
@@ -1807,6 +2120,15 @@ public final class LineFollowerPipeline {
         // you have moved fully off the line and a new one is being sought.
         if (forcedIntersection >= 0f) intersection = forcedIntersection;
 
+        // Line momentarily hidden mid-image: hold the last good outputs.
+        if (held) {
+            steering     = lastSteering;
+            intersection = lastIntersection;
+        } else if (trackFound) {
+            lastSteering     = steering;
+            lastIntersection = intersection;
+        }
+
         // ── Write internal output ──────────────────────────────────────────────
         output.steering     = steering;
         output.intersection = intersection;
@@ -1815,6 +2137,339 @@ public final class LineFollowerPipeline {
         output.trackWidthPx = lastTrackWidthPx;   // measured width, held on track loss
         output.trackFound   = trackFound;
         output.threshold    = threshold;
+        output.offsetTerm   = trackFound ? cfg.steerOffsetWeight * offsetTerm : 0f;
+        output.headingTerm  = trackFound ? cfg.steerHeadingWeight * conf * headingTerm : 0f;
+        output.headingDeg   = headingDeg;
+        output.headingConf  = conf;
+        output.held         = held;
+        output.rejected     = rejectedBands;
+    }
+
+    /**
+     * Stage 3 threshold: adaptive to the (dimmer, farther) look-ahead.
+     * The far look-ahead line is dimmer than the near line, so the H-ROI Otsu
+     * can miss it — the tracker then loses the line early and the track value
+     * plateaus. Build a subsampled histogram of the whole V-ROI band and run
+     * Otsu again to get a threshold matched to the look-ahead's own lighting.
+     */
+    private int lookAheadThreshold(byte[] pixels, int threshold, boolean bright) {
+        int vThreshold = threshold;
+        if (cfg.vRoiAdaptiveThreshold && vRoiBot > vRoiTop) {
+            final int W = imgW;
+            final int[] histV = histogramV;
+            java.util.Arrays.fill(histV, 0);
+            final int stepR = Math.max(1, (vRoiBot - vRoiTop) / 240);   // ~240 rows sampled
+            final int stepC = Math.max(1, W / 240);                     // ~240 cols sampled
+            long cntV = 0;
+            for (int row = vRoiTop; row < vRoiBot; row += stepR) {
+                final int base = row * W;
+                for (int col = 0; col < W; col += stepC) {
+                    histV[pixels[base + col] & 0xFF]++; cntV++;
+                }
+            }
+            final int t = finishThreshold(otsuThreshold(histV, cntV), bright);
+            if (t != NO_TRACK) vThreshold = t;   // flat look-ahead → keep the strip threshold
+        }
+        return vThreshold;
+    }
+
+    /**
+     * Stage 3: follow the line row by row up through the V-ROI from the H-ROI
+     * centroid {@code centroidX} (-1 = no line: nothing traced). Results go to the
+     * trace* fields (image fit, far row, far-weighted look-ahead centroid, overlay
+     * path) and the floor fit (floorN, fU…, floorSpan) used for the heading.
+     *
+     * We TRACK the line up through the V-ROI, recentring the scan window on
+     * the previous row's centroid, so curves and a skewed approach are
+     * followed instead of leaking out of a fixed column. Only rows where the
+     * line is actually VISIBLE are used; empty far-away rows are never counted.
+     *
+     * With {@code filter} (distractor rejection) a row's run must also not be
+     * wider than the line can be at that row (calibrated width scaled by the
+     * perspective and the line's slant). A wider run — the line merged with a
+     * nearby dark object — keeps only the edge that continues the line, or the
+     * row counts as a gap, so the tracker never jumps onto the object. The
+     * window is also re-centred on the line's PREDICTED column (previous row +
+     * its local drift), which follows curves more closely.
+     */
+    private void traceLookAhead(byte[] pixels, int vThreshold, boolean bright, int centroidX, boolean filter) {
+        final int     W      = imgW;
+        final int     half   = cfg.vRoiHalfWidthPx;
+        final float[] rowCx  = this.rowCx;
+        final int     maxGap = Math.max(8, cfg.hRoiThickPx);   // stop after this many empty rows
+        final int     runGapTol = runGapTol();
+        final boolean trackFound = centroidX >= 0;
+
+        // Per-row line-lock limits (same memory idea as Stage 2, applied upward):
+        //   • minRowW   — a row's run must be at least this many pixels to count,
+        //                 so 1-px specular noise never seeds the tracker.
+        //   • vMaxDrift — the run's centre may sit at most this far from where the
+        //                 line was on the row below. A real line drifts only a few
+        //                 px per row even on curves, so this is what stops the
+        //                 tracker from JUMPING onto a separate object (table)
+        //                 that happens to fall inside the scan window.
+        final int minRowW   = Math.max(1, Math.round(0.25f * lastTrackWidthPx));
+        final int vMaxDrift = Math.max(8, Math.round(0.75f * lastTrackWidthPx));
+        // Distractor rejection: the line's expected width at each row is the
+        // calibrated H-ROI width scaled by perspective (rowScale is inversely
+        // proportional to apparent width).
+        final float expectW = expectedLineWidth();
+        final boolean widthTest = filter && expectW > 0f && floorScaleH > 0f;
+
+        // Least-squares accumulators over rows with a detected centroid (y = row).
+        int    fitN = 0;
+        double sY = 0.0, sYY = 0.0, sC = 0.0, sYC = 0.0;
+        // Same fit restricted to the rows just above the H-ROI: the line's slant where
+        // it crosses the strip, for the strip's width test (far rows may curve away).
+        final int nearRow = vRoiBot - Math.max(40, 4 * cfg.hRoiThickPx);
+        int    nN = 0;
+        double nY = 0.0, nYY = 0.0, nC = 0.0, nYC = 0.0;
+        // Floor-plane fit: lateral X vs forward Z (camera heights).
+        floorN = 0; fU = 0; fUU = 0; fUUU = 0; fUUUU = 0; fX = 0; fUX = 0; fUUX = 0; fXX = 0;
+        fUmin = Float.MAX_VALUE; fUmax = -Float.MAX_VALUE;
+        final float cx0 = W * 0.5f - 0.5f;   // column whose centre is the optical axis
+
+        // Anchor the fit with the H-ROI centroid (longest, most reliable baseline).
+        if (trackFound) {
+            final double yH = (hRoiTop + hRoiBot) * 0.5;
+            fitN++; sY += yH; sYY += yH * yH; sC += centroidX; sYC += yH * centroidX;
+            nN++;   nY += yH; nYY += yH * yH; nC += centroidX; nYC += yH * centroidX;
+            final float z = floorFwdH, x = floorScaleH * (centroidX - cx0);
+            addFloorPoint(z, x);
+        }
+
+        // Track the line from the bottom of the V-ROI upward, following drift.
+        // Each row we lock onto the contiguous RUN closest to the line's
+        // position on the row below — never the average of everything in the
+        // window — and reject any run that is too small or too far (a different
+        // object). Stop once the line has been missing for maxGap rows (end /
+        // off the road), so empty frame above is never mistaken for the track.
+        int    trackCenter = centroidX;
+        float  drift       = filter ? Math.max(-2f, Math.min(2f, lastImgSlope)) : 0f;  // columns per row, upward
+        // Width factor for the line's slant, from the previous frame (fixed for this
+        // frame, so a distractor cannot inflate the allowed width row after row).
+        final float slantK = (float) Math.sqrt(1f + drift * drift);
+        double prevC       = centroidX;
+        int    prevRow     = (hRoiTop + hRoiBot) / 2;
+        int    gap         = 0;
+        int    farRow      = -1;   // farthest (topmost) V-ROI row where the line was accepted
+        // Look-ahead position accumulators: a centroid of the band-locked line over
+        // the V-ROI, weighting FARTHER-ahead rows more so the value previews the
+        // road in front of the robot rather than what is right under it.
+        double laW = 0.0, laM = 0.0;
+
+        // Dynamic look-ahead path (nearest → farthest) for the overlay to follow.
+        // Seed it with the near H-ROI centroid so the drawn band starts on the line,
+        // then push one point every laStride accepted rows (subsampled to LA_MAX_PTS).
+        int laCount = 0;
+        final int laStride = Math.max(1, (vRoiBot - vRoiTop) / Math.max(1, LA_MAX_PTS - 2));
+        int laNext = 0;
+        if (trackFound) {
+            laPathRowFrac[laCount] = (float) ((hRoiTop + hRoiBot) * 0.5) / imgH;
+            laPathColFrac[laCount] = centroidX / (float) imgW;
+            laCount++;
+        }
+
+        for (int row = vRoiBot - 1; row >= vRoiTop && trackFound; row--) {
+            // Predicted centre on this row: the row below, plus (filter) the drift.
+            final double pred = filter ? prevC + drift * (prevRow - row) : trackCenter;
+            final int    pc   = filter ? (int) Math.round(pred) : trackCenter;
+            // Expected width of the line on this row (filter only).
+            float expRow = 0f, maxRow = Float.MAX_VALUE;
+            int   rowHalf = half;
+            if (widthTest) {
+                expRow = expectW * floorScaleH / rowScale[row] * slantK;
+                maxRow = cfg.bandMaxWidthMult * expRow + 4f;
+                // The window must leave room beside the line (more than the gap that
+                // is bridged), else a line merged with anything touches both window
+                // edges and its true edges cannot be seen. Wide tape at high
+                // resolution can be wider than 2 × vRoiHalfWidthPx.
+                rowHalf = Math.max(half, (int) Math.ceil(0.5f * expRow) + 2 * runGapTol);
+            }
+            final int vLeft  = Math.max(0,     pc - rowHalf);
+            final int vRight = Math.min(W, pc + rowHalf);
+            final int base   = row * W;
+
+            // Scan the window, picking the run whose centre is nearest the
+            // predicted centre. Small gaps inside a run are bridged.
+            long   runW = 0;   double runM = 0;   int runStart = -1, runLast = -1, runGap = 0;
+            double bestC = Double.NaN; long bestW = 0; double bestDist = Double.MAX_VALUE;
+            for (int col = vLeft; col <= vRight; col++) {
+                final boolean on = col < vRight && isTrack(pixels[base + col] & 0xFF, vThreshold, bright);
+                if (on) {
+                    if (runStart < 0) { runStart = col; runW = 0; runM = 0; }
+                    runW++; runM += col; runGap = 0; runLast = col;
+                } else if (runStart >= 0 && (col == vRight || ++runGap > runGapTol)) {
+                    double c = runM / runW; long wCount = runW;
+                    boolean ok = true;
+                    final int span = runLast + 1 - runStart;
+                    // A run cut by the scan window (not the frame edge) may be much wider.
+                    final boolean clipL = runStart == vLeft && vLeft > 0, clipR = runLast + 1 == vRight && vRight < W;
+                    final boolean clipped = clipL || clipR;
+                    if (widthTest && clipL && clipR) ok = false;          // fills the whole window: not the line
+                    else if (widthTest && (span > 1.3f * expRow || clipped)) {
+                        // Wider than the line: the line merged with an object (which
+                        // would make the centre creep toward it row after row). Keep
+                        // the edge that continues the line; if neither edge does, use
+                        // the run only if it is not too wide, else skip the row.
+                        final double tol   = Math.max(4.0, 0.3 * expRow);
+                        final boolean lOk  = Math.abs(runStart - (pred - expRow * 0.5)) <= tol;
+                        final boolean rOk  = Math.abs(runLast + 1 - (pred + expRow * 0.5)) <= tol;
+                        if (lOk && !rOk)      { c = runStart + expRow * 0.5;    wCount = Math.round(expRow); }
+                        else if (rOk && !lOk) { c = runLast + 1 - expRow * 0.5; wCount = Math.round(expRow); }
+                        else if (!(lOk && rOk) && (span > maxRow || clipped)) ok = false;
+                    }
+                    if (ok) {
+                        final double d = Math.abs(c - (filter ? pred : trackCenter));
+                        if (d < bestDist) { bestDist = d; bestC = c; bestW = wCount; }
+                    }
+                    runStart = -1;
+                }
+            }
+
+            // Accept only a run that is big enough AND close enough to the line we
+            // are following; otherwise this row has no usable track → count a gap.
+            if (bestW >= minRowW && bestDist <= vMaxDrift) {
+                rowCx[row]  = (float) bestC;
+                if (filter) {
+                    // Local drift (columns per row upward), smoothed over rows.
+                    final int dr = prevRow - row;
+                    if (dr > 0) {
+                        final float step = Math.max(-2f, Math.min(2f, (float) ((bestC - prevC) / dr)));
+                        drift = Math.max(-2f, Math.min(2f, 0.9f * drift + 0.1f * step));
+                    }
+                    prevC = bestC; prevRow = row;
+                }
+                trackCenter = (int) (bestC + 0.5);        // follow the line upward
+                gap = 0;
+                farRow = row;                             // farthest row the line reaches
+                final double laWeight = vRoiBot - row;    // farther ahead → weighted more
+                laW += laWeight; laM += laWeight * bestC;
+                fitN++; sY += row; sYY += (double) row * row;
+                if (row >= nearRow) { nN++; nY += row; nYY += (double) row * row; nC += bestC; nYC += (double) row * bestC; }
+                sC += bestC;       sYC += (double) row * bestC;
+                final float z = rowFwd[row], x = rowScale[row] * (float) (bestC - cx0);
+                addFloorPoint(z, x);
+                // Subsample this row into the overlay path (current-frame data only).
+                if (laCount < LA_MAX_PTS && --laNext <= 0) {
+                    laPathRowFrac[laCount] = row / (float) imgH;
+                    laPathColFrac[laCount] = (float) bestC / (float) imgW;
+                    laCount++;
+                    laNext = laStride;
+                }
+            } else {
+                rowCx[row] = Float.NaN;                    // no line in this row
+                if (++gap > maxGap) break;                 // line ended → stop look-ahead
+            }
+        }
+
+        // Image-space least-squares slope  b = d(col)/d(row).
+        double slope = 0.0;
+        if (fitN >= 2) {
+            final double denom = (double) fitN * sYY - sY * sY;
+            if (Math.abs(denom) > 1e-6) {
+                slope = ((double) fitN * sYC - sY * sC) / denom;
+            }
+        }
+        traceFitN    = fitN;
+        traceSlope   = slope;
+        double nearSlope = slope;
+        if (nN >= 8) {
+            final double nd = (double) nN * nYY - nY * nY;
+            if (Math.abs(nd) > 1e-6) nearSlope = ((double) nN * nYC - nY * nC) / nd;
+        }
+        traceNearSlope = nearSlope;
+        traceFarRow  = farRow;
+        traceLaW     = laW;
+        traceLaM     = laM;
+        traceLaCount = laCount;
+    }
+
+    /**
+     * Add one point of the line on the floor (forward z, lateral x; camera heights).
+     * Points more than FIT_DEPTH H-ROI distances beyond the H-ROI are not fitted.
+     */
+    private void addFloorPoint(float z, float x) {
+        final double u = z - floorFwdH;
+        if (u > FIT_DEPTH * floorFwdH) return;
+        final double uu = u * u;
+        floorN++;
+        fU += u; fUU += uu; fUUU += uu * u; fUUUU += uu * uu;
+        fX += x; fUX += u * x; fUUX += uu * x; fXX += (double) x * x;
+        fUmin = (float) Math.min(fUmin, u); fUmax = (float) Math.max(fUmax, u);
+        floorSpan = fUmax - fUmin;
+    }
+
+    /**
+     * Heading of the robot relative to the line from the last trace, into
+     * fitHeadingDeg (deg, + = line heads right; before the calibrated zero) and
+     * fitConfidence [0 … 1].
+     *
+     * The traced line on the floor (perspective removed) is fitted with a parabola
+     * x = A + B·u + C·u² (u = forward distance beyond the H-ROI) and its direction
+     * is taken at u = 0, i.e. where the line crosses the base of the ⊥. A parabola
+     * gives that tangent without the bias a straight-line fit (the chord) would
+     * have on a curve, and only the near look-ahead is fitted (FIT_DEPTH) so the
+     * next turn does not bend it. With too little line visible for a parabola, the
+     * straight-line direction is used.
+     *
+     * Confidence is full with at least steerHeadingMinRows rows spanning at least
+     * half the H-ROI's floor distance, and with the points lying on the fitted
+     * curve (RMS error ≤ a quarter of the line width). It fades to 0 with fewer
+     * rows, a shorter span, or a line that is not a smooth curve (a 90° corner,
+     * a junction) — the steering then falls back to the offset only.
+     */
+    private void computeHeading() {
+        fitHeadingDeg = 0f;
+        fitConfidence = 0f;
+        if (floorN < 3) return;
+        final double n = floorN;
+        final double d2 = n * fUU - fU * fU;
+        if (Math.abs(d2) < 1e-12) return;
+        // Straight-line fit x = A + B·u (chord), and its residual.
+        double B = (n * fUX - fU * fX) / d2;
+        double A = (fX - B * fU) / n;
+        double res = fXX - (A * fX + B * fUX);
+        double slope = B;
+        if (floorN >= 6 && floorSpan >= 0.8f * floorFwdH) {
+            // Parabola: 3×3 normal equations, Cramer's rule.
+            final double a11 = n,   a12 = fU,   a13 = fUU;
+            final double a22 = fUU, a23 = fUUU, a33 = fUUUU;
+            final double b1 = fX, b2 = fUX, b3 = fUUX;
+            final double det = a11 * (a22 * a33 - a23 * a23) - a12 * (a12 * a33 - a23 * a13) + a13 * (a12 * a23 - a22 * a13);
+            if (Math.abs(det) > 1e-12) {
+                final double detA = b1 * (a22 * a33 - a23 * a23) - a12 * (b2 * a33 - a23 * b3) + a13 * (b2 * a23 - a22 * b3);
+                final double detB = a11 * (b2 * a33 - a23 * b3) - b1 * (a12 * a33 - a23 * a13) + a13 * (a12 * b3 - b2 * a13);
+                final double detC = a11 * (a22 * b3 - b2 * a23) - a12 * (a12 * b3 - b2 * a13) + b1 * (a12 * a23 - a22 * a13);
+                A = detA / det; B = detB / det;
+                final double C = detC / det;
+                res   = fXX - (A * fX + B * fUX + C * fUUX);
+                slope = B;                                              // tangent where the line crosses the H-ROI (u = 0)
+            }
+        }
+        fitHeadingDeg = (float) Math.toDegrees(Math.atan(slope));
+
+        final float rows = Math.min(1f, (floorN - 1) / (float) Math.max(1, cfg.steerHeadingMinRows));
+        final float span = Math.min(1f, floorSpan / Math.max(1e-3f, 0.5f * floorFwdH));
+        // Fit quality: RMS distance of the points from the curve vs the line width.
+        final float lineW = expectedLineWidth() > 0f ? expectedLineWidth() : lastTrackWidthPx;
+        final double halfW = Math.max(1e-6, 0.5 * lineW * floorScaleH);
+        final double rms = Math.sqrt(Math.max(0.0, res) / n);
+        final float fit = (float) Math.max(0.0, Math.min(1.0, 1.5 - 2.0 * rms / halfW));
+        fitConfidence = rows * span * fit;
+    }
+
+    /** Forget what was learned about the line beyond the colours (level, heading zero, motion). */
+    private void resetLineModel() {
+        calibLevel        = 0f;
+        headingRefDeg     = 0f;
+        calibHeadingCount = 0;
+        centroidVel       = 0f;
+        lastImgSlope      = 0f;
+        holdFrames        = 0;
+        lastSteering      = 0f;
+        lastIntersection  = 0f;
+        rejectedBands     = 0;
     }
 
     /** Fill the shared FrameData and hand it to the registered callback, if any. */
@@ -1866,6 +2521,15 @@ public final class LineFollowerPipeline {
         d.trackFound   = trackFound;
         d.steering     = steering;
         d.tracking     = tracking;
+        // Steering components (output units, i.e. half the internal scale) and
+        // distractor-rejection state. Zero during calibration.
+        final boolean live = calibrated && isProcessing;
+        d.steerOffsetTerm   = live ? 0.5f * output.offsetTerm  : 0f;
+        d.steerHeadingTerm  = live ? 0.5f * output.headingTerm : 0f;
+        d.headingDeg        = live ? output.headingDeg  : 0f;
+        d.headingConfidence = live ? output.headingConf : 0f;
+        d.lineHeld          = live && output.held;
+        d.rejectedBands     = live ? output.rejected : 0;
         frameCallback.onFrame(d);
     }
 

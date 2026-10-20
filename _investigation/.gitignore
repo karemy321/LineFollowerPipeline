@@ -1,0 +1,22 @@
+# Generated / local-only files — regenerate with the scripts in this folder.
+build/
+jar/
+results/
+snaps/
+test_images/
+docs_backup/
+pdf_compare/old/
+pdf_compare/new/
+pdf_compare/side_by_side/
+pdf_work/
+pdf_source/guide.html
+readme_examples/api/
+readme_examples/classes/
+readme_examples/classes_old/
+readme_examples/junit_cur/
+readme_examples/lib8/
+readme_examples/src/
+readme_examples/src_old_readme/
+readme_examples/variant_v1defaults/
+readme_examples/probe/*.class
+*.class
