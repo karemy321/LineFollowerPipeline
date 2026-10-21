@@ -647,6 +647,6 @@ cd LineFollowerLibrary
 gradlew test
 ```
 
-> ⚠️ With the v2 defaults **8 of the 24 unit tests fail**: 7 expect the v1 offset-only steering value (19 for a line 60 px right; v2 reads 22 because the heading part is added) and `lostLineReportsTrackLost` expects tracking 5 on the first blank frame (v2 holds the last value). They all pass with `steerHeadingWeight = 0` and `trackHoldFrames = 0`. The test expectations still have to be updated for v2. `gradlew jar` and the app build do not run the tests.
+All **26 tests pass** with the v2 defaults. The steering tests check the offset part (19 for a line 60 px right) and that the heading part steers the same way; `lostLineReportsTrackLost` checks the hold of `trackHoldFrames` frames before tracking drops to 5. Two tests (`v1SteeringIsOffsetOnly`, `v1LostLineDropsTrackingAtOnce`) check that `steerHeadingWeight = 0` and `trackHoldFrames = 0` give the v1 behaviour. `gradlew jar` and the app build do not run the tests.
 
 RoboPhoneApp pulls the library in **from source** through a Gradle composite build (`includeBuild("../LineFollowerLibrary")` in `settings.gradle.kts`), so library changes show up in the app on the next build — no jar copying.

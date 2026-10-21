@@ -113,7 +113,7 @@ is visible near the centre (lock lost / pinned).
 | `processFrame` cost, 960×1280 YUV, this PC (6 runs) | 0.87–0.98 ms | 0.89–0.94 ms (within run-to-run noise) |
 | Heap allocation per 1000 frames (YUV, gray, ARGB) | 0 / 0 / 0 B | 0 / 0 / 0 B |
 | Regression tests (colour pairs, manual mode, recalibration, empty floor, ranges) | 22/22 | 22/22 |
-| Existing project JUnit tests (`src/test`) | 24/24 | 16/24 with v2 defaults — all 8 differences are the two intended new behaviours; **24/24** with `steerHeadingWeight = 0` and `trackHoldFrames = 0` (see §6.6) |
+| Existing project JUnit tests (`src/test`) | 24/24 | 16/24 before the tests were updated — all 8 differences are the two intended new behaviours; **26/26** after updating them for v2 (see §6.6) |
 | Output ranges in every test frame | S ∈ [−50, 50], T ∈ [5, 100] | S ∈ [−50, 50], T ∈ [5, 100] |
 
 **Recommended starting values** for the lecturer's program (details in §7): steering gain **c = 1.0**
@@ -164,7 +164,7 @@ With `rejectDistractors = false` and `steerHeadingWeight = 0` the new library is
 | 515 | Note: heading needs correct camera geometry; the app runs at 960 × 1280. |
 
 ### Not changed
-`RoboPhoneApp/` (builds unchanged against the new library, see §8), `line_follower_block.js`, `line_follower.xml`, the PDF, the existing unit tests in `LineFollowerLibrary/src/test/`.
+`RoboPhoneApp/` (builds unchanged against the new library, see §8), `line_follower_block.js`, `line_follower.xml`, the PDF. (The unit tests in `LineFollowerLibrary/src/test/` were updated afterwards for v2, see §6.6.)
 
 ---
 
@@ -659,8 +659,17 @@ Robot on a straight line at 960 × 1280; centred, then 2 cm right and 2 cm left 
 The 7 tests draw a perfectly *vertical* line shifted sideways on a flat 320 × 240 image. Through a
 45°-tilted camera that is a line on the floor heading outward, so the heading term rightly adds 3.
 The 8th is the new hold behaviour. Since these tests encode v1 steering exactly, they need updated
-expected values (or those two settings) — I did **not** edit the project's test files; tell me if you
-want that done. `gradlew jar` / `assembleDebug` do not run them; `gradlew test` / `build` would.
+expected values (or those two settings). `gradlew jar` / `assembleDebug` do not run them; `gradlew test` / `build` would.
+
+**Update — tests changed for v2 (`gradlew test`: 26 / 26 pass with the default Config).**
+* The 7 steering tests no longer expect a fixed 19. They check that the offset part
+  (`steerOffsetTerm`) is still 19 ± 2, that the heading part (`steerHeadingTerm`) steers the same
+  way, and that the output equals offset + heading. A centred line must still give 0.
+* `lostLineReportsTrackLost` now checks that the last values are held (`lineHeld`) for
+  `trackHoldFrames` frames and that tracking drops to 5 on the next frame.
+* Two new tests keep the v1 behaviour covered: `v1SteeringIsOffsetOnly` (±19 with
+  `steerHeadingWeight = 0`) and `v1LostLineDropsTrackingAtOnce` (tracking 5 on the first blank
+  frame with `trackHoldFrames = 0`).
 
 ### 6.7 Zero allocation and timing (`Perf`, 960 × 1280, this PC, JDK 21)
 

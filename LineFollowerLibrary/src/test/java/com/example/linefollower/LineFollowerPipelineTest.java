@@ -104,9 +104,34 @@ public class LineFollowerPipelineTest {
         return r.clone();
     }
 
+    /**
+     * Steering for a line shifted 60 px from the calibrated column. The offset
+     * part alone (v1 steering) is 19.
+     */
+    private static final int OFFSET_60PX = 19;
+
+    /**
+     * Checks the steering for a straight image line shifted {@code sign × 60 px}.
+     * A line that is vertical in the image but off-centre is angled on the floor
+     * (pointing away from the robot's centreline), so v2 steering is the v1
+     * offset part plus a heading part in the same direction.
+     */
+    private static void assertShiftedSteering(String what, int sign, int steering,
+                                              LineFollowerPipeline.FrameData d) {
+        assertTrue(what + ": line found", d.trackFound);
+        assertEquals(what + " offset part", sign * OFFSET_60PX, d.steerOffsetTerm, 2f);
+        assertTrue(what + " heading part should steer the same way: " + d.steerHeadingTerm,
+                sign * d.steerHeadingTerm > 1f);
+        assertEquals(what + " steering = offset + heading",
+                Math.max(-50f, Math.min(50f, d.steerOffsetTerm + d.steerHeadingTerm)),
+                steering, 1f);
+    }
+
     /** Calibrate on a centred line, then check centred / right / left steering. */
     private static void assertFollows(Fmt f, int floorRgb, int lineRgb) {
         final LineFollowerPipeline p = new LineFollowerPipeline();
+        final LineFollowerPipeline.FrameData[] last = {null};
+        p.setFrameCallback(d -> last[0] = d);
         final int[] centred = straight(floorRgb, lineRgb, W / 2, 30);
         int frames = 0;
         while (!calibrate(p, f, centred)) {
@@ -116,16 +141,25 @@ public class LineFollowerPipelineTest {
 
         final int[] c = process(p, f, centred);
         assertEquals("centred steering", 0, c[0], 2);
+        assertEquals("centred heading part", 0f, last[0].steerHeadingTerm, 2f);
         assertTrue("straight road should give high tracking: " + c[1], c[1] > 90);
 
         final int[] right = process(p, f, straight(floorRgb, lineRgb, W / 2 + 60, 30));
-        assertEquals("right steering", 19, right[0], 2);
+        assertShiftedSteering(f + " right", +1, right[0], last[0]);
 
         // Back through the centre: a 120 px jump in one frame is outside the
         // line-lock gate and is (correctly) treated as leaving the line.
         process(p, f, centred);
         final int[] left = process(p, f, straight(floorRgb, lineRgb, W / 2 - 60, 30));
-        assertEquals("left steering", -19, left[0], 2);
+        assertShiftedSteering(f + " left", -1, left[0], last[0]);
+    }
+
+    /** Config that reproduces the v1 steering and lost-line behaviour. */
+    private static LineFollowerPipeline.Config v1Behaviour() {
+        final LineFollowerPipeline.Config cfg = new LineFollowerPipeline.Config();
+        cfg.steerHeadingWeight = 0f;
+        cfg.trackHoldFrames    = 0;
+        return cfg;
     }
 
     private static int rgb(int r, int g, int b) { return (r << 16) | (g << 8) | b; }
@@ -245,7 +279,10 @@ public class LineFollowerPipelineTest {
         final byte[] g = toGray(straight(BLACK, WHITE, W / 2, 30));
         assertTrue("no colour phase — finishes after calibFrames", calibrateN(p, g, cfg.calibFrames));
         assertFalse(p.isColorModelReady());
-        assertEquals(19, p.processFrame(toGray(straight(BLACK, WHITE, W / 2 + 60, 30)), W, H)[0], 2);
+        final LineFollowerPipeline.FrameData[] last = {null};
+        p.setFrameCallback(d -> last[0] = d);
+        final int s = p.processFrame(toGray(straight(BLACK, WHITE, W / 2 + 60, 30)), W, H)[0];
+        assertShiftedSteering("grayscale right", +1, s, last[0]);
     }
 
     private static boolean calibrateN(LineFollowerPipeline p, byte[] g, int n) {
@@ -260,8 +297,10 @@ public class LineFollowerPipelineTest {
         final LineFollowerPipeline p = new LineFollowerPipeline();
         final int[] img = straight(BROWN, WHITE, W / 2, 30);
         while (!p.calibrateArgb(img, W, H)) { /* calibrating */ }
+        final LineFollowerPipeline.FrameData[] last = {null};
+        p.setFrameCallback(d -> last[0] = d);
         final int[] dim = scene(BROWN, WHITE, r -> W / 2 + 60, 30, 4, 0.6, 99);
-        assertEquals(19, p.processFrameArgb(dim, W, H)[0], 2);
+        assertShiftedSteering("dim right", +1, p.processFrameArgb(dim, W, H)[0], last[0]);
     }
 
     @Test public void hardTurnKeepsTrackFound() {
@@ -298,7 +337,45 @@ public class LineFollowerPipelineTest {
     }
 
     @Test public void lostLineReportsTrackLost() {
+        // The line vanishes in the middle of the image (e.g. hidden by a shadow):
+        // the last values are held for trackHoldFrames, then tracking drops to 5.
         final LineFollowerPipeline p = new LineFollowerPipeline();
+        final int holdFrames = new LineFollowerPipeline.Config().trackHoldFrames;
+        final LineFollowerPipeline.FrameData[] last = {null};
+        p.setFrameCallback(d -> last[0] = d);
+        final int[] img = straight(BLACK, WHITE, W / 2, 30);
+        while (!p.calibrateArgb(img, W, H)) { /* calibrating */ }
+        final int[] before = p.processFrameArgb(img, W, H).clone();
+        final int[] empty = scene(BLACK, BLACK, r -> 0, 1, 4, 1.0, 3);
+        for (int i = 1; i <= holdFrames; i++) {
+            final int[] out = p.processFrameArgb(empty, W, H);
+            assertTrue("frame " + i + " should be held", last[0].lineHeld);
+            assertEquals("held steering, frame " + i, before[0], out[0]);
+            assertEquals("held tracking, frame " + i, before[1], out[1]);
+        }
+        final int[] out = p.processFrameArgb(empty, W, H);
+        assertFalse("hold expired", last[0].lineHeld);
+        assertFalse(last[0].trackFound);
+        assertEquals(5, out[1]);
+    }
+
+    // ── v1 compatibility (steerHeadingWeight = 0, trackHoldFrames = 0) ──────
+
+    @Test public void v1SteeringIsOffsetOnly() {
+        final LineFollowerPipeline p = new LineFollowerPipeline();
+        p.configure(v1Behaviour());
+        final int[] img = straight(BLACK, WHITE, W / 2, 30);
+        while (!p.calibrateArgb(img, W, H)) { /* calibrating */ }
+        assertEquals(OFFSET_60PX,
+                p.processFrameArgb(straight(BLACK, WHITE, W / 2 + 60, 30), W, H)[0], 2);
+        p.processFrameArgb(img, W, H);
+        assertEquals(-OFFSET_60PX,
+                p.processFrameArgb(straight(BLACK, WHITE, W / 2 - 60, 30), W, H)[0], 2);
+    }
+
+    @Test public void v1LostLineDropsTrackingAtOnce() {
+        final LineFollowerPipeline p = new LineFollowerPipeline();
+        p.configure(v1Behaviour());
         final int[] img = straight(BLACK, WHITE, W / 2, 30);
         while (!p.calibrateArgb(img, W, H)) { /* calibrating */ }
         p.processFrameArgb(img, W, H);
