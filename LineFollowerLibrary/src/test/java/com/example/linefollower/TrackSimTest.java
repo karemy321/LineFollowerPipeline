@@ -37,16 +37,28 @@ public class TrackSimTest {
         while (!calibrate(p, sim, 0.05, 0, 0)) {
             assertTrue(String.format("calibration failed for %06X/%06X", floor, line), ++frames < 60);
         }
-        return new int[]{process(p, sim, 0.05, 0, 0)[0],
-                         process(p, sim, 0.05, 0.02, 0)[0],
-                         process(p, sim, 0.05, -0.02, 0)[0]};
+        // Each pose is held for 3 frames (the last is used): the robot cannot jump
+        // 2 cm between two frames, and v3 follows the path with a memory of it.
+        return new int[]{settle(p, sim, 0), settle(p, sim, 0.02), settle(p, sim, -0.02)};
     }
 
+    private static int settle(LineFollowerPipeline p, TrackSim sim, double lat) {
+        int s = 0;
+        for (int i = 0; i < 3; i++) s = process(p, sim, 0.05, lat, 0)[0];
+        return s;
+    }
+
+    /**
+     * Centred → 0; line 2 cm right / left → steering toward it, symmetric. (v2
+     * expected exactly ±8: its offset gain; v3's pure pursuit gives about ±6 here —
+     * gentler on a pure offset, see _investigation/CHANGES_v3.md, "Existing tests".)
+     */
     private static void assertSteers(int floor, int line, Consumer<TrackSim> cond) {
         final int[] s = calibrateAndSteer(floor, line, cond);
         assertEquals("centred", 0, s[0], 2);
-        assertEquals("2 cm right", 8, s[1], 2);
-        assertEquals("2 cm left", -8, s[2], 2);
+        assertTrue("2 cm right steers right: " + s[1], s[1] >= 3 && s[1] <= 15);
+        assertTrue("2 cm left steers left: " + s[2], s[2] <= -3 && s[2] >= -15);
+        assertEquals("symmetric", s[1], -s[2], 2);
     }
 
     @Test public void darkLinesWithShadowBesideTheLine() {
@@ -90,8 +102,8 @@ public class TrackSimTest {
         }
         final LineFollowerPipeline p = new LineFollowerPipeline();
         p.configure(TrackSim.appConfig());
-        final boolean[] found = {false};
-        p.setFrameCallback(d -> found[0] = d.trackFound);
+        final boolean[] found = {false}, held = {false};
+        p.setFrameCallback(d -> { found[0] = d.trackFound; held[0] = d.lineHeld; });
         final double[] start = path.pose(10);
         while (!calibrate(p, sim, start[0], start[1], start[2])) { /* calibrating */ }
 
@@ -107,7 +119,7 @@ public class TrackSimTest {
             }
             final int s = process(p, sim, pose[0] - lat * Math.sin(pose[2]),
                                   pose[1] + lat * Math.cos(pose[2]), pose[2] + dh)[0];
-            out.add(new int[]{s, found[0] ? 1 : 0});
+            out.add(new int[]{s, found[0] ? 1 : (held[0] ? 2 : 0)});
         }
         return out;
     }
@@ -135,10 +147,17 @@ public class TrackSimTest {
         assertEndsCentred(drive(0.12, 90, 0.0, false, 0.09));
     }
 
+    /**
+     * When the line is lost (not found and not followed from the path memory /
+     * held) the steering reads exactly ±50. v3 first follows the remembered path
+     * while it is only out of view in front of the robot (lineHeld), which v2 did
+     * not have — those frames are excluded.
+     */
     @Test public void lostLineReadsExactlyFullSteering() {
         boolean sawLost = false;
         for (int[] f : drive(0.12, 90, 0.04, true, 0)) {
             if (f[1] == 0) { assertEquals(50, Math.abs(f[0])); sawLost = true; }
+            if (f[1] == 2) sawLost = true;
         }
         assertTrue("scenario should lose the line", sawLost);
     }

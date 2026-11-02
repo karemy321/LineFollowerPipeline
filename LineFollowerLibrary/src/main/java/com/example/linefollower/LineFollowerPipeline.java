@@ -1088,7 +1088,7 @@ public final class LineFollowerPipeline {
         // v3 path tracking
         final int prSize  = Math.max(PROF_MAX, width / 2 + 2);
         prY = new float[prSize]; prU = new float[prSize]; prV = new float[prSize];
-        prLam = new float[prSize]; prTmp = new float[prSize]; prCls = new byte[prSize];
+        prLam = new float[prSize]; prTmp = new float[prSize]; prCls = new byte[prSize]; prU2 = new float[prSize];
         v3Ready           = false;
         modelReady        = false;
         nFloorModels      = 0;
@@ -2788,6 +2788,7 @@ public final class LineFollowerPipeline {
 
     private boolean v3Ready;               // calibrated in path mode
     private static final boolean DBG = System.getProperty("lf.dbg") != null;   // TEMP
+    private static int dbgCount;   // TEMP
     private static final boolean NOGUARD = System.getProperty("lf.noguard") != null;   // TEMP
 
     // ── Geometry actually used (pinhole; tilt possibly learned) ─────────────
@@ -2814,7 +2815,7 @@ public final class LineFollowerPipeline {
     private float  dirLF0, dirLF1, dirLF2, dirLFn;   // line − floor (main) for the linear line-ness
 
     // ── Profile buffers (also used for full-row scans) ──────────────────────
-    private float[] prY, prU, prV, prLam, prTmp;
+    private float[] prY, prU, prV, prLam, prTmp, prU2;
     private byte[]  prCls;
     private int     prN;
     private float   prStep, prH0;
@@ -2950,8 +2951,10 @@ public final class LineFollowerPipeline {
         clsLam = ((y - gMid * cmF[0]) * dirLF0 + (u - gMid * cmF[1]) * dirLF1 + (v - gMid * cmF[2]) * dirLF2)
                  / (gMid * dirLFn);
         final boolean mL = dL <= tau, mF = dF <= tau;
-        if (mL && (!mF || dF > 4f * dL)) return CL_LINE;
-        if (mF && (!mL || dL > 4f * dF)) return CL_FLOOR;
+        if (DBG && dbgCount < 6 && y < 30f) { dbgCount++; System.out.println("CLS y=" + y + " u=" + u + " v=" + v + " dL=" + dL + " dF=" + dF + " g=[" + gLo + "," + gHi + "] mL=" + cmL[0] + "," + cmL[1] + "," + cmL[2] + " mF=" + cmF[0] + "," + cmF[1] + "," + cmF[2] + " iL0=" + ciL[0] + " iF0=" + ciF[0] + " nF=" + nFloorModels); }
+        // both fit: the clearly better one (likelihood ratio > e³ ≈ 20 : 1), else unknown
+        if (mL && (!mF || dF - dL > 6f)) return CL_LINE;
+        if (mF && (!mL || dL - dF > 6f)) return CL_FLOOR;
         return CL_UNK;
     }
 
@@ -2966,7 +2969,13 @@ public final class LineFollowerPipeline {
         if (g < 0.2f || g > 2.5f) return -1f;
         final float d = q0 - q1 * g;
         final float tau = cfg.colorMatchSigma * cfg.colorMatchSigma;
-        return d <= 2f * tau ? g : -1f;
+        if (d > 2f * tau) return -1f;
+        // A pixel that is also the line colour under a plausible light level is not used
+        // to measure the floor's light (with brightness only, a dark line is otherwise
+        // "floor in deep shadow" and drags the estimate down).
+        final float r = lightRange();
+        final float dL = rayDist(y, u, v, ciL, 0, caL, 0, ckL, 1f / (r * r), r * r);
+        return dL <= tau ? -1f : g;
     }
 
     /** Reads the 2×2-averaged colour around pixel (col,row) into sY / sU / sV (U, V centred on 0). */
@@ -3047,9 +3056,11 @@ public final class LineFollowerPipeline {
 
     /** Expected line width (plane units) at plane point (x, y). Overwrites pU / pV in image mode. */
     private float widthAt(float x, float y) {
-        if (cfg.pathFloorSpace) return lineW;
+        // The width measured per image row at calibration, converted to plane units at
+        // this point: consistent with the image even if the camera tilt is not exact.
         if (!planeToImage(x, y)) return lineW;
-        return Math.max(3f, calWA + calWB * pV) * ipK;
+        final float px = Math.max(3f, calWA + calWB * pV);
+        return cfg.pathFloorSpace ? px * pixelSizeAt(x, y) : px * ipK;
     }
 
     /** True if plane point (x, y) is inside the ROI with a margin of {@code marginPx}. Sets pU / pV. */
@@ -3088,17 +3099,62 @@ public final class LineFollowerPipeline {
 
     /** Classify prY/U/V[0…n) (CL_OUT entries kept) with the local light level from prTmp[0…nG). */
     private void classifyProfile(int n, int nG) {
+        if (n > 2 * PROF_MAX) { classifyLongScan(n); return; }
         float gl = prGain;
         if (nG >= 4) gl = median(prTmp, nG);
         else if (nG > 0) gl = 0.5f * (prGain + median(prTmp, nG));
         prGain = gl;
-        final float r = Math.max(1.05f, cfg.lightLocalRange);
+        final float r = lightRange();
         final float gLo = gl / r, gHi = gl * r;
         for (int j = 0; j < n; j++) {
             if (prCls[j] == CL_OUT) { prLam[j] = 0f; continue; }
             prCls[j] = classify(prY[j], prU[j], prV[j], gLo, gHi, gl);
             prLam[j] = clsLam;
         }
+    }
+
+    /**
+     * Long scans (a whole image row): the light level may change along the row (a
+     * shadow edge), so each sample uses the mean light level of the floor-like
+     * samples within ±16 samples (prefix sums of log gain), falling back to the
+     * row's overall level where there are none.
+     */
+    private void classifyLongScan(int n) {
+        final float r = lightRange();
+        // prLam temporarily holds the prefix sums of log-gain, prTmp the prefix counts
+        float sum = 0f, cnt = 0f, all = 0f; int allN = 0;
+        for (int j = 0; j < n; j++) {
+            final float g = prCls[j] == CL_OUT ? -1f : floorGain(prY[j], prU[j], prV[j]);
+            if (g > 0f) { final float lg = (float) Math.log(g); sum += lg; cnt += 1f; all += lg; allN++; }
+            prLam[j] = sum; prTmp[j] = cnt;
+        }
+        final float glAll = allN > 0 ? (float) Math.exp(all / allN) : prGain;
+        final int H = 16;
+        for (int j = 0; j < n; j++) {
+            final int lo = Math.max(0, j - H) - 1, hi = Math.min(n - 1, j + H);
+            final float c = prTmp[hi] - (lo >= 0 ? prTmp[lo] : 0f);
+            final float sl = prLam[hi] - (lo >= 0 ? prLam[lo] : 0f);
+            final float gl = c >= 4f ? (float) Math.exp(sl / c) : glAll;
+            prU2[j] = gl;
+        }
+        prGain = glAll;
+        if (DBG && dbgCount < 3) { dbgCount++; final StringBuilder sb = new StringBuilder("LONG n=" + n + " glAll=" + glAll + " gl:"); for (int j = 60; j < 100 && j < n; j += 3) sb.append(String.format(" %.2f/%.0f", prU2[j], prY[j])); System.out.println(sb); }
+        for (int j = 0; j < n; j++) {
+            if (prCls[j] == CL_OUT) { prLam[j] = 0f; continue; }
+            final float gl = prU2[j];
+            prCls[j] = classify(prY[j], prU[j], prV[j], gl / r, gl * r, gl);
+            prLam[j] = clsLam;
+        }
+    }
+
+    /**
+     * Local light window (×/÷) for matching colours. With brightness only (grayscale
+     * input or autoColor off) nothing but brightness separates line and floor, so the
+     * window is narrower.
+     */
+    private float lightRange() {
+        final float r = Math.max(1.05f, cfg.lightLocalRange);
+        return (srcFormat == FMT_GRAY || modelLumaOnly) ? Math.min(r, 1.3f) : r;
     }
 
     /** Median of a[0…n) (partially reorders a). */
@@ -3118,6 +3174,34 @@ public final class LineFollowerPipeline {
         if (Math.abs(b - a) > 1e-3f) t = (0.5f - a) / (b - a);
         if (t < 0f) t = 0f; else if (t > 1f) t = 1f;
         return prH0 + (i + t) * prStep;
+    }
+
+    // result of leftEdge / rightEdge: true when the edge is against floor
+    private boolean edgeClean;
+
+    /**
+     * Left edge of the LINE run starting at sample a. Against floor = clean. One
+     * mixed sample (partly line, partly floor: a blurred edge) between the run and
+     * floor also counts as clean; the edge is placed where the line-ness crosses 0.5.
+     */
+    private float leftEdge(int a) {
+        if (a > 0 && prCls[a - 1] == CL_FLOOR) { edgeClean = true; return edgePos(a - 1); }
+        if (a > 1 && prCls[a - 1] == CL_UNK && prCls[a - 2] == CL_FLOOR && prLam[a - 1] > 0.1f && prLam[a - 1] < 0.9f) {
+            edgeClean = true; return prLam[a - 1] >= 0.5f ? edgePos(a - 2) : edgePos(a - 1);
+        }
+        edgeClean = false;
+        return prH0 + (a - 0.5f) * prStep;
+    }
+
+    /** Right edge of the LINE run ending at sample b (see leftEdge). */
+    private float rightEdge(int b) {
+        final int n = prN;
+        if (b + 1 < n && prCls[b + 1] == CL_FLOOR) { edgeClean = true; return edgePos(b); }
+        if (b + 2 < n && prCls[b + 1] == CL_UNK && prCls[b + 2] == CL_FLOOR && prLam[b + 1] > 0.1f && prLam[b + 1] < 0.9f) {
+            edgeClean = true; return prLam[b + 1] >= 0.5f ? edgePos(b + 1) : edgePos(b);
+        }
+        edgeClean = false;
+        return prH0 + (b + 0.5f) * prStep;
     }
 
     /**
@@ -3153,10 +3237,8 @@ public final class LineFollowerPipeline {
                 else break;
             }
             j = b + 1;
-            final byte lc = a > 0 ? prCls[a - 1] : CL_OUT, rc = b + 1 < n ? prCls[b + 1] : CL_OUT;
-            final boolean cl = lc == CL_FLOOR, cr = rc == CL_FLOOR;
-            final float eL = cl ? edgePos(a - 1) : prH0 + (a - 0.5f) * prStep;
-            final float eR = cr ? edgePos(b) : prH0 + (b + 0.5f) * prStep;
+            final float eL = leftEdge(a); final boolean cl = edgeClean;
+            final float eR = rightEdge(b); final boolean cr = edgeClean;
             final float width = eR - eL, ratio = width / wExp;
             final boolean near = eR >= -reach && eL <= reach;
             float c1 = 0f, q1 = 0f, c2 = 0f, q2 = 0f;
@@ -3322,11 +3404,25 @@ public final class LineFollowerPipeline {
             if (col < edge) { left[lbl]++; leftTotal++; }
             else if (col >= imgW - edge) { right[lbl]++; rightTotal++; }
         }
+        // Two colours that are not really different (noise on one surface): low contrast.
+        if (k == 2) {
+            final double dd = Math.sqrt(sq(c[0] - c[3]) + sq(c[1] - c[4]) + sq(c[2] - c[5]));
+            if (dd < cfg.colorMinDistance) { calibIssue = ISSUE_LOW_CONTRAST; return false; }
+        }
         // Floor: the cluster holding the most of both edge zones (and ≥ 40 % of each).
         int floor = -1; double bestEdge = 0;
         for (int j = 0; j < k; j++) {
             final double l = left[j] / (double) Math.max(1, leftTotal), r = right[j] / (double) Math.max(1, rightTotal);
             if (l >= 0.4 && r >= 0.4 && l + r > bestEdge) { bestEdge = l + r; floor = j; }
+        }
+        if (floor < 0 && k > 2) {
+            // A shadow or a light change splits the floor (one part on each edge): the
+            // floor is the cluster with the largest share of both edges together (the
+            // other part is the same floor under other light — see buildModelsV3).
+            for (int j = 0; j < k; j++) {
+                final double l = left[j] / (double) Math.max(1, leftTotal), r = right[j] / (double) Math.max(1, rightTotal);
+                if (l + r >= 0.6 && l + r > bestEdge) { bestEdge = l + r; floor = j; }
+            }
         }
         if (floor < 0) { calibIssue = ISSUE_NO_FLOOR; return false; }
         // Line: a cluster that (almost) never reaches the edges and forms a narrow
@@ -3338,7 +3434,7 @@ public final class LineFollowerPipeline {
             // (an object of the line's colour may touch an edge in a few rows: the
             // per-block band test decides, those blocks are outvoted)
             if (left[j] > 0.4 * leftTotal || right[j] > 0.4 * rightTotal) continue;
-            if (bandBlocks(n, j, b) < 0.5 || b[1] > 0.5 * imgW) continue;
+            if (bandBlocks(n, j, b) < 0.5 || b[1] > (k == 2 ? 0.8 : 0.5) * imgW) continue;
             final double d = Math.abs(b[0] - imgW * 0.5);
             if (d < bestD) { bestD = d; line = j; band[0] = b[0]; band[1] = b[1]; }
         }
@@ -3389,7 +3485,7 @@ public final class LineFollowerPipeline {
                     curS = -1;
                 }
             }
-            if (bestS >= 0 && bestIn >= 0.6 * clTotal[blk] && bestE - bestS <= 0.5 * W) {
+            if (bestS >= 0 && bestIn >= 0.6 * clTotal[blk] && bestE - bestS <= 0.8 * W) {
                 if (ok == 0) { out[0] = (bestS + bestE) * 0.5; out[1] = bestE - bestS; }
                 ok++;
             }
@@ -3408,7 +3504,7 @@ public final class LineFollowerPipeline {
         // Other clusters: a second floor colour if it also fills both edges and is
         // not explained by the floor / line colour under other light; otherwise a
         // disturbance (glare, shadow patch, object) — excluded from the models.
-        final float r = Math.max(1.05f, cfg.lightLocalRange);
+        final float r = lightRange();
         for (int j = 0; j < k && nFloorModels < FLOOR_MAX; j++) {
             if (j == line || j == floor) continue;
             final float y = (float) c[j * 3], u = (float) c[j * 3 + 1] - 128f, v = (float) c[j * 3 + 2] - 128f;
@@ -3528,6 +3624,7 @@ public final class LineFollowerPipeline {
             for (int i = 0; i < n; i++) { if (prCls[i] == CL_OUT) continue; valid++; if (prCls[i] != CL_UNK) good++; }
             cgFrames[j]++;
             cgSumGood[j] += valid > 0 ? good / (float) valid : 0f;
+            if (DBG && j % 20 == 0) { final StringBuilder sb = new StringBuilder("CG row=" + row + " n=" + n + " pred=" + pred + " predW=" + predW + " gain=" + prGain + " cls="); for (int q = 0; q < n; q += 2) sb.append(prCls[q]); System.out.println(sb); }
             // Candidate nearest the prediction with clean edges on both sides.
             final float p = lastJ >= 0 ? pred + slope * (j - lastJ) : pred;
             final float gate = lastJ >= 0 ? Math.max(12f, (predW > 0f ? predW : 40f) * Math.min(3f, 0.6f + 0.1f * (j - lastJ))) : W * 0.3f;
@@ -3542,8 +3639,9 @@ public final class LineFollowerPipeline {
                     else break;
                 }
                 i = b + 1;
-                if (a == 0 || b == n - 1 || prCls[a - 1] != CL_FLOOR || prCls[b + 1] != CL_FLOOR) continue;
-                final float eL = edgePos(a - 1), eR = edgePos(b), w = eR - eL, cc = 0.5f * (eL + eR);
+                final float eL = leftEdge(a); if (!edgeClean) continue;
+                final float eR = rightEdge(b); if (!edgeClean) continue;
+                final float w = eR - eL, cc = 0.5f * (eL + eR);
                 if (w < 3f) continue;
                 if (predW > 0f && (w < 0.5f * predW * (lastJ >= 0 ? 0.8f : 0.5f) || w > 1.6f * predW)) continue;
                 final float d = Math.abs(cc - p);
@@ -3641,9 +3739,10 @@ public final class LineFollowerPipeline {
             final double t = Math.toDegrees(Math.atan2(wc, gFoc * B));
             int used = 0; for (int j = jb; j <= jt; j++) if (wt[j] > 0.3f) used++;
             final float spanFrac = (cgRow[jb] - cgRow[jt]) / (float) imgH;
-            if (wc > 0 && t >= 15 && t <= 89.5 && used >= 8 && spanFrac >= 0.25f) setGeometry((float) t);
-        } else if (cfg.learnCameraTilt && Math.abs(B) <= 1e-6 && A > 0) {
-            setGeometry(89.5f);                                  // constant width: camera looks straight down
+            // trusted only near the configured tilt (a gross mismatch means the width
+            // measurement is not a perspective view of a straight line)
+            if (wc > 0 && t >= 15 && t <= 80 && Math.abs(t - cfg.cameraTiltDeg) <= 25 && used >= 8 && spanFrac >= 0.25f)
+                setGeometry((float) t);
         }
         // ── ROI rows (top with the safety margin, as a fraction of the floor distance) ──
         roiBot = Math.min(ignoreTop, cgRow[jb] + Math.max(2, imgH / 320) + 1);
@@ -3770,6 +3869,35 @@ public final class LineFollowerPipeline {
     //  v3 — tracing the path (hot path: no allocation)
     // =========================================================================
 
+    // copy of the traced path (for trying a fresh search without losing it)
+    private final float[] svX = new float[NODE_MAX], svY = new float[NODE_MAX], svConf = new float[NODE_MAX], svQ = new float[NODE_MAX];
+    private final byte[]  svSt = new byte[NODE_MAX], svSrc = new byte[NODE_MAX];
+    private final short[] svAge = new short[NODE_MAX];
+    private int svN;
+    private boolean memAbsent;              // this frame: clean floor where the remembered path is
+
+    private void saveNodes() {
+        svN = ndN;
+        System.arraycopy(ndX, 0, svX, 0, ndN); System.arraycopy(ndY, 0, svY, 0, ndN);
+        System.arraycopy(ndConf, 0, svConf, 0, ndN); System.arraycopy(ndQ, 0, svQ, 0, ndN);
+        System.arraycopy(ndSt, 0, svSt, 0, ndN); System.arraycopy(ndSrc, 0, svSrc, 0, ndN);
+        System.arraycopy(ndAge, 0, svAge, 0, ndN);
+    }
+
+    private void restoreNodes() {
+        ndN = svN;
+        System.arraycopy(svX, 0, ndX, 0, ndN); System.arraycopy(svY, 0, ndY, 0, ndN);
+        System.arraycopy(svConf, 0, ndConf, 0, ndN); System.arraycopy(svQ, 0, ndQ, 0, ndN);
+        System.arraycopy(svSt, 0, ndSt, 0, ndN); System.arraycopy(svSrc, 0, ndSrc, 0, ndN);
+        System.arraycopy(svAge, 0, ndAge, 0, ndN);
+    }
+
+    private int countFresh() {
+        int c = 0;
+        for (int i = 0; i < ndN; i++) if (ndSrc[i] == PATH_SRC_FRESH) c++;
+        return c;
+    }
+
     /** Unit normals (pointing right of the path direction) of polyline x/y[0…n). */
     private static void normals(float[] x, float[] y, int n, float[] nx, float[] ny) {
         for (int i = 0; i < n; i++) {
@@ -3827,7 +3955,7 @@ public final class LineFollowerPipeline {
         for (int i = 0; i < n; i++) {
             if (ndSt[i] == ST_MEAS) meas++; else if (ndSt[i] == ST_ABSENT) absent++; else if (ndSt[i] == ST_UNREL) unrel++;
         }
-        if (meas == 0 && absent >= 2 && absent >= unrel) return false;
+        if (meas == 0 && absent >= 2 && absent >= unrel) { memAbsent = true; return false; }
 
         estimateCorrection();
         assembleFromMemory();
@@ -4281,10 +4409,9 @@ public final class LineFollowerPipeline {
                 else break;
             }
             i = b + 1;
-            final boolean cl = a > 0 && prCls[a - 1] == CL_FLOOR, cr = b + 1 < n && prCls[b + 1] == CL_FLOOR;
+            final float eL = leftEdge(a); final boolean cl = edgeClean;
+            final float eR = rightEdge(b); final boolean cr = edgeClean;
             if (!cl && !cr) continue;
-            final float eL = cl ? edgePos(a - 1) : prH0 + (a - 0.5f) * prStep;
-            final float eR = cr ? edgePos(b) : prH0 + (b + 0.5f) * prStep;
             final float ratio = (eR - eL) / wPx;
             float c, qual;
             if (cl && cr) { if (ratio < 0.6f || ratio > 1.5f) continue; c = 0.5f * (eL + eR); qual = 1f - 0.4f * Math.abs(ratio - 1f); }
@@ -4530,7 +4657,9 @@ public final class LineFollowerPipeline {
             // urgency with fast attack and slow release (no on/off toggling)
             final float u = xExit >= 0f ? Math.max(0f, Math.min(1f, (x0 - xExit) / Math.max(1e-3f, x0 - xb))) : 0f;
             if (xExit >= 0f && side != guardSide) { guardU = 0f; guardSide = side; }
-            guardU = u > guardU ? guardU + 0.5f * (u - guardU) : guardU * 0.95f;
+            // slow release while the path still leaves the side, quick once it no longer does
+            guardU = u > guardU ? guardU + 0.5f * (u - guardU) : guardU * (xExit >= 0f ? 0.95f : 0.75f);
+            if (xExit < 0f && Math.abs(ctTY) < 0.5f * lineW) guardU = 0f;     // path straight ahead again
             if (guardU > 0.02f && guardSide != 0f) {
                 ctGuard = guardSide * 50f * guardU;
                 if (guardSide * ctSteer < 50f * guardU) ctSteer = guardSide * 50f * guardU;
@@ -4598,13 +4727,16 @@ public final class LineFollowerPipeline {
         final float tMin = cfg.trackingMinValue;
         float t = ctTrackCurve;
         if (cfg.trackLengthSlowdown && pathEnd == END_ABSENT) {
-            final float full = Math.max(1e-3f, cfg.trackLengthFullFrac * roiFarFwd);
-            t = Math.min(t, 100f * Math.max(0f, Math.min(1f, ctLength / full)));
+            // linear in the known length: 100 at trackLengthFullFrac of the view's
+            // depth, the minimum when the end reaches the bottom of the view
+            final float full = Math.max(roiNearFwd + 1e-3f, cfg.trackLengthFullFrac * roiFarFwd);
+            t = Math.min(t, 100f * Math.max(0f, Math.min(1f, (ctLength - roiNearFwd) / (full - roiNearFwd))));
         }
         if (ctConf < 0.5f) t = tMin + (t - tMin) * Math.max(0f, ctConf) / 0.5f;
         t = Math.max(tMin, Math.min(100f, t));
         // light smoothing of the target (the path is re-measured every frame)
         ctCurvAheadPrev += 0.3f * (t - ctCurvAheadPrev);
+        if (t <= tMin + 0.5f && ctCurvAheadPrev < tMin + 2f) ctCurvAheadPrev = tMin;
         return ctCurvAheadPrev;
     }
 
@@ -4620,7 +4752,7 @@ public final class LineFollowerPipeline {
     private void buildReliabilityGrid() {
         final int GC = RELIABILITY_GRID_COLS, GR = RELIABILITY_GRID_ROWS;
         final float cw = imgW / (float) GC, ch = (roiBot - roiTop) / (float) GR;
-        final float r = Math.max(1.05f, cfg.lightLocalRange);
+        final float r = lightRange();
         int cnt = 0;
         float gl = 1f;
         for (int gy = 0; gy < GR; gy++) {
@@ -4651,6 +4783,7 @@ public final class LineFollowerPipeline {
     /** One v3 frame: trace, control, memory update. Writes the internal output holder. */
     private void processV3() {
         v3Rejected = 0;
+        memAbsent = false;
         buildReliabilityGrid();
         final boolean haveMem = cfg.pathMemory && memN >= 2;
         if (haveMem) predictMemory();
@@ -4661,6 +4794,21 @@ public final class LineFollowerPipeline {
             boolean any = false;
             for (int i = 0; i < ndN && !any; i++) any = ndSt[i] == ST_MEAS;
             if (!any) ok = false;
+        }
+        if (ok) {
+            // (Almost) nothing of the remembered path confirmed this frame: maybe it is hidden,
+            // maybe the line moved more than expected. A fresh search decides: a
+            // well-measured path found elsewhere replaces the memory; otherwise the
+            // memory is kept (hidden line).
+            int conf = 0;
+            for (int i = 0; i < ndN; i++) if (ndSt[i] == ST_MEAS) conf++;
+            if (conf < 3) {
+                saveNodes();
+                final float cx = corrX, cy = corrY, ct = corrT;
+                final int pe = pathEnd;
+                if (acquire() && countFresh() >= 4) { corrX = 0f; corrY = 0f; corrT = 0f; }
+                else { restoreNodes(); corrX = cx; corrY = cy; corrT = ct; pathEnd = pe; }
+            }
         }
         if (!ok) { corrX = 0f; corrY = 0f; corrT = 0f; ok = acquire(); }
         int fresh = 0;
@@ -4699,7 +4847,7 @@ public final class LineFollowerPipeline {
             final boolean blind = ok && nAbs == 0 && nBelow > 0 && nBelow >= nSide
                     && v3LostFrames <= cfg.pathMemoryFrames;
             final boolean hidden = ok && ((nUnr > 0 && nUnr >= nAbs) || blind) && v3LostFrames <= cfg.pathMemoryFrames;
-            final boolean midImage = ok && nAbs > 0 && nAbs >= nOut && v3HoldFrames < cfg.trackHoldFrames;
+            final boolean midImage = ((ok && nAbs > 0 && nAbs >= nOut) || (!ok && memAbsent)) && v3HoldFrames < cfg.trackHoldFrames;
             if (hidden) {
                 // covered by a disturbance: follow the remembered path, confidence fades slowly
                 steering = ctSteer;

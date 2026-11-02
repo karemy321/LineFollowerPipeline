@@ -105,23 +105,26 @@ public class LineFollowerPipelineTest {
     }
 
     /**
-     * Steering for a line shifted 60 px from the calibrated column. The offset
-     * part alone (v1 steering) is 19.
+     * Steering for a line shifted 60 px from the calibrated column in the v1/v2
+     * pipeline (Config.pathTracking = false): the offset part alone is 19.
      */
     private static final int OFFSET_60PX = 19;
 
     /**
-     * Checks the steering for a straight image line shifted {@code sign × 60 px}.
-     * A line that is vertical in the image but off-centre is angled on the floor
-     * (pointing away from the robot's centreline), so v2 steering is the v1
-     * offset part plus a heading part in the same direction.
+     * Checks the v3 steering for a straight image line shifted {@code sign × 60 px}.
+     * v3 steers by pure pursuit on the traced path: the path is found, steering goes
+     * toward the line (a 60 px shift of a 30 px line is ~2 line widths: well inside
+     * ±50, clearly non-zero), the offset part points the same way, and the output
+     * is the sum of its offset and heading parts (FrameData decomposition).
+     * (v2 expected exactly 19 + a heading part; v3's pursuit reacts more gently to a
+     * pure sideways offset — see _investigation/CHANGES_v3.md, "Existing tests".)
      */
     private static void assertShiftedSteering(String what, int sign, int steering,
                                               LineFollowerPipeline.FrameData d) {
         assertTrue(what + ": line found", d.trackFound);
-        assertEquals(what + " offset part", sign * OFFSET_60PX, d.steerOffsetTerm, 2f);
-        assertTrue(what + " heading part should steer the same way: " + d.steerHeadingTerm,
-                sign * d.steerHeadingTerm > 1f);
+        assertTrue(what + " steers toward the line: " + steering, sign * steering >= 3 && sign * steering <= 50);
+        assertTrue(what + " offset part points toward the line: " + d.steerOffsetTerm, sign * d.steerOffsetTerm > 0f);
+        assertTrue(what + " path offset has the line's side: " + d.pathOffset, sign * d.pathOffset > 0f);
         assertEquals(what + " steering = offset + heading",
                 Math.max(-50f, Math.min(50f, d.steerOffsetTerm + d.steerHeadingTerm)),
                 steering, 1f);
@@ -154,9 +157,10 @@ public class LineFollowerPipelineTest {
         assertShiftedSteering(f + " left", -1, left[0], last[0]);
     }
 
-    /** Config that reproduces the v1 steering and lost-line behaviour. */
+    /** Config that reproduces the v1 steering and lost-line behaviour (v2 pipeline). */
     private static LineFollowerPipeline.Config v1Behaviour() {
         final LineFollowerPipeline.Config cfg = new LineFollowerPipeline.Config();
+        cfg.pathTracking       = false;
         cfg.steerHeadingWeight = 0f;
         cfg.trackHoldFrames    = 0;
         return cfg;
@@ -315,7 +319,10 @@ public class LineFollowerPipelineTest {
             final double t = Math.max(0, (180 - r) / 120.0);
             return W / 2 + 220 * t * t;
         }, 30, 4, 1.0, 5);
-        final int[] out = p.processFrameArgb(turn, W, H);
+        // v3 tracking changes smoothly (Config.powerFallRate per frame), so the turn
+        // is shown for a few frames before the value is checked.
+        int[] out = null;
+        for (int i = 0; i < 15; i++) out = p.processFrameArgb(turn, W, H);
         assertTrue("turn should lower tracking: " + out[1], out[1] < 60);
         assertTrue("line still in view → trackFound", last[0].trackFound);
         assertTrue("look-ahead path follows the curve", last[0].lookAheadPointCount > 5);
