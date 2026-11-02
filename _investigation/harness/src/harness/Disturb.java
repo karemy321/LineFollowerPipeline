@@ -201,9 +201,10 @@ final class Disturb {
             case "edge": {
                 final double[] c = at(t, g(kv, "s", 1.0));
                 final int col = rgb(kv, "rgb", 0x3C3C46);
+                final double off = g(kv, "off", 0.0);
                 return (yuv, wx, wy, rf, rl, tape) -> {
                     final double al = (wx - c[0]) * c[2] + (wy - c[1]) * c[3];
-                    if (al <= 0) return;
+                    if (al <= off) return;
                     final double n = World.noise(wx, wy, 0.04, 77);
                     final int base = World.Col.scale(col, 0.8 + 0.4 * n);
                     final double ch = World.noise(wx, wy, 0.25, 78);

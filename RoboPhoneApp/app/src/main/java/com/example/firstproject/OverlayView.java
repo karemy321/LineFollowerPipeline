@@ -15,16 +15,22 @@ import com.example.linefollower.LineFollowerPipeline;
  * Transparent overlay drawn on top of the camera PreviewView.
  *
  * Everything drawn here comes straight from the library's
- * {@link LineFollowerPipeline.FrameData} — no geometry is recomputed in the app:
+ * {@link LineFollowerPipeline.FrameData} — no geometry is recomputed in the app.
+ *
+ * v3 path tracking (default, FrameData.pathMode):
  *
  *   ┌──────────────────────────────────────────┐
- *   │        ╲   V-ROI (magenta) band   ╱       │  bends along the detected line
- *   │         ╲  look-ahead / TRACK    ╱        │
- *   │          ╲        │ centre line ╱         │  green = tracking, orange = lost
- *   ╠═══════════════════╪══════════════════════╣  H-ROI (cyan) — STEER strip
- *   │                   ┊ dashed = calibrated straight-ahead
- *   │▒▒▒▒▒▒▒▒▒▒▒▒ IGNORED (robot) ▒▒▒▒▒▒▒▒▒▒▒▒▒│  red — excluded robot body
+ *   │  ROI (white frame) — the region read      │
+ *   │      ░░ unreliable cells (red) ░░         │  glare / shadow / object / colour patch
+ *   │        ●  path measured now (green)       │
+ *   │       ●   path from memory (cyan)         │
+ *   │      ●    hidden part filled from memory  │  (orange) / bridged (yellow)
+ *   │     ◎ ← look-ahead target (magenta)       │
+ *   │     ↑ steering arrow from the robot       │
+ *   │▒▒▒▒▒▒▒▒▒▒▒▒ IGNORED (robot) ▒▒▒▒▒▒▒▒▒▒▒▒▒│
  *   └──────────────────────────────────────────┘
+ *
+ * v2 (Config.pathTracking = false): the H-ROI strip and the V-ROI look-ahead band (⊥).
  *
  * The camera image is mapped to the view exactly as PreviewView's default
  * FILL_CENTER scale type does (scale to cover, centre, crop the overflow), so
@@ -46,6 +52,12 @@ public final class OverlayView extends View {
     private final Paint labelPaint      = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint ignorePaint     = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint ignoreLinePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+    // v3
+    private final Paint roiPaint        = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private final Paint unreliablePaint = new Paint();
+    private final Paint pathPaint       = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private final Paint pointPaint      = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private final Paint targetPaint     = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Path  arrowPath  = new Path();  // reused in onDraw — no allocation
     private final Path  vRoiPath   = new Path();  // reused — straight V-ROI trapezoid
     private final Path  bandPath   = new Path();  // reused — dynamic (curved) V-ROI band
@@ -54,6 +66,14 @@ public final class OverlayView extends View {
     private static final int COLOR_TRACKING    = Color.parseColor("#00E676");
     private static final int COLOR_LOST        = Color.parseColor("#FF6D00");
     private static final int COLOR_CALIBRATING = Color.parseColor("#FFD600");
+    // path point sources (FrameData.pathSource)
+    private static final int COLOR_FRESH       = Color.parseColor("#00E676");   // measured now
+    private static final int COLOR_MEMORY      = Color.parseColor("#00B8FF");   // from memory
+    private static final int COLOR_UNRELIABLE  = Color.parseColor("#FF9100");   // hidden now, from memory
+    private static final int COLOR_PREDICTED   = Color.parseColor("#FFEA00");   // bridged by continuity
+    private static final int COLOR_TARGET      = Color.MAGENTA;
+
+    private static final int GRID = LineFollowerPipeline.RELIABILITY_GRID_COLS * LineFollowerPipeline.RELIABILITY_GRID_ROWS;
 
     // ── Frame snapshots ───────────────────────────────────────────────────────
     // The camera thread writes into `pending` under the lock; onDraw copies it
@@ -69,11 +89,20 @@ public final class OverlayView extends View {
         float   hRoiTopFrac, hRoiBotFrac, vRoiTopFrac, ignoreTopFrac;
         float   steerRefXFrac, trackRefXFrac, halfBotFrac, halfTopFrac;
         float   centroidXFrac;
-        int     steering;
-        boolean trackFound, isCalibrated;
+        int     steering, tracking;
+        boolean trackFound, isCalibrated, lineHeld;
         final float[] laCol = new float[48];
         final float[] laRow = new float[48];
         int     laCount;
+        // v3
+        boolean pathMode, lookAheadValid;
+        float   roiTopFrac, roiBotFrac, lookX, lookY, memoryFrac, confidence;
+        final float[] pCol = new float[LineFollowerPipeline.PATH_MAX_POINTS];
+        final float[] pRow = new float[LineFollowerPipeline.PATH_MAX_POINTS];
+        final byte[]  pSrc = new byte[LineFollowerPipeline.PATH_MAX_POINTS];
+        int     pCount;
+        final byte[]  grid = new byte[GRID];
+        int     cells;
 
         void copyFrom(LineFollowerPipeline.FrameData d) {
             valid         = true;
@@ -82,11 +111,22 @@ public final class OverlayView extends View {
             vRoiTopFrac   = d.vRoiTopFrac;   ignoreTopFrac = d.ignoreTopFrac;
             steerRefXFrac = d.steerRefXFrac; trackRefXFrac = d.trackRefXFrac;
             halfBotFrac   = d.halfBotFrac;   halfTopFrac   = d.halfTopFrac;
-            centroidXFrac = d.centroidXFrac; steering      = d.steering;
-            trackFound    = d.trackFound;    isCalibrated  = d.isCalibrated;
+            centroidXFrac = d.centroidXFrac; steering      = d.steering;   tracking = d.tracking;
+            trackFound    = d.trackFound;    isCalibrated  = d.isCalibrated; lineHeld = d.lineHeld;
             laCount = Math.min(d.lookAheadPointCount, laCol.length);
             System.arraycopy(d.lookAheadColFrac, 0, laCol, 0, laCount);
             System.arraycopy(d.lookAheadRowFrac, 0, laRow, 0, laCount);
+            pathMode   = d.pathMode;
+            roiTopFrac = d.roiTopFrac;       roiBotFrac = d.roiBotFrac;
+            lookAheadValid = d.lookAheadValid;
+            lookX      = d.lookAheadXFrac;   lookY      = d.lookAheadYFrac;
+            memoryFrac = d.pathMemoryFrac;   confidence = d.pathConfidence;
+            pCount = Math.min(d.pathPointCount, pCol.length);
+            System.arraycopy(d.pathColFrac, 0, pCol, 0, pCount);
+            System.arraycopy(d.pathRowFrac, 0, pRow, 0, pCount);
+            System.arraycopy(d.pathSource, 0, pSrc, 0, pCount);
+            System.arraycopy(d.unreliableGrid, 0, grid, 0, GRID);
+            cells = d.unreliableCells;
         }
 
         void copyFrom(Snapshot s) {
@@ -96,11 +136,22 @@ public final class OverlayView extends View {
             vRoiTopFrac   = s.vRoiTopFrac;   ignoreTopFrac = s.ignoreTopFrac;
             steerRefXFrac = s.steerRefXFrac; trackRefXFrac = s.trackRefXFrac;
             halfBotFrac   = s.halfBotFrac;   halfTopFrac   = s.halfTopFrac;
-            centroidXFrac = s.centroidXFrac; steering      = s.steering;
-            trackFound    = s.trackFound;    isCalibrated  = s.isCalibrated;
+            centroidXFrac = s.centroidXFrac; steering      = s.steering;   tracking = s.tracking;
+            trackFound    = s.trackFound;    isCalibrated  = s.isCalibrated; lineHeld = s.lineHeld;
             laCount = s.laCount;
             System.arraycopy(s.laCol, 0, laCol, 0, laCount);
             System.arraycopy(s.laRow, 0, laRow, 0, laCount);
+            pathMode   = s.pathMode;
+            roiTopFrac = s.roiTopFrac;       roiBotFrac = s.roiBotFrac;
+            lookAheadValid = s.lookAheadValid;
+            lookX      = s.lookX;            lookY      = s.lookY;
+            memoryFrac = s.memoryFrac;       confidence = s.confidence;
+            pCount = s.pCount;
+            System.arraycopy(s.pCol, 0, pCol, 0, pCount);
+            System.arraycopy(s.pRow, 0, pRow, 0, pCount);
+            System.arraycopy(s.pSrc, 0, pSrc, 0, pCount);
+            System.arraycopy(s.grid, 0, grid, 0, GRID);
+            cells = s.cells;
         }
     }
 
@@ -171,6 +222,26 @@ public final class OverlayView extends View {
         ignoreLinePaint.setColor(Color.RED);
         ignoreLinePaint.setAlpha(220);
         ignoreLinePaint.setStrokeWidth(3f);
+
+        // v3: ROI frame, unreliable cells, path, target
+        roiPaint.setStyle(Paint.Style.STROKE);
+        roiPaint.setColor(Color.WHITE);
+        roiPaint.setAlpha(170);
+        roiPaint.setStrokeWidth(3f);
+
+        unreliablePaint.setStyle(Paint.Style.FILL);
+        unreliablePaint.setColor(Color.RED);
+        unreliablePaint.setAlpha(80);
+
+        pathPaint.setStyle(Paint.Style.STROKE);
+        pathPaint.setStrokeWidth(7f);
+        pathPaint.setStrokeCap(Paint.Cap.ROUND);
+
+        pointPaint.setStyle(Paint.Style.FILL);
+
+        targetPaint.setStyle(Paint.Style.STROKE);
+        targetPaint.setColor(COLOR_TARGET);
+        targetPaint.setStrokeWidth(5f);
     }
 
     // =========================================================================
@@ -208,6 +279,88 @@ public final class OverlayView extends View {
         mapOffX   = (W - mapScaleX) * 0.5f;
         mapOffY   = (H - mapScaleY) * 0.5f;
 
+        // ── Ignored bottom band (red) — robot body, excluded from processing ─
+        if (s.ignoreTopFrac < 1f) {
+            final float ignoreTop = my(s.ignoreTopFrac);
+            canvas.drawRect(0f, ignoreTop, W, H, ignorePaint);
+            canvas.drawLine(0f, ignoreTop, W, ignoreTop, ignoreLinePaint);
+            canvas.drawText("IGNORED (robot)", 8f, ignoreTop + 34f, labelPaint);
+        }
+
+        if (s.pathMode) drawPath(canvas, s, W);
+        else            drawT(canvas, s, W);
+    }
+
+    /** v3: ROI, unreliable cells, the traced path by source, the pure-pursuit target. */
+    private void drawPath(Canvas canvas, Snapshot s, float W) {
+        final float top = my(s.roiTopFrac), bot = my(s.roiBotFrac);
+        final int GC = LineFollowerPipeline.RELIABILITY_GRID_COLS, GR = LineFollowerPipeline.RELIABILITY_GRID_ROWS;
+
+        // Unreliable regions (glare, shadow, object, colour patch …)
+        if (s.isCalibrated && s.cells > 0) {
+            final float cw = mapScaleX / GC, ch = (bot - top) / GR;
+            for (int gy = 0; gy < GR; gy++) {
+                for (int gx = 0; gx < GC; gx++) {
+                    if (s.grid[gy * GC + gx] == 0) continue;
+                    final float x = mapOffX + gx * cw, y = top + gy * ch;
+                    canvas.drawRect(x, y, x + cw, y + ch, unreliablePaint);
+                }
+            }
+        }
+
+        // ROI frame (yellow while calibrating)
+        roiPaint.setColor(s.isCalibrated ? Color.WHITE : COLOR_CALIBRATING);
+        roiPaint.setAlpha(170);
+        canvas.drawRect(mx(0f) + 2f, top, mx(1f) - 2f, bot, roiPaint);
+
+        // Path: segments coloured by where each point came from
+        final int n = s.pCount;
+        for (int i = 0; i + 1 < n; i++) {
+            pathPaint.setColor(sourceColor(s.pSrc[i + 1]));
+            canvas.drawLine(mx(s.pCol[i]), my(s.pRow[i]), mx(s.pCol[i + 1]), my(s.pRow[i + 1]), pathPaint);
+        }
+        for (int i = 0; i < n; i++) {
+            pointPaint.setColor(sourceColor(s.pSrc[i]));
+            canvas.drawCircle(mx(s.pCol[i]), my(s.pRow[i]), 6f, pointPaint);
+        }
+
+        // Look-ahead target and the steering arrow from the robot (bottom centre)
+        final float baseX = mx(s.steerRefXFrac), baseY = bot;
+        if (s.lookAheadValid) {
+            final float tx = mx(s.lookX), ty = my(s.lookY);
+            canvas.drawCircle(tx, ty, 22f, targetPaint);
+            canvas.drawLine(baseX, baseY, tx, ty, targetPaint);
+        }
+        final int stateColor = !s.isCalibrated ? COLOR_CALIBRATING
+                             : s.trackFound ? COLOR_TRACKING : COLOR_LOST;
+        centroidPaint.setColor(stateColor);
+        final float tipX = baseX + s.steering / 50f * 0.25f * mapScaleX;
+        arrowPath.rewind();
+        arrowPath.moveTo(tipX, baseY - 60f);
+        arrowPath.lineTo(baseX - 18f, baseY - 10f);
+        arrowPath.lineTo(baseX + 18f, baseY - 10f);
+        arrowPath.close();
+        canvas.drawPath(arrowPath, centroidPaint);
+
+        // Labels
+        canvas.drawText(s.isCalibrated ? "ROI" : "CALIBRATING", 8f, top + 34f, labelPaint);
+        if (s.isCalibrated) {
+            final String state = s.trackFound ? "PATH" : (s.lineHeld ? "MEMORY" : "LOST");
+            canvas.drawText(state, 8f, top + 74f, labelPaint);
+        }
+    }
+
+    private static int sourceColor(byte src) {
+        switch (src) {
+            case LineFollowerPipeline.PATH_SRC_FRESH:      return COLOR_FRESH;
+            case LineFollowerPipeline.PATH_SRC_MEMORY:     return COLOR_MEMORY;
+            case LineFollowerPipeline.PATH_SRC_UNRELIABLE: return COLOR_UNRELIABLE;
+            default:                                       return COLOR_PREDICTED;
+        }
+    }
+
+    /** v2 (Config.pathTracking = false): the ⊥ — H-ROI strip and the V-ROI look-ahead band. */
+    private void drawT(Canvas canvas, Snapshot s, float W) {
         final float hTop = my(s.hRoiTopFrac);
         final float hBot = my(s.hRoiBotFrac);
         final float vTop = my(s.vRoiTopFrac);
@@ -217,25 +370,12 @@ public final class OverlayView extends View {
         final int   stateColor = !s.isCalibrated ? COLOR_CALIBRATING
                                : s.trackFound    ? COLOR_TRACKING : COLOR_LOST;
 
-        // ── 0. Ignored bottom band (red) — robot body, excluded from processing ─
-        if (s.ignoreTopFrac < 1f) {
-            final float ignoreTop = my(s.ignoreTopFrac);
-            canvas.drawRect(0f, ignoreTop, W, H, ignorePaint);
-            canvas.drawLine(0f, ignoreTop, W, ignoreTop, ignoreLinePaint);
-            canvas.drawText("IGNORED (robot)", 8f, ignoreTop + 34f, labelPaint);
-        }
-
         // ── 1. V-ROI (magenta) — vertical leg of ⊥ ────────────────────────────
-        // With a live look-ahead path the V-ROI is drawn as a BAND that bends along
-        // the detected line; otherwise as the straight perspective trapezoid from
-        // the calibrated steering reference, leaning toward the look-ahead reference.
         final int     n       = s.laCount;
         final boolean dynamic = s.trackFound && n >= 2;
         final float   span    = Math.max(1f, hTop - vTop);   // near→far vertical extent
 
         if (dynamic) {
-            // Band outline: left edge nearest→farthest, then right edge back. The
-            // half-width tapers per row between the near (wide) and far (narrow) ends.
             bandPath.rewind();
             for (int i = 0; i < n; i++) {
                 final float y = my(s.laRow[i]);
@@ -266,7 +406,6 @@ public final class OverlayView extends View {
             canvas.drawPath(vRoiPath, vFillPaint);
             canvas.drawPath(vRoiPath, vStrokePaint);
 
-            // T-junction corner accents — only meaningful for the straight guide box.
             final float arm = 22f;
             canvas.drawLine(blX - 2f, hTop, blX - 2f, hTop + arm, cornerPaint);
             canvas.drawLine(brX + 2f, hTop, brX + 2f, hTop + arm, cornerPaint);
@@ -289,7 +428,6 @@ public final class OverlayView extends View {
         if (s.centroidXFrac >= 0f) {
             cx = mx(s.centroidXFrac);                  // real detected position
         } else {
-            // Lost: point at the edge the line left (steering is pinned to ±50).
             cx = mx(clamp01(s.steerRefXFrac + s.steering / 100f));
         }
         if (dynamic) {
@@ -305,7 +443,6 @@ public final class OverlayView extends View {
             canvas.drawLine(cx, hTop, cx, hBot, centroidPaint);
         }
 
-        // Small triangle pointer at the H-ROI to highlight the near centroid.
         if (s.centroidXFrac >= 0f || s.isCalibrated) {
             final float tri = 18f;
             arrowPath.rewind();
@@ -313,7 +450,7 @@ public final class OverlayView extends View {
             arrowPath.lineTo(cx - tri * 0.6f, hTop - tri);
             arrowPath.lineTo(cx + tri * 0.6f, hTop - tri);
             arrowPath.close();
-            canvas.drawPath(arrowPath, centroidPaint);   // reuse same colour paint
+            canvas.drawPath(arrowPath, centroidPaint);
         }
 
         // ── 5. Labels ─────────────────────────────────────────────────────────

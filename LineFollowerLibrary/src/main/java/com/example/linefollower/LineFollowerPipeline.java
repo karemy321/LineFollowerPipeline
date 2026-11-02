@@ -2787,9 +2787,6 @@ public final class LineFollowerPipeline {
     private static final int  NODE_MAX = 128, PROF_MAX = 72, FLOOR_MAX = 3;
 
     private boolean v3Ready;               // calibrated in path mode
-    private static final boolean DBG = System.getProperty("lf.dbg") != null;   // TEMP
-    private static int dbgCount;   // TEMP
-    private static final boolean NOGUARD = System.getProperty("lf.noguard") != null;   // TEMP
 
     // ── Geometry actually used (pinhole; tilt possibly learned) ─────────────
     private double gFoc, gCx, gCy, gSinT = Math.sin(Math.PI / 4), gCosT = Math.cos(Math.PI / 4);
@@ -2951,7 +2948,6 @@ public final class LineFollowerPipeline {
         clsLam = ((y - gMid * cmF[0]) * dirLF0 + (u - gMid * cmF[1]) * dirLF1 + (v - gMid * cmF[2]) * dirLF2)
                  / (gMid * dirLFn);
         final boolean mL = dL <= tau, mF = dF <= tau;
-        if (DBG && dbgCount < 6 && y < 30f) { dbgCount++; System.out.println("CLS y=" + y + " u=" + u + " v=" + v + " dL=" + dL + " dF=" + dF + " g=[" + gLo + "," + gHi + "] mL=" + cmL[0] + "," + cmL[1] + "," + cmL[2] + " mF=" + cmF[0] + "," + cmF[1] + "," + cmF[2] + " iL0=" + ciL[0] + " iF0=" + ciF[0] + " nF=" + nFloorModels); }
         // both fit: the clearly better one (likelihood ratio > e³ ≈ 20 : 1), else unknown
         if (mL && (!mF || dF - dL > 6f)) return CL_LINE;
         if (mF && (!mL || dL - dF > 6f)) return CL_FLOOR;
@@ -3138,7 +3134,6 @@ public final class LineFollowerPipeline {
             prU2[j] = gl;
         }
         prGain = glAll;
-        if (DBG && dbgCount < 3) { dbgCount++; final StringBuilder sb = new StringBuilder("LONG n=" + n + " glAll=" + glAll + " gl:"); for (int j = 60; j < 100 && j < n; j += 3) sb.append(String.format(" %.2f/%.0f", prU2[j], prY[j])); System.out.println(sb); }
         for (int j = 0; j < n; j++) {
             if (prCls[j] == CL_OUT) { prLam[j] = 0f; continue; }
             final float gl = prU2[j];
@@ -3266,7 +3261,9 @@ public final class LineFollowerPipeline {
                 if (ratio >= 0.8f && ratio <= 1.25f) { c1 = 0.5f * (eL + eR); q1 = 0.35f; }
                 else if (near) doubtNear = true;
             }
-            if (q1 > 0f && Math.abs(c1) <= gate) {
+            // weaker evidence (one clean edge, or none) must also sit closer to the prediction
+            final float g1 = q1 >= 0.7f ? gate : Math.max(tol, 0.5f * gate);
+            if (q1 > 0f && Math.abs(c1) <= g1) {
                 final float z = c1 / sig, s = q1 * (float) Math.exp(-0.5f * z * z);
                 if (s > best) { best = s; msOff = c1; msQual = q1; msTrim = trim; }
             } else if (q1 > 0f && near) doubtNear = true;
@@ -3624,7 +3621,6 @@ public final class LineFollowerPipeline {
             for (int i = 0; i < n; i++) { if (prCls[i] == CL_OUT) continue; valid++; if (prCls[i] != CL_UNK) good++; }
             cgFrames[j]++;
             cgSumGood[j] += valid > 0 ? good / (float) valid : 0f;
-            if (DBG && j % 20 == 0) { final StringBuilder sb = new StringBuilder("CG row=" + row + " n=" + n + " pred=" + pred + " predW=" + predW + " gain=" + prGain + " cls="); for (int q = 0; q < n; q += 2) sb.append(prCls[q]); System.out.println(sb); }
             // Candidate nearest the prediction with clean edges on both sides.
             final float p = lastJ >= 0 ? pred + slope * (j - lastJ) : pred;
             final float gate = lastJ >= 0 ? Math.max(12f, (predW > 0f ? predW : 40f) * Math.min(3f, 0.6f + 0.1f * (j - lastJ))) : W * 0.3f;
@@ -3875,6 +3871,7 @@ public final class LineFollowerPipeline {
     private final short[] svAge = new short[NODE_MAX];
     private int svN;
     private boolean memAbsent;              // this frame: clean floor where the remembered path is
+    private boolean lastEndAbsent;          // the last traced path ended on clean floor (a dead end)
 
     private void saveNodes() {
         svN = ndN;
@@ -3913,7 +3910,10 @@ public final class LineFollowerPipeline {
     private void predictMemory() {
         // Prior: a robot that follows the path turns at (speed × path curvature);
         // the measurements correct this every frame.
-        velT += 0.25f * (velX * ctCurvPivot - velT);
+        // (only on a clear curve: a small curvature may be the memory's own error,
+        // and feeding it back would bend the memory further)
+        final float kp = Math.abs(ctCurvPivot) < 0.25f ? 0f : ctCurvPivot;
+        if (kp != 0f) velT += 0.25f * (velX * kp - velT);
         final float c = (float) Math.cos(velT), s = (float) Math.sin(velT);
         // While the path is being tracked (the motion is registered every frame) the
         // memory stays valid much longer; it fades at the full rate only while
@@ -4089,9 +4089,10 @@ public final class LineFollowerPipeline {
                 rr = (ndR[hi] - rigidN(hi)) * Math.max(0f, 1f - (hi - i) / 8f);
             }
             ndX[i] = bx + rr * nx; ndY[i] = by + rr * ny;
-            // "Absent" between two measured sections is a gap (the line is hidden by
-            // something that looks like the floor), not the end of the line.
-            if (ndSt[i] == ST_ABSENT && lo >= 0 && hi < n) ndSt[i] = ST_UNREL;
+            // "Absent" before a measured section is a gap (the line is hidden by
+            // something that looks like the floor), not the end of the line: only
+            // clean floor after the last measured point can mean the line ends.
+            if (ndSt[i] == ST_ABSENT && hi < n) ndSt[i] = ST_UNREL;
             if (ndSt[i] == ST_ABSENT) ndConf[i] *= decayAbsent;
             ndSrc[i] = ndSt[i] == ST_UNREL ? PATH_SRC_UNRELIABLE : PATH_SRC_MEMORY;
         }
@@ -4644,7 +4645,7 @@ public final class LineFollowerPipeline {
         // urgency growing from 0 (exit 1.5 ROI-bottom distances ahead) to 1 (exit at the
         // ROI bottom). Never triggers while the robot follows the path well.
         ctGuard = 0f;
-        if (ctTarget && !NOGUARD) {
+        if (ctTarget) {
             final float xb = roiNearFwd, x0 = 1.5f * roiNearFwd;
             float xExit = -1f, side = 0f;
             for (int i = iC; i < n; i++) {
@@ -4721,6 +4722,47 @@ public final class LineFollowerPipeline {
     }
 
     private static float dist(float dx, float dy) { return (float) Math.sqrt(dx * dx + dy * dy); }
+
+    /**
+     * Remembered points that lie on the smooth continuation of the points measured
+     * now (a quadratic fitted to them, within 0.35 line widths, at most 1.5 camera
+     * heights beyond them) are confirmed by continuity: their confidence is
+     * refreshed. Along a straight line the robot's forward motion cannot be seen
+     * from the line itself, so a hidden stretch is otherwise never re-measured and
+     * would only age.
+     */
+    private void confirmByContinuity() {
+        int m = 0;
+        double s0 = 0, s1 = 0, s2 = 0, s3 = 0, s4 = 0, r0 = 0, r1 = 0, r2 = 0;
+        float xMin = Float.MAX_VALUE, xMax = -Float.MAX_VALUE;
+        for (int i = 0; i < ndN; i++) {
+            if (ndSrc[i] != PATH_SRC_FRESH) continue;
+            final double x = ndX[i], y = ndY[i];
+            s0 += 1; s1 += x; s2 += x * x; s3 += x * x * x; s4 += x * x * x * x;
+            r0 += y; r1 += x * y; r2 += x * x * y;
+            xMin = Math.min(xMin, ndX[i]); xMax = Math.max(xMax, ndX[i]); m++;
+        }
+        if (m < 5 || xMax - xMin < 0.5f) return;
+        final double det = s0 * (s2 * s4 - s3 * s3) - s1 * (s1 * s4 - s3 * s2) + s2 * (s1 * s3 - s2 * s2);
+        if (Math.abs(det) < 1e-9) return;
+        final double c0 = cramer(s0, s1, s2, s3, s4, r0, r1, r2, 0, det), c1 = cramer(s0, s1, s2, s3, s4, r0, r1, r2, 1, det),
+                     c2 = cramer(s0, s1, s2, s3, s4, r0, r1, r2, 2, det);
+        // the fit must describe the measured points well (a path that turns back is not a function of x)
+        double rss = 0;
+        for (int i = 0; i < ndN; i++) {
+            if (ndSrc[i] != PATH_SRC_FRESH) continue;
+            final double e = ndY[i] - (c0 + c1 * ndX[i] + c2 * ndX[i] * ndX[i]);
+            rss += e * e;
+        }
+        final float tol = 0.35f * lineW;
+        if (Math.sqrt(rss / m) > tol) return;
+        for (int i = 0; i < ndN; i++) {
+            if (ndSrc[i] == PATH_SRC_FRESH || ndSt[i] == ST_ABSENT) continue;
+            final float x = ndX[i];
+            if (x < xMin - 1.5f || x > xMax + 1.5f) continue;
+            if (Math.abs(ndY[i] - (c0 + c1 * x + c2 * x * x)) <= tol) ndConf[i] = Math.max(ndConf[i], 0.85f);
+        }
+    }
 
     /** Tracking target [min … 100] from the computed path statistics. */
     private float trackingTarget() {
@@ -4815,15 +4857,15 @@ public final class LineFollowerPipeline {
         if (ok) {
             resamplePath();
             for (int i = 0; i < ndN; i++) if (ndSrc[i] == PATH_SRC_FRESH) fresh++;
-            if (ndN >= 2) { smoothPath(); computeControl(); } else ok = false;
+            if (ndN >= 2) { confirmByContinuity(); smoothPath(); computeControl(); } else ok = false;
         }
-        if (DBG) { final StringBuilder sb = new StringBuilder("DBGF end=" + pathEnd + " light=" + lightRef + " st="); for (int i = 0; i < ndN; i++) sb.append(ndSt[i]); System.out.println(sb); }
         // ── found / hidden / lost ──
         final boolean found = ok && fresh >= 2;
         float steering, tracking;
         boolean held = false, pinned = false;
         if (found) {
             v3LostFrames = 0; v3HoldFrames = 0;
+            lastEndAbsent = pathEnd == END_ABSENT;
             steering = ctSteer;
             final float tt = trackingTarget();
             v3Tracking += Math.max(-cfg.powerFallRate, Math.min(cfg.powerRiseRate, tt - v3Tracking));
@@ -4835,7 +4877,6 @@ public final class LineFollowerPipeline {
             for (int i = 0; i < ndN; i++) {
                 if (ndSt[i] == ST_OUT) nOut++; else if (ndSt[i] == ST_ABSENT) nAbs++; else if (ndSt[i] == ST_UNREL) nUnr++;
             }
-            if (DBG) { final StringBuilder sb = new StringBuilder("DBG ok=" + ok + " n=" + ndN + " st="); for (int i = 0; i < ndN; i++) sb.append(ndSt[i]); System.out.println(sb); }
             // Path ahead of the robot that left the view at the BOTTOM (into the blind
             // zone in front of the robot, e.g. a sharp corner just before the robot)
             // versus through a SIDE edge (the robot is turning off the line).
@@ -4857,6 +4898,8 @@ public final class LineFollowerPipeline {
                 held = true;
             } else if (midImage) {
                 v3HoldFrames++;
+                // approaching a dead end (the line's end was seen): keep slowing down
+                if (lastEndAbsent) v3Tracking = Math.max(cfg.trackingMinValue, v3Tracking - cfg.powerFallRate);
                 steering = v3LastSteer; tracking = v3Tracking; held = true;
             } else {
                 // left the view (or gone for good): full turn toward the side it was last on

@@ -28,6 +28,89 @@ final class TrackSim {
     double wideHalfWidth = 0.02;
     private final Random rnd = new Random(42);
 
+    // ── Local disturbances (v3 tests) ───────────────────────────────────────
+    /** Effect applied to the floor colour {r, g, b} seen at a floor point. */
+    interface Effect {
+        /** wx, wy: world point; fwd, lat: the same relative to the camera's floor point (lat + = right). */
+        void apply(double[] rgb, double wx, double wy, double fwd, double lat, boolean tape);
+    }
+    final List<Effect> effects = new ArrayList<>();
+    /** Effects can be switched off (e.g. for a clean calibration). */
+    boolean effectsOn = true;
+
+    /** Glare: whitening spot (strength i) at fwd/lat metres from the camera's floor point, radii rf/rl. */
+    TrackSim glare(double fwd, double lat, double rf, double rl, double i) {
+        effects.add((c, wx, wy, f, l, tape) -> {
+            final double a = (f - fwd) / rf, b = (l - lat) / rl, s = i * Math.exp(-(a * a + b * b));
+            for (int k = 0; k < 3; k++) c[k] += s * (245 - c[k]);
+        });
+        return this;
+    }
+    /** Darker (k < 1) or brighter ellipse on the floor (world, axis-aligned). */
+    TrackSim lightSpot(double x, double y, double rx, double ry, double k) {
+        effects.add((c, wx, wy, f, l, tape) -> {
+            final double a = (wx - x) / rx, b = (wy - y) / ry;
+            if (a * a + b * b <= 1) for (int q = 0; q < 3; q++) c[q] *= k;
+        });
+        return this;
+    }
+    /** The robot's own shadow: ellipse relative to the camera's floor point. */
+    TrackSim robotShadow(double fwd, double lat, double rf, double rl, double k) {
+        effects.add((c, wx, wy, f, l, tape) -> {
+            final double a = (f - fwd) / rf, b = (l - lat) / rl;
+            if (a * a + b * b <= 1) for (int q = 0; q < 3; q++) c[q] *= k;
+        });
+        return this;
+    }
+    /** Light gradient along x: lo before x0, hi after (soft over w metres). */
+    TrackSim gradient(double x0, double w, double lo, double hi) {
+        effects.add((c, wx, wy, f, l, tape) -> {
+            final double g = lo + (hi - lo) * (0.5 + 0.5 * Math.tanh((wx - x0) / w));
+            for (int q = 0; q < 3; q++) c[q] *= g;
+        });
+        return this;
+    }
+    /** Floor patch of another colour (under the tape). */
+    TrackSim patch(double x, double y, double rx, double ry, int rgb) {
+        effects.add((c, wx, wy, f, l, tape) -> {
+            final double a = (wx - x) / rx, b = (wy - y) / ry;
+            if (!tape && a * a + b * b <= 1) { c[0] = (rgb >> 16) & 255; c[1] = (rgb >> 8) & 255; c[2] = rgb & 255; }
+        });
+        return this;
+    }
+    /** Object covering everything in the rectangle (over the tape). */
+    TrackSim cover(double x0, double y0, double x1, double y1, int rgb) {
+        effects.add((c, wx, wy, f, l, tape) -> {
+            if (wx >= x0 && wx <= x1 && wy >= y0 && wy <= y1) { c[0] = (rgb >> 16) & 255; c[1] = (rgb >> 8) & 255; c[2] = rgb & 255; }
+        });
+        return this;
+    }
+    /** Thin bright stripe (scratch) parallel to x at lateral y, from x0 to x1, width w. */
+    TrackSim stripe(double y, double x0, double x1, double w, int rgb) {
+        effects.add((c, wx, wy, f, l, tape) -> {
+            if (!tape && wx >= x0 && wx <= x1 && Math.abs(wy - y) <= w / 2) { c[0] = (rgb >> 16) & 255; c[1] = (rgb >> 8) & 255; c[2] = rgb & 255; }
+        });
+        return this;
+    }
+    /** Coloured light (multiplies the channels) inside a disc. */
+    TrackSim cast(double x, double y, double r, double kr, double kg, double kb) {
+        effects.add((c, wx, wy, f, l, tape) -> {
+            if ((wx - x) * (wx - x) + (wy - y) * (wy - y) <= r * r) { c[0] *= kr; c[1] *= kg; c[2] *= kb; }
+        });
+        return this;
+    }
+    /** Background (another floor, objects) beyond x = edge: the table ends there. */
+    TrackSim tableEdge(double edge, int rgb) {
+        effects.add((c, wx, wy, f, l, tape) -> {
+            if (wx > edge) {
+                final boolean obj = Math.floorMod((int) Math.floor(wy / 0.07), 3) == 0 && Math.floorMod((int) Math.floor(wx / 0.05), 2) == 0;
+                final int v = obj ? 0x181818 : rgb;
+                c[0] = (v >> 16) & 255; c[1] = (v >> 8) & 255; c[2] = v & 255;
+            }
+        });
+        return this;
+    }
+
     /** Each track is a dense polyline {xs, ys}. */
     final List<double[][]> tracks = new ArrayList<>();
 
@@ -83,23 +166,38 @@ final class TrackSim {
                 final double xc = (u + 0.5 - w / 2.0) / f;
                 int base = floorRgb;
                 double bright = 1.0;
+                boolean fx = false;
                 if (down > 1e-6) {
                     final double t = camHeight / down;
                     final double wx = camX + t * fwd * ch + t * xc * rightX;
                     final double wy = camY + t * fwd * sh + t * xc * rightY;
-                    if (onTape(tracks, tapeHalfWidth, wx, wy) || onTape(wideTracks, wideHalfWidth, wx, wy)) base = lineRgb;
+                    final boolean tape = onTape(tracks, tapeHalfWidth, wx, wy) || onTape(wideTracks, wideHalfWidth, wx, wy);
+                    if (tape) base = lineRgb;
                     else if (grain > 0) bright += grain * Math.sin(wx * 2 * Math.PI / 0.03 + 3 * Math.sin(wy * 8));
+                    if (effectsOn && !effects.isEmpty()) {
+                        fxc[0] = (base >> 16) & 255; fxc[1] = (base >> 8) & 255; fxc[2] = base & 255;
+                        for (Effect e : effects) e.apply(fxc, wx, wy, t * fwd, t * xc, tape);
+                        fx = true;
+                    }
                 }
                 if (u < shadowEdgeFrac * w) bright *= shadowGain;
                 if (vignette > 0) {
                     final double nx = (u - w / 2.0) / (w / 2.0), ny = (v - h / 2.0) / (h / 2.0);
                     bright *= 1 - vignette * (nx * nx + ny * ny) / 2;
                 }
-                px[v * w + u] = 0xFF000000
+                if (fx) px[v * w + u] = 0xFF000000 | (chanD(fxc[0], bright) << 16) | (chanD(fxc[1], bright) << 8) | chanD(fxc[2], bright);
+                else px[v * w + u] = 0xFF000000
                         | (chan(base >> 16, bright) << 16) | (chan(base >> 8, bright) << 8) | chan(base, bright);
             }
         }
         return px;
+    }
+
+    private final double[] fxc = new double[3];
+
+    private int chanD(double c, double bright) {
+        final double x = c * bright + rnd.nextGaussian() * noise;
+        return (int) Math.max(0, Math.min(255, Math.round(x)));
     }
 
     private int chan(int c, double bright) {
