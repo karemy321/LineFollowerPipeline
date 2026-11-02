@@ -97,7 +97,7 @@ final class Disturb {
                 final double fwd = g(kv, "fwd", 0.4), lat = g(kv, "lat", 0.012);
                 final double rf = g(kv, "rf", 0.07), rl = g(kv, "rl", 0.05), I = g(kv, "i", 0.9);
                 // reference camera ground point and the wanted spot (world)
-                final double[] r = at(t, sRef);
+                final double[] r = at(t, g(kv, "ref", sRef));
                 final double cgx = r[0] + cam.camFwd * r[2], cgy = r[1] + cam.camFwd * r[3];
                 final double sx = r[0] + fwd * r[2] + lat * r[3], sy = r[1] + fwd * r[3] - lat * r[2];
                 // spot = cg + (L − cg)·h/(h+H)  →  L = cg + (spot − cg)·(h+H)/h

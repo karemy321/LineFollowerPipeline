@@ -46,6 +46,7 @@ public final class ClosedLoop {
     static final double YAW0 = Double.parseDouble(System.getProperty("sim.yaw0", "0"));
     static final double LAT0 = Double.parseDouble(System.getProperty("sim.lat0", "0"));
     static final boolean TRACE = System.getProperty("trace") != null;
+    static final double SNAP_T = Double.parseDouble(System.getProperty("snap.t", "-1"));
     static final int TRACE_EVERY = Integer.getInteger("trace.every", 6);
 
     static final class Spec {
@@ -65,13 +66,19 @@ public final class ClosedLoop {
         final World w = world(s);
         final World.Track t = w.track;
         final Render r = new Render(cam, w, ROW_LO, ROW_HI, (s.key() + s.c + s.x).hashCode(), 0.25, 0.15);
+        final String dspec = System.getProperty("sim.disturb", "");
+        if (!dspec.isEmpty()) r.disturb = Disturb.parse(dspec.replace('|', ';'), w, t, 0);
+        final boolean calibClean = System.getProperty("sim.calibClean") != null;
+        final Disturb dKeep = r.disturb;
+        if (calibClean) r.disturb = null;
         final Lib lib = new Lib();
         if (s.extra != null && !s.extra.isEmpty())
             for (String kv : s.extra.split(";")) lib.set(kv.split("=")[0], kv.split("=")[1]);
 
         double px = t.x[0], py = t.y[0], th = t.hd[0];
         final int calib = lib.calibrateAt(r, px, py, th, 400);
-        if (calib < 0) return row(s, "NOCAL", 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+        r.disturb = dKeep;
+        if (calib < 0) return row(s, "NOCAL", 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0) + ",0,0,0," + dspec.replace(',', ' ');
         // Optional start disturbance after calibration: robot turned YAW0 degrees (+ = left)
         // about its axle and shifted LAT0 metres to the left.
         th += Math.toRadians(YAW0);
@@ -87,6 +94,7 @@ public final class ClosedLoop {
         final double tMax = 2.5 * t.length / v5 + 5;
         int frames = 0, signChanges = 0, lastSign = 0, lostFrames = 0, lostEvents = 0, wrongLock = 0;
         boolean prevFound = true;
+        double sumLat2 = 0, sumDT = 0; int prevT = -1, minPw = 0, nT = 0;
         double sumLat = 0, maxLat = 0, sumHead2 = 0, maxHead = 0, sumS = 0, sumS2 = 0, sumAbsS = 0;
         int minS = 999, maxS = -999, minT = 999, maxT = -999;
         long libNs = 0;
@@ -101,6 +109,9 @@ public final class ClosedLoop {
             final int S = out[0], T = out[1];
             frames++;
             minS = Math.min(minS, S); maxS = Math.max(maxS, S); minT = Math.min(minT, T); maxT = Math.max(maxT, T);
+            if (prevT >= 0) { sumDT += Math.abs(T - prevT); nT++; }
+            prevT = T;
+            if (T <= 10) minPw++;
 
             // ── metrics on the current pose ──
             if (!lib.trackFound) { lostFrames++; if (prevFound) lostEvents++; }
@@ -121,6 +132,9 @@ public final class ClosedLoop {
                 System.out.printf(Locale.ROOT, "t=%6.2f s=%5.2f lat=%6.2f he=%6.1f S=%4d T=%4d off=%6.1f head=%6.1f hdeg=%6.1f conf=%.2f found=%b%n",
                         frames * DT, progress * World.STEP, 100 * latT, Math.toDegrees(Scenes.angDiff(th, t.hd[idx])), S, T,
                         lib.fd("steerOffsetTerm"), lib.fd("steerHeadingTerm"), lib.fd("headingDeg"), lib.fd("headingConfidence"), lib.trackFound);
+            }
+            if (SNAP_T > 0 && Math.abs(frames * DT - SNAP_T) < DT / 2) {
+                try { Viz.save(r, lib.last, "snaps/v3/cl_snap.png"); } catch (Exception e) { throw new RuntimeException(e); }
             }
             // ── controller (lecturer's Blockly program) ──
             final double motorSteer = (0 - S) * s.c;
@@ -161,7 +175,7 @@ public final class ClosedLoop {
             if (!t.closed && idx >= n - 60) { result = "DONE"; break; }   // finish 0.30 m before the tape ends
             if (t.closed && progress >= n) { result = "DONE"; break; }
             final double al = Math.abs(lat);
-            sumLat += al; maxLat = Math.max(maxLat, al);
+            sumLat += al; maxLat = Math.max(maxLat, al); sumLat2 += al * al;
             sumHead2 += he * he; maxHead = Math.max(maxHead, he);
             if (al > 0.01 || he > 3) settleT = frames * DT;   // last time outside 1 cm / 3°
             if (al > OFF_TRACK) { result = "LEFT@" + String.format(Locale.ROOT, "%.2fm", progress * World.STEP); break; }
@@ -173,11 +187,13 @@ public final class ClosedLoop {
                 Math.sqrt(sumHead2 / Math.max(1, frames)), maxHead,
                 signChanges / Math.max(1e-9, ne * DT), Math.sqrt(Math.max(0, sumS2 / ne - mean * mean)), sumAbsS / ne,
                 100.0 * lostFrames / Math.max(1, frames), lostEvents, 100.0 * wrongLock / Math.max(1, frames),
-                minS, maxS, minT, maxT, libNs / 1e6 / Math.max(1, frames), settleT);
+                minS, maxS, minT, maxT, libNs / 1e6 / Math.max(1, frames), settleT)
+                + String.format(Locale.ROOT, ",%.2f,%.2f,%.1f,%s", 100 * Math.sqrt(sumLat2 / Math.max(1, frames)), sumDT / Math.max(1, nT),
+                                100.0 * minPw / Math.max(1, frames), dspec.isEmpty() ? "" : dspec.replace(',', ' '));
     }
 
     static final String HEADER = "lib,track,scheme,distract,c,x,vmax,extra,sim,result,time_s,frames,meanLat_cm,maxLat_cm,rmsHead_deg,maxHead_deg,"
-            + "signChg_per_s,steerStd,steerMeanAbs,lost_pct,lostEvents,wrongLock_pct,minS,maxS,minT,maxT,lib_ms,settle_s";
+            + "signChg_per_s,steerStd,steerMeanAbs,lost_pct,lostEvents,wrongLock_pct,minS,maxS,minT,maxT,lib_ms,settle_s,rmsLat_cm,powerJerk,lowPower_pct,disturb";
 
     static double dead(double p) { return Math.abs(p) < SIM_DEAD ? 0 : p; }
 

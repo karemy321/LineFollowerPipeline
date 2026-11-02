@@ -22,7 +22,10 @@ final class Scenes {
             case "scurveR":  return new World.PathBuilder(0, 0, 0).straight(0.45).arc(0.4, -90).arc(0.4, 90).straight(0.5).build(name, false);
             case "tightL":   return new World.PathBuilder(0, 0, 0).straight(0.45).arc(0.25, 90).straight(0.5).build(name, false);
             case "tightR":   return new World.PathBuilder(0, 0, 0).straight(0.45).arc(0.25, -90).straight(0.5).build(name, false);
-            case "lap":      return new World.PathBuilder(0, 0, 0).straight(1.0).arc(0.35, 90).arc(0.5, -90).arc(0.35, 180).straight(0.5).arc(0.3, 90).arc(0.6, 90).straight(0.2).build(name, false);
+            // closed lap: straight, U-turn, S-bump (R 0.4 m: right 60°, left 120°, right 60° — same length as the straight), U-turn
+            case "lap":      return new World.PathBuilder(0, 0, 0).straight(1.386).arc(0.35, 180).arc(0.4, -60).arc(0.4, 120).arc(0.4, -60).arc(0.35, 180).build(name, true);
+            // self-crossing track (two crossings) — a junction-like stress case
+            case "cross8":   return new World.PathBuilder(0, 0, 0).straight(1.0).arc(0.35, 90).arc(0.5, -90).arc(0.35, 180).straight(0.5).arc(0.3, 90).arc(0.6, 90).straight(0.2).build(name, false);
             case "oval":     return new World.PathBuilder(0, 0, 0).straight(1.0).arc(0.35, 180).straight(1.0).arc(0.35, 180).build(name, true);
             default: throw new IllegalArgumentException(name);
         }
