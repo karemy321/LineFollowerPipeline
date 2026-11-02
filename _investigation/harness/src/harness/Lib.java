@@ -77,6 +77,11 @@ final class Lib {
         return Double.NaN;
     }
 
+    static boolean isV3() {
+        try { LineFollowerPipeline.FrameData.class.getField("pathMode"); return true; }
+        catch (NoSuchFieldException e) { return false; }
+    }
+
     static boolean isV2() {
         try { LineFollowerPipeline.FrameData.class.getField("headingDeg"); return true; }
         catch (NoSuchFieldException e) { return false; }

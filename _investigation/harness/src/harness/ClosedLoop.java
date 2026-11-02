@@ -31,7 +31,7 @@ public final class ClosedLoop {
     // Camera: 60° vFOV, tilt 45°, 20 cm high, 8 cm ahead of the axle, 1 cm right of centre (overridable).
     static final Cam CAM = new Cam(W, H, 60, Double.parseDouble(System.getProperty("sim.tilt", "45")),
             Double.parseDouble(System.getProperty("sim.camH", "0.20")), Double.parseDouble(System.getProperty("sim.camFwd", "0.08")), 0.01);
-    static final int ROW_LO = 280, ROW_HI = 970, H_ROW = 948;   // library reads rows 296…960
+    static final int ROW_LO = 0, ROW_HI = 970, H_ROW = 948;     // v2 reads rows 296…960, v3 its ROI (up to the top)
     static final double DT = 1.0 / 60, WHEELBASE = 0.13, TAU = 0.08;
     // Real-robot effects (system properties): command latency (s), Blockly loop rate (Hz),
     // motor dead zone (wheel power below which the wheel does not turn).

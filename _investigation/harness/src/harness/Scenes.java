@@ -16,6 +16,13 @@ final class Scenes {
             case "gentle":   return new World.PathBuilder(0, 0, 0).straight(0.45).arc(0.8, 90).straight(0.5).build(name, false);
             case "scurve":   return new World.PathBuilder(0, 0, 0).straight(0.45).arc(0.4, 90).arc(0.4, -90).straight(0.5).build(name, false);
             case "sharp90":  return new World.PathBuilder(0, 0, 0).straight(0.8).arc(0.04, -90).straight(0.7).build(name, false);
+            case "arcL":     return new World.PathBuilder(0, 0, 0).straight(1.0).arc(0.5, 150).straight(1.0).build(name, false);   // matrix curve
+            case "gentleR":  return new World.PathBuilder(0, 0, 0).straight(0.45).arc(0.8, -90).straight(0.5).build(name, false);
+            case "sharp90L": return new World.PathBuilder(0, 0, 0).straight(0.8).arc(0.04, 90).straight(0.7).build(name, false);
+            case "scurveR":  return new World.PathBuilder(0, 0, 0).straight(0.45).arc(0.4, -90).arc(0.4, 90).straight(0.5).build(name, false);
+            case "tightL":   return new World.PathBuilder(0, 0, 0).straight(0.45).arc(0.25, 90).straight(0.5).build(name, false);
+            case "tightR":   return new World.PathBuilder(0, 0, 0).straight(0.45).arc(0.25, -90).straight(0.5).build(name, false);
+            case "lap":      return new World.PathBuilder(0, 0, 0).straight(1.0).arc(0.35, 90).arc(0.5, -90).arc(0.35, 180).straight(0.5).arc(0.3, 90).arc(0.6, 90).straight(0.2).build(name, false);
             case "oval":     return new World.PathBuilder(0, 0, 0).straight(1.0).arc(0.35, 180).straight(1.0).arc(0.35, 180).build(name, true);
             default: throw new IllegalArgumentException(name);
         }

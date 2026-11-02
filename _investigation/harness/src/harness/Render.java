@@ -19,6 +19,9 @@ final class Render {
     private static final int NT = 1 << 20;
     private final byte[] noiseTab = new byte[NT];
     private final Random rnd;
+    /** Optional disturbances (null / inactive = clean). */
+    Disturb disturb;
+    private final int[] dyuv = new int[3];
 
     Render(Cam cam, World w, int rowLo, int rowHi, long seed, double vignette, double farDim) {
         this.cam = cam; this.w = w; W = cam.W; H = cam.H;
@@ -50,6 +53,9 @@ final class Render {
         final float[] F = cam.fwd, L = cam.left;
         final byte[] WY = w.Y, WU = w.U, WV = w.V;
         int noff = rnd.nextInt(NT);
+        final Disturb dist = disturb != null && disturb.active() ? disturb : null;
+        if (dist != null) dist.frame(px, py, th);
+        final int[] dy3 = dyuv;
         for (int r = rowLo; r < rowHi; r++) {
             final int base = r * W;
             final boolean chromaRow = (r & 1) == 0;
@@ -63,7 +69,14 @@ final class Render {
                     final double wx = px + f * c - L[i] * s, wy = py + f * s + L[i] * c;
                     final int mi = (int) ((wx - x0) * inv), mj = (int) ((wy - y0) * inv);
                     if (mi < 0 || mj < 0 || mi >= nx || mj >= ny || wx < x0 || wy < y0) { yy = w.outY; uu = w.outU; vv = w.outV; }
-                    else { final int m = mj * nx + mi; yy = WY[m] & 0xFF; uu = WU[m] & 0xFF; vv = WV[m] & 0xFF; }
+                    else {
+                        final int m = mj * nx + mi; yy = WY[m] & 0xFF; uu = WU[m] & 0xFF; vv = WV[m] & 0xFF;
+                        if (dist != null) {
+                            dy3[0] = yy; dy3[1] = uu; dy3[2] = vv;
+                            dist.apply(dy3, wx, wy, f, L[i], w.tapeIdx[m] != 0);
+                            yy = World.Col.clamp(dy3[0]); uu = World.Col.clamp(dy3[1]); vv = World.Col.clamp(dy3[2]);
+                        }
+                    }
                 }
                 final int g = gain[i];
                 int val = ((yy * g) >> 10) + noiseTab[noff++ & (NT - 1)];

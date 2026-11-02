@@ -298,7 +298,133 @@ public final class LineFollowerPipeline {
         // offset. The steering reference is taken as the MEDIAN of this many solid
         // detections (more = steadier / more outlier-proof capture, slower startup).
         public int calibFrames = 10;
+
+        // ═════════════════════════════════════════════════════════════════
+        //  v3 — PATH TRACKING (the default)
+        // ═════════════════════════════════════════════════════════════════
+        // Floor distances below are in CAMERA HEIGHTS (the height of the phone's
+        // camera above the floor): 1.0 = one camera height, e.g. 20 cm when the
+        // camera is 20 cm above the floor. Curvatures are 1 / camera height.
+
+        // ON (default): v3 — the whole visible path is traced, kept in a path
+        // memory on the floor, and steering / tracking come from that path (pure
+        // pursuit, curvature ahead). OFF: the v2 "⊥" pipeline (scan strip +
+        // look-ahead), unchanged, for comparison. Before calibration v3 frames are
+        // processed by the v2 pipeline.
+        public boolean pathTracking = true;
+
+        // Working region (ROI), found during calibration: its bottom is just above
+        // the robot body (bottomIgnoreFrac, raised if the lowest rows are not
+        // floor), its top where the floor / line stops being reliably visible
+        // (table edge, background) minus this safety margin, as a fraction of the
+        // visible floor distance. Each frame only reads pixels inside the ROI (full
+        // image width — in curves the line reaches the image edge).
+        public boolean roiAuto = true;
+        public float roiTopMarginFrac = 0.10f;
+
+        // Learn the camera tilt from how the line width changes with the image row
+        // during calibration (a straight line of constant width narrows toward the
+        // horizon). Used only if the measurement is consistent; otherwise
+        // cameraTiltDeg is used.
+        public boolean learnCameraTilt = true;
+
+        // Distance between two traced path points (camera heights). 0.1 = 2 cm at
+        // 20 cm camera height.
+        public float pathStep = 0.10f;
+
+        // Order in which the path is traced each frame (see TRACE_* constants):
+        // near → far, far → near, or near → far plus a second pass that re-reads
+        // the gaps between two good sections from both sides (default).
+        public int pathTraceDirection = TRACE_BOTH;
+
+        // ON (default): the path is traced, fitted and remembered on the FLOOR
+        // (bird's-eye coordinates from the camera geometry; only the path points
+        // are converted, never the image). OFF: the same algorithm in image
+        // coordinates (for comparison only — perspective then bends straight lines).
+        public boolean pathFloorSpace = true;
+
+        // ON (default): the traced path is kept between frames and moved with the
+        // robot's estimated motion, so a section that is hidden now (glare, shadow,
+        // an object) is filled in from earlier frames. OFF: every frame starts from
+        // scratch (for comparison).
+        public boolean pathMemory = true;
+
+        // How long (frames) a remembered path point stays trusted without being
+        // seen again. Its confidence halves after about 0.7 × this many frames.
+        public int pathMemoryFrames = 120;
+
+        // Longest stretch (camera heights) of unreadable path that the tracer
+        // bridges by continuity when it has no memory of it (e.g. a glare spot on
+        // a part of the path never seen before, or a stretch that looks like bare
+        // floor between two visible sections). 2.5 = 50 cm at 20 cm height.
+        public float pathMaxGap = 2.5f;
+
+        // Colour match tolerance in standard deviations of the colours learned at
+        // calibration. A pixel that is within this of NEITHER the line nor the
+        // floor colour is "unreliable" (glare, a colour patch, an object) — it
+        // counts neither as line nor as floor.
+        public float colorMatchSigma = 4.0f;
+
+        // Brightness change (×/÷) allowed around the local light level when a
+        // pixel is matched to the learned colours. Shadows and uneven light change
+        // the brightness of line and floor alike, so the local level is measured
+        // from the floor around the line and the colours are matched relative to it.
+        public float lightLocalRange = 1.6f;
+
+        // Pure pursuit: the steering aims at the point of the path this far
+        // (camera heights) from the robot's turning point. Larger = smoother, less
+        // weaving, but cuts tight curves a little; smaller = tighter, more weaving.
+        public float pursuitLookAhead = 1.2f;
+
+        // Turning point of the robot (axle centre) behind the camera's floor point,
+        // in camera heights (0.4 = 8 cm at 20 cm height).
+        public float pursuitPivotBehind = 0.4f;
+
+        // Steering output per unit of pure-pursuit curvature (1 / camera height).
+        // Steering = steerPerCurvature × 2·lateral / distance² of the target point,
+        // limited to ±50. The default suits "move steering" with gain 1 on a robot
+        // whose wheelbase is about 0.65 camera heights.
+        public float steerPerCurvature = 30f;
+
+        // Tracking from the path ahead: 100 on a straight path, falling linearly
+        // with the sharpest curvature found within powerPreview camera heights
+        // ahead, from powerCurvatureDeadband (still 100) to powerFullCurvature
+        // (the minimum). 1.5 = a curve of radius 0.67 camera heights (13 cm).
+        public float powerFullCurvature = 1.5f;
+        public float powerCurvatureDeadband = 0.2f;
+        public float powerPreview = 2.0f;
+
+        // Largest change of the tracking output per frame (up / down), so it moves
+        // smoothly instead of jumping. A truly lost line still drops at once.
+        public float powerRiseRate = 3f;
+        public float powerFallRate = 8f;
     }
+
+    // =========================================================================
+    //  v3 path tracking — public constants
+    // =========================================================================
+
+    /** Config.pathTraceDirection: trace from the robot outward (near → far). */
+    public static final int TRACE_BOTTOM_UP = 0;
+    /** Config.pathTraceDirection: trace from the far end of the ROI toward the robot. */
+    public static final int TRACE_TOP_DOWN  = 1;
+    /** Config.pathTraceDirection: near → far, then gaps re-read from both sides (default). */
+    public static final int TRACE_BOTH      = 2;
+
+    /** Capacity of the FrameData path arrays. */
+    public static final int PATH_MAX_POINTS = 64;
+    /** Columns / rows of the FrameData.unreliableGrid over the ROI. */
+    public static final int RELIABILITY_GRID_COLS = 24;
+    public static final int RELIABILITY_GRID_ROWS = 32;
+
+    /** FrameData.pathSource: point measured in this frame. */
+    public static final byte PATH_SRC_FRESH      = 0;
+    /** FrameData.pathSource: point from the path memory (outside the ROI, or not readable). */
+    public static final byte PATH_SRC_MEMORY     = 1;
+    /** FrameData.pathSource: point in an unreliable region this frame, filled from memory. */
+    public static final byte PATH_SRC_UNRELIABLE = 2;
+    /** FrameData.pathSource: point bridged by continuity (no memory, no measurement). */
+    public static final byte PATH_SRC_PREDICTED  = 3;
 
     // =========================================================================
     //  Calibration phase / issue codes (reported in FrameData)
@@ -429,6 +555,52 @@ public final class LineFollowerPipeline {
         public boolean lineHeld;
         /** Number of candidate bands rejected or trimmed as distractors this frame (H-ROI). */
         public int rejectedBands;
+
+        // ── v3 path tracking ────────────────────────────────────────────────
+        /** True when this frame was processed by the v3 path tracker (false: v2 ⊥ pipeline). */
+        public boolean pathMode;
+        /** Working region (ROI) top / bottom edge as a fraction of frame height (full width). */
+        public float roiTopFrac, roiBotFrac;
+        /** Path points, nearest to farthest, as fractions of frame width / height (may lie
+         *  outside 0…1 for remembered points that are out of view). */
+        public final float[] pathColFrac = new float[PATH_MAX_POINTS];
+        public final float[] pathRowFrac = new float[PATH_MAX_POINTS];
+        /** The same points on the floor, robot frame, camera heights: forward / lateral (+ = right). */
+        public final float[] pathFwd = new float[PATH_MAX_POINTS];
+        public final float[] pathLat = new float[PATH_MAX_POINTS];
+        /** Where each point came from: PATH_SRC_FRESH / _MEMORY / _UNRELIABLE / _PREDICTED. */
+        public final byte[]  pathSource = new byte[PATH_MAX_POINTS];
+        /** Number of valid path points (0 = no path). */
+        public int pathPointCount;
+        /** Points measured this frame / taken from memory / in an unreliable region this frame. */
+        public int pathFreshPoints, pathMemoryPoints, pathUnreliablePoints;
+        /** Fraction [0 … 1] of the path ahead of the robot that came from memory (not measured now). */
+        public float pathMemoryFrac;
+        /** Pure-pursuit target point: image fractions (may be outside 0…1) and floor (robot frame). */
+        public float lookAheadXFrac, lookAheadYFrac, lookAheadFwd, lookAheadLat;
+        /** True when a look-ahead target exists this frame. */
+        public boolean lookAheadValid;
+        /** Path curvature at the robot and the sharpest curvature ahead (1 / camera height, + = curves right). */
+        public float pathCurvature, pathCurvatureAhead;
+        /** Lateral offset of the path at the camera's floor point (camera heights, + = path is right). */
+        public float pathOffset;
+        /** Path direction at the robot relative to straight ahead, degrees (+ = heads right). */
+        public float pathHeadingDeg;
+        /** Length of the known path ahead of the robot (camera heights). */
+        public float pathLength;
+        /** Confidence [0 … 1] of the path ahead (1 = all measured now; drops only while it is unknown). */
+        public float pathConfidence;
+        /** Unreliable cells of the ROI (RELIABILITY_GRID_COLS × RELIABILITY_GRID_ROWS, row-major
+         *  from the ROI top-left; 1 = pixels match neither the line nor the floor colours). */
+        public final byte[] unreliableGrid = new byte[RELIABILITY_GRID_COLS * RELIABILITY_GRID_ROWS];
+        /** Number of unreliable cells. */
+        public int unreliableCells;
+        /** Estimated robot motion since the previous frame: forward / lateral (camera heights), yaw (deg, + = right). */
+        public float motionFwd, motionLat, motionYawDeg;
+        /** Camera tilt used for the floor geometry (deg; learned at calibration or Config.cameraTiltDeg). */
+        public float cameraTiltUsedDeg;
+        /** Line width on the floor learned at calibration (camera heights). */
+        public float lineWidthFloor;
     }
 
     // =========================================================================
@@ -517,7 +689,7 @@ public final class LineFollowerPipeline {
     private boolean colorPreset;        // set via setTrackColors(); survives re-init
     private int     colorFramesSampled;
     private int     sampleCount;
-    private short[] sampY, sampU, sampV, sampCol;
+    private short[] sampY, sampU, sampV, sampCol, sampRow;
     private byte[]  sampLabel;
     private int     kY, kU, kV, k0, kR, kG, kB, kC, kGrayOff;
     private int     lineColorArgb, floorColorArgb;
@@ -880,6 +1052,7 @@ public final class LineFollowerPipeline {
         sampU             = new short[maxSamples];
         sampV             = new short[maxSamples];
         sampCol           = new short[maxSamples];
+        sampRow           = new short[maxSamples];
         sampLabel         = new byte[maxSamples];
         sampleCount        = 0;
         colorFramesSampled = 0;
@@ -903,6 +1076,19 @@ public final class LineFollowerPipeline {
         calibLevelSamples   = new int[Math.max(1, config.calibFrames)];
         calibHeadingSamples = new float[Math.max(1, config.calibFrames)];
         resetLineModel();
+        // v3 path tracking
+        final int prSize  = Math.max(PROF_MAX, width / 2 + 2);
+        prY = new float[prSize]; prU = new float[prSize]; prV = new float[prSize];
+        prLam = new float[prSize]; prTmp = new float[prSize]; prCls = new byte[prSize];
+        v3Ready           = false;
+        modelReady        = false;
+        nFloorModels      = 0;
+        cgRow             = null;
+        roiTop            = vRoiTop;
+        roiBot            = hRoiBot;
+        setGeometry(config.cameraTiltDeg);
+        rfA = 0f; rfCos = 1f; rfSin = 0f;
+        resetPathState();
         laPathCount       = 0;
         steerRefX         = width * 0.5f;   // default = image centre until calibrated
         trackRefX         = width * 0.5f;
@@ -971,6 +1157,10 @@ public final class LineFollowerPipeline {
         laPathCount        = 0;
         sampleCount        = 0;
         colorFramesSampled = 0;
+        v3Ready            = false;
+        modelReady         = false;
+        clearCalibRows();
+        resetPathState();
         if (colorPreset) {
             applyPresetColors();
         } else {
@@ -1049,6 +1239,7 @@ public final class LineFollowerPipeline {
     // =========================================================================
 
     private boolean calibrateBound() {
+        if (cfg.pathTracking) return calibrateV3();
         if (calibrated) return true;
         laPathCount = 0;
 
@@ -1131,6 +1322,7 @@ public final class LineFollowerPipeline {
     }
 
     private int[] processBound() {
+        if (cfg.pathTracking && v3Ready && calibrated) return processBoundV3();
         updateFps();
         final byte[] pix = prepareWorkImage(vRoiTop, hRoiBot);
         runPipeline(pix, imgW, imgH, workBright);
@@ -1298,7 +1490,7 @@ public final class LineFollowerPipeline {
             line = 1 - floor;
             // Contrast first (the more basic diagnosis), then the line must form
             // one compact band — otherwise the split was not line vs floor.
-            if (!fitDiscriminant(n, k, c, count, line)) return false;
+            if (!fitDiscriminant(n, k, c, count, line, true)) return false;
             if (clusterBand(n, line, band) < 0.6) {
                 colorReady      = false;
                 colorSeparation = 0f;
@@ -1325,7 +1517,7 @@ public final class LineFollowerPipeline {
             if (line < 0) { calibIssue = ISSUE_NO_FLOOR; return false; }
         }
 
-        if (!fitDiscriminant(n, k, c, count, line)) return false;
+        if (!fitDiscriminant(n, k, c, count, line, true)) return false;
         learnedLineX = (float) band[0];
         learnedLineW = (float) band[1];
         return true;
@@ -1428,7 +1620,7 @@ public final class LineFollowerPipeline {
      * so no part of the floor reads as line. With two clusters this is exactly
      * the classic line-vs-floor discriminant.
      */
-    private boolean fitDiscriminant(int n, int k, double[] c, int[] count, int line) {
+    private boolean fitDiscriminant(int n, int k, double[] c, int[] count, int line, boolean strictOthers) {
         // ── Pooled within-cluster covariance (3×3, symmetric) ──
         final double[] cov = new double[6];   // yy yu yv uu uv vv
         for (int i = 0; i < n; i++) {
@@ -1482,7 +1674,7 @@ public final class LineFollowerPipeline {
             if (q == line || q == floor) continue;
             final double wq = wY * (c[L] - c[q * 3]) + wU * (c[L + 1] - c[q * 3 + 1])
                             + wV * (c[L + 2] - c[q * 3 + 2]);
-            if (wq < 0.8 * wd) { calibIssue = ISSUE_LOW_CONTRAST; return false; }
+            if (strictOthers && wq < 0.8 * wd) { calibIssue = ISSUE_LOW_CONTRAST; return false; }
         }
 
         setProjection(wY, wU, wV, c[F], c[F + 1], c[F + 2], wd);
@@ -2530,6 +2722,7 @@ public final class LineFollowerPipeline {
         d.headingConfidence = live ? output.headingConf : 0f;
         d.lineHeld          = live && output.held;
         d.rejectedBands     = live ? output.rejected : 0;
+        fillPathFrameData(d);
         frameCallback.onFrame(d);
     }
 
@@ -2550,6 +2743,1951 @@ public final class LineFollowerPipeline {
             fpsFrameCount    = 0;
             fpsWindowStartNs = now;
         }
+    }
+
+    // =========================================================================
+    //  v3 PATH TRACKING
+    // =========================================================================
+    //
+    //  Overview (details at each method):
+    //   • Colour model: the line and the floor colours learned at calibration,
+    //     each with its spread (covariance). A pixel is LINE, FLOOR or UNKNOWN —
+    //     unknown when it fits neither (glare, a colour patch, an object, dirt).
+    //     Brightness may change locally (shadow, uneven light): the local light
+    //     level is measured from the floor next to the line and both colours are
+    //     matched relative to it. Unknown pixels are never taken as line or floor.
+    //   • Geometry: an exact pinhole model (tilt learned from the line width per
+    //     row) converts image points ↔ floor points (bird's-eye view). Only path
+    //     points are converted; no image is warped.
+    //   • Path: a chain of points on the floor, one every Config.pathStep, in the
+    //     robot frame (x forward, y right, camera heights). Kept between frames
+    //     (path memory) and moved with the robot's motion, which is estimated from
+    //     how the measured path shifts between frames.
+    //   • Each frame the path is traced: at every point a short profile ACROSS the
+    //     predicted path is sampled (a window on a subsampled image), and the
+    //     line's edges are located. A measurement must have the line colour, the
+    //     expected width and continue the path; otherwise the point is
+    //     "unreliable" (filled from memory / continuity) or "absent" (clean floor
+    //     where the line should be — real evidence that it is not there).
+    //   • Control: pure pursuit on the smoothed path for steering; curvature ahead
+    //     and the known path length for tracking (rate-limited).
+
+    private static final byte CL_OUT = 0, CL_FLOOR = 1, CL_LINE = 2, CL_UNK = 3;
+    private static final byte ST_NONE = 0, ST_MEAS = 1, ST_UNREL = 2, ST_ABSENT = 3, ST_OUT = 4;
+    private static final int  END_OUT = 0, END_ABSENT = 1, END_UNKNOWN = 2;
+    private static final int  NODE_MAX = 128, PROF_MAX = 72, FLOOR_MAX = 3;
+
+    private boolean v3Ready;               // calibrated in path mode
+    private static final boolean DBG = System.getProperty("lf.dbg") != null;   // TEMP
+
+    // ── Geometry actually used (pinhole; tilt possibly learned) ─────────────
+    private double gFoc, gCx, gCy, gSinT = Math.sin(Math.PI / 4), gCosT = Math.cos(Math.PI / 4);
+    private float  gTiltDeg = 45f;
+    // camera floor frame → robot frame (the calibrated straight line is the x axis)
+    private float  rfA, rfCos = 1f, rfSin = 0f;
+    // image-plane variant (Config.pathFloorSpace = false)
+    private float  ipK = 1f, ipU0, ipV0, ipSlope;
+    // line width in pixels as a function of the image row: w(v) = calWA + calWB·v
+    private float  calWA, calWB;
+    private int    roiTop, roiBot;          // ROI rows [roiTop, roiBot)
+    private float  lineW;                   // line width in plane units
+    private float  roiFarFwd;               // forward distance of the ROI top (plane units, centre)
+
+    // ── Colour models (Y, U−128, V−128); inverse covariance ×6, a = Σ⁻¹m, k = mᵀΣ⁻¹m ──
+    private final float[] cmL = new float[3], ciL = new float[6], caL = new float[3];
+    private float  ckL;
+    private final float[] cmF = new float[3 * FLOOR_MAX], ciF = new float[6 * FLOOR_MAX], caF = new float[3 * FLOOR_MAX];
+    private final float[] ckF = new float[FLOOR_MAX];
+    private int    nFloorModels;
+    private boolean modelLumaOnly;          // Config.autoColor == false: brightness only
+    private boolean modelReady;
+    private float  dirLF0, dirLF1, dirLF2, dirLFn;   // line − floor (main) for the linear line-ness
+
+    // ── Profile buffers (also used for full-row scans) ──────────────────────
+    private float[] prY, prU, prV, prLam, prTmp;
+    private byte[]  prCls;
+    private int     prN;
+    private float   prStep, prH0;
+    private float   prGain = 1f;            // local light level of the last profile
+    // result of analyzeProfile()
+    private byte    msStatus;
+    private float   msOff, msQual;
+    private boolean msTrim;
+    // results of the conversions
+    private float   pU, pV, qX, qY;
+    // last sampled pixel
+    private float   sY, sU, sV;
+    // classify() side outputs
+    private float   clsLam;
+
+    // ── Path memory (robot frame of the previous frame) ─────────────────────
+    private final float[] memX = new float[NODE_MAX], memY = new float[NODE_MAX], memConf = new float[NODE_MAX];
+    private final short[] memAge = new short[NODE_MAX];
+    private int     memN;
+
+    // ── Path of the current frame ───────────────────────────────────────────
+    private final float[] ndX = new float[NODE_MAX], ndY = new float[NODE_MAX];      // final positions
+    private final float[] ndPX = new float[NODE_MAX], ndPY = new float[NODE_MAX];    // predicted (memory)
+    private final float[] ndNX = new float[NODE_MAX], ndNY = new float[NODE_MAX];    // unit normals
+    private final float[] ndR = new float[NODE_MAX], ndQ = new float[NODE_MAX], ndConf = new float[NODE_MAX];
+    private final byte[]  ndSt = new byte[NODE_MAX], ndSrc = new byte[NODE_MAX];
+    private final short[] ndAge = new short[NODE_MAX];
+    private int     ndN;
+    private final float[] tmpA = new float[NODE_MAX], tmpB = new float[NODE_MAX], tmpC = new float[NODE_MAX];
+    private final byte[]  tmpS = new byte[NODE_MAX], tmpT = new byte[NODE_MAX];
+    private final short[] tmpG = new short[NODE_MAX];
+    // smoothed path
+    private final float[] smX = new float[NODE_MAX], smY = new float[NODE_MAX];
+    private final float[] smTX = new float[NODE_MAX], smTY = new float[NODE_MAX], smK = new float[NODE_MAX];
+    private final float[] smW = new float[NODE_MAX];
+    private int     pathEnd = END_OUT;      // how the traced path ended (far side)
+    private float   pathExitSide;           // lateral side (+1 right / −1 left) the path left the view
+
+    // ── Motion (per frame, robot frame) ─────────────────────────────────────
+    private float   velX, velY, velT;       // estimated motion of the robot per frame
+    private float   corrX, corrY, corrT;    // correction found this frame
+
+    // ── Control state ───────────────────────────────────────────────────────
+    private float   v3Tracking = 100f;      // rate-limited tracking output
+    private int     v3LostFrames, v3HoldFrames;
+    private float   v3LastSteer;
+    private int     v3Rejected;
+    // results of computeControl()
+    private boolean ctTarget;
+    private float   ctTX, ctTY, ctKappa, ctSteer, ctOffset, ctHeading, ctCurv, ctCurvAhead, ctLength, ctConf, ctMemFrac;
+    private int     ctFresh, ctMem, ctUnrel;
+    private boolean v3Found, v3Held;
+    private float   ctCurvAheadPrev;
+
+    // ── Reliability grid ────────────────────────────────────────────────────
+    private final byte[] relGrid = new byte[RELIABILITY_GRID_COLS * RELIABILITY_GRID_ROWS];
+    private final float[] gridY = new float[4], gridU = new float[4], gridV = new float[4], gridG = new float[4];
+    private int     relCells;
+
+    // ── Calibration (geometry phase) accumulators ───────────────────────────
+    private int[]   cgRow;                  // scan rows, bottom → top
+    private float[] cgSumC, cgSumW, cgSumGood;
+    private int[]   cgClean, cgFrames;
+    private int     cgN;
+
+    // =========================================================================
+    //  v3 — colour model
+    // =========================================================================
+
+    /** Inverse of the symmetric 3×3 (yy yu yv uu uv vv) into out[off…off+5]; false if singular. */
+    private static boolean invert3(double[] m, float[] out, int off) {
+        final double a = m[0], b = m[1], c = m[2], d = m[3], e = m[4], f = m[5];
+        final double i00 = d * f - e * e, i01 = c * e - b * f, i02 = b * e - c * d;
+        final double i11 = a * f - c * c, i12 = b * c - a * e, i22 = a * d - b * b;
+        final double det = a * i00 + b * i01 + c * i02;
+        if (Math.abs(det) < 1e-9) return false;
+        out[off] = (float) (i00 / det); out[off + 1] = (float) (i01 / det); out[off + 2] = (float) (i02 / det);
+        out[off + 3] = (float) (i11 / det); out[off + 4] = (float) (i12 / det); out[off + 5] = (float) (i22 / det);
+        return true;
+    }
+
+    /** Install one colour model from a mean and a covariance (yy yu yv uu uv vv). */
+    private boolean setModel(boolean line, int slot, double mY, double mU, double mV, double[] cov) {
+        final float[] m = line ? cmL : cmF, inv = line ? ciL : ciF, a = line ? caL : caF;
+        final int o3 = line ? 0 : slot * 3, o6 = line ? 0 : slot * 6;
+        if (!invert3(cov, inv, o6)) return false;
+        m[o3] = (float) mY; m[o3 + 1] = (float) mU; m[o3 + 2] = (float) mV;
+        a[o3]     = inv[o6] * m[o3] + inv[o6 + 1] * m[o3 + 1] + inv[o6 + 2] * m[o3 + 2];
+        a[o3 + 1] = inv[o6 + 1] * m[o3] + inv[o6 + 3] * m[o3 + 1] + inv[o6 + 4] * m[o3 + 2];
+        a[o3 + 2] = inv[o6 + 2] * m[o3] + inv[o6 + 4] * m[o3 + 1] + inv[o6 + 5] * m[o3 + 2];
+        final float k = a[o3] * m[o3] + a[o3 + 1] * m[o3 + 1] + a[o3 + 2] * m[o3 + 2];
+        if (k < 1e-6f) return false;
+        if (line) ckL = k; else ckF[slot] = k;
+        return true;
+    }
+
+    private void finishModels() {
+        dirLF0 = cmL[0] - cmF[0]; dirLF1 = cmL[1] - cmF[1]; dirLF2 = cmL[2] - cmF[2];
+        dirLFn = Math.max(1f, dirLF0 * dirLF0 + dirLF1 * dirLF1 + dirLF2 * dirLF2);
+        modelReady = true;
+    }
+
+    /** Squared distance of colour (y,u,v) from model (inverse cov at inv[o6], a at a[o3], k), best gain in [gLo,gHi]. */
+    private static float rayDist(float y, float u, float v, float[] inv, int o6, float[] a, int o3, float k,
+                                 float gLo, float gHi) {
+        final float q0 = y * (inv[o6] * y + 2f * (inv[o6 + 1] * u + inv[o6 + 2] * v))
+                       + u * (inv[o6 + 3] * u + 2f * inv[o6 + 4] * v) + inv[o6 + 5] * v * v;
+        final float q1 = a[o3] * y + a[o3 + 1] * u + a[o3 + 2] * v;
+        float g = q1 / k;
+        if (g < gLo) g = gLo; else if (g > gHi) g = gHi;
+        final float d = q0 - 2f * g * q1 + g * g * k;
+        return d > 0f ? d : 0f;
+    }
+
+    /**
+     * Class of colour (y,u,v) for light level window [gLo, gHi]: LINE, FLOOR or
+     * UNKNOWN (fits neither, or both about equally well). Also sets clsLam, a
+     * linear line-ness (0 = floor colour, 1 = line colour) used to place edges.
+     */
+    private byte classify(float y, float u, float v, float gLo, float gHi, float gMid) {
+        final float tau = cfg.colorMatchSigma * cfg.colorMatchSigma;
+        final float dL = rayDist(y, u, v, ciL, 0, caL, 0, ckL, gLo, gHi);
+        float dF = Float.MAX_VALUE;
+        for (int j = 0; j < nFloorModels; j++) {
+            final float d = rayDist(y, u, v, ciF, j * 6, caF, j * 3, ckF[j], gLo, gHi);
+            if (d < dF) dF = d;
+        }
+        clsLam = ((y - gMid * cmF[0]) * dirLF0 + (u - gMid * cmF[1]) * dirLF1 + (v - gMid * cmF[2]) * dirLF2)
+                 / (gMid * dirLFn);
+        final boolean mL = dL <= tau, mF = dF <= tau;
+        if (mL && (!mF || dF > 4f * dL)) return CL_LINE;
+        if (mF && (!mL || dL > 4f * dF)) return CL_FLOOR;
+        return CL_UNK;
+    }
+
+    /** Light level of colour (y,u,v) relative to the main floor colour, or −1 if it is not floor-like. */
+    private float floorGain(float y, float u, float v) {
+        final float[] inv = ciF, a = caF;
+        final float q0 = y * (inv[0] * y + 2f * (inv[1] * u + inv[2] * v)) + u * (inv[3] * u + 2f * inv[4] * v) + inv[5] * v * v;
+        final float q1 = a[0] * y + a[1] * u + a[2] * v;
+        final float g = q1 / ckF[0];
+        if (g < 0.15f || g > 6f) return -1f;
+        final float d = q0 - q1 * g;
+        final float tau = cfg.colorMatchSigma * cfg.colorMatchSigma;
+        return d <= 2f * tau ? g : -1f;
+    }
+
+    /** Reads the 2×2-averaged colour around pixel (col,row) into sY / sU / sV (U, V centred on 0). */
+    private void readPixel(int col, int row) {
+        final int W = imgW;
+        if (col < 0) col = 0; else if (col > W - 2) col = W - 2;
+        if (row < 0) row = 0; else if (row > imgH - 2) row = imgH - 2;
+        final int i = row * W + col;
+        if (srcFormat == FMT_ARGB) {
+            final int a = srcArgb[i], b = srcArgb[i + 1], c = srcArgb[i + W], d = srcArgb[i + W + 1];
+            sY = 0.25f * (lumaOf(a) + lumaOf(b) + lumaOf(c) + lumaOf(d));
+            if (modelLumaOnly) { sU = 0f; sV = 0f; return; }
+            sU = 0.25f * (chromaUOf(a) + chromaUOf(b) + chromaUOf(c) + chromaUOf(d)) - 128f;
+            sV = 0.25f * (chromaVOf(a) + chromaVOf(b) + chromaVOf(c) + chromaVOf(d)) - 128f;
+        } else {
+            final byte[] y = srcY;
+            sY = 0.25f * ((y[i] & 0xFF) + (y[i + 1] & 0xFF) + (y[i + W] & 0xFF) + (y[i + W + 1] & 0xFF));
+            if (srcFormat == FMT_YUV420 && !modelLumaOnly) {
+                final int uvi = (row >> 1) * uvW + (col >> 1);
+                sU = (srcU[uvi] & 0xFF) - 128f;
+                sV = (srcV[uvi] & 0xFF) - 128f;
+            } else { sU = 0f; sV = 0f; }
+        }
+    }
+
+    // =========================================================================
+    //  v3 — geometry (image ↔ plane)
+    // =========================================================================
+
+    /** Pinhole geometry for tilt {@code tiltDeg} (degrees below horizontal). */
+    private void setGeometry(float tiltDeg) {
+        gTiltDeg = tiltDeg;
+        final double fov = Math.max(1f, cfg.verticalFovDeg);
+        gFoc = (imgH * 0.5) / Math.tan(Math.toRadians(fov * 0.5));
+        gCx = imgW * 0.5; gCy = imgH * 0.5;
+        gSinT = Math.sin(Math.toRadians(tiltDeg)); gCosT = Math.cos(Math.toRadians(tiltDeg));
+    }
+
+    /** Plane point → continuous image position (pU, pV). False if the point cannot be seen (behind the camera). */
+    private boolean planeToImage(float x, float y) {
+        if (cfg.pathFloorSpace) {
+            final float xc = x * rfCos - y * rfSin;
+            final float yc = x * rfSin + y * rfCos + rfA;
+            final double zc = xc * gCosT + gSinT;
+            if (zc < 0.05) return false;
+            pU = (float) (gCx + gFoc * yc / zc);
+            pV = (float) (gCy + gFoc * (gCosT - xc * gSinT) / zc);
+        } else {
+            pV = ipV0 - x / ipK;
+            pU = ipU0 + ipSlope * (ipV0 - pV) + y / ipK;
+        }
+        return true;
+    }
+
+    /** Continuous image position → plane point (qX, qY). False above the horizon. */
+    private boolean imageToPlane(float u, float v) {
+        if (cfg.pathFloorSpace) {
+            final double yn = (v - gCy) / gFoc;
+            final double down = yn * gCosT + gSinT;
+            if (down < 1e-3) return false;
+            final float xc = (float) ((gCosT - yn * gSinT) / down);
+            final float yc = (float) ((u - gCx) / (gFoc * down)) - rfA;
+            qX = xc * rfCos + yc * rfSin;
+            qY = -xc * rfSin + yc * rfCos;
+        } else {
+            qX = (ipV0 - v) * ipK;
+            qY = (u - ipU0 - ipSlope * (ipV0 - v)) * ipK;
+        }
+        return true;
+    }
+
+    /** Plane units per image pixel (sideways) at plane point (x, y). */
+    private float pixelSizeAt(float x, float y) {
+        if (!cfg.pathFloorSpace) return ipK;
+        final double zc = (x * rfCos - y * rfSin) * gCosT + gSinT;
+        return (float) (Math.max(0.05, zc) / gFoc);
+    }
+
+    /** Expected line width (plane units) at plane point (x, y). Overwrites pU / pV in image mode. */
+    private float widthAt(float x, float y) {
+        if (cfg.pathFloorSpace) return lineW;
+        if (!planeToImage(x, y)) return lineW;
+        return Math.max(3f, calWA + calWB * pV) * ipK;
+    }
+
+    /** True if plane point (x, y) is inside the ROI with a margin of {@code marginPx}. Sets pU / pV. */
+    private boolean insideRoi(float x, float y, float marginPx) {
+        if (!planeToImage(x, y)) return false;
+        return pU >= marginPx && pU <= imgW - marginPx && pV >= roiTop + marginPx && pV <= roiBot - marginPx;
+    }
+
+    // =========================================================================
+    //  v3 — one profile across the path
+    // =========================================================================
+
+    /**
+     * Sample a profile across the path at plane point (px,py) along the unit normal
+     * (nx,ny), ±half, and classify every sample relative to the local light level
+     * (measured from the floor-like samples of this profile). Fills pr* arrays.
+     */
+    private void sampleProfile(float px, float py, float nx, float ny, float half, float wExp) {
+        float step = Math.max(wExp / 10f, 1.6f * pixelSizeAt(px, py));
+        int n = (int) (2f * half / step) + 1;
+        if (n > PROF_MAX) { n = PROF_MAX; step = 2f * half / (n - 1); }
+        if (n < 5) { n = 5; step = 2f * half / 4f; }
+        prN = n; prStep = step; prH0 = -(n - 1) * step * 0.5f;
+        int nG = 0;
+        for (int j = 0; j < n; j++) {
+            final float s = prH0 + j * step;
+            if (!planeToImage(px + s * nx, py + s * ny)) { prCls[j] = CL_OUT; continue; }
+            if (pU < 0.5f || pV < roiTop + 0.5f || pU > imgW - 1.5f || pV > roiBot - 1.5f) { prCls[j] = CL_OUT; continue; }
+            readPixel((int) (pU - 0.5f), (int) (pV - 0.5f));
+            prY[j] = sY; prU[j] = sU; prV[j] = sV; prCls[j] = CL_UNK;
+            final float g = floorGain(sY, sU, sV);
+            if (g > 0f) prTmp[nG++] = g;
+        }
+        classifyProfile(n, nG);
+    }
+
+    /** Classify prY/U/V[0…n) (CL_OUT entries kept) with the local light level from prTmp[0…nG). */
+    private void classifyProfile(int n, int nG) {
+        float gl = prGain;
+        if (nG >= 4) gl = median(prTmp, nG);
+        else if (nG > 0) gl = 0.5f * (prGain + median(prTmp, nG));
+        prGain = gl;
+        final float r = Math.max(1.05f, cfg.lightLocalRange);
+        final float gLo = gl / r, gHi = gl * r;
+        for (int j = 0; j < n; j++) {
+            if (prCls[j] == CL_OUT) { prLam[j] = 0f; continue; }
+            prCls[j] = classify(prY[j], prU[j], prV[j], gLo, gHi, gl);
+            prLam[j] = clsLam;
+        }
+    }
+
+    /** Median of a[0…n) (partially reorders a). */
+    private static float median(float[] a, int n) {
+        for (int i = 1; i < n; i++) {
+            final float x = a[i]; int j = i - 1;
+            while (j >= 0 && a[j] > x) { a[j + 1] = a[j]; j--; }
+            a[j + 1] = x;
+        }
+        return (n & 1) == 1 ? a[n / 2] : 0.5f * (a[n / 2 - 1] + a[n / 2]);
+    }
+
+    /** Edge position (profile offset) between samples i and i+1 where the line-ness crosses 0.5. */
+    private float edgePos(int i) {
+        final float a = prLam[i], b = prLam[i + 1];
+        float t = 0.5f;
+        if (Math.abs(b - a) > 1e-3f) t = (0.5f - a) / (b - a);
+        if (t < 0f) t = 0f; else if (t > 1f) t = 1f;
+        return prH0 + (i + t) * prStep;
+    }
+
+    /**
+     * Find the line in the current profile: the run of LINE samples whose width,
+     * edges and position fit the line expected at offset 0 (± gate). Writes
+     * msStatus (ST_MEAS / ST_UNREL / ST_ABSENT / ST_OUT), msOff, msQual, msTrim.
+     *
+     *   both edges against floor, width ≈ expected   → measured (quality ~1)
+     *   one edge against floor, other unknown          → centre = clean edge ± width/2
+     *     (glare / shadow / object over one side)        (quality 0.6)
+     *   too wide but one edge where the line's edge     → that edge ± width/2 (0.55)
+     *     is predicted (line merged with a blob)
+     *   too wide / too thin, no edge fits                → unreliable (never a guess)
+     *   no line, mostly unknown pixels near the path     → unreliable
+     *   no line, clean floor where the path should be    → absent
+     */
+    private void analyzeProfile(float gate, float wExp) {
+        final int n = prN;
+        msStatus = ST_NONE; msOff = 0f; msQual = 0f; msTrim = false;
+        final float tol = Math.max(0.3f * wExp, 1.5f * prStep);
+        final float sig = Math.max(0.35f * wExp, 0.5f * gate);
+        final float reach = gate + 0.5f * wExp;
+        float best = 0f;
+        boolean doubtNear = false;
+        int j = 0;
+        while (j < n) {
+            if (prCls[j] != CL_LINE) { j++; continue; }
+            final int a = j;
+            int b = j, k = j + 1;
+            while (k < n) {
+                if (prCls[k] == CL_LINE) { b = k; k++; }
+                else if (prCls[k] == CL_UNK && k + 1 < n && prCls[k + 1] == CL_LINE) k++;
+                else break;
+            }
+            j = b + 1;
+            final byte lc = a > 0 ? prCls[a - 1] : CL_OUT, rc = b + 1 < n ? prCls[b + 1] : CL_OUT;
+            final boolean cl = lc == CL_FLOOR, cr = rc == CL_FLOOR;
+            final float eL = cl ? edgePos(a - 1) : prH0 + (a - 0.5f) * prStep;
+            final float eR = cr ? edgePos(b) : prH0 + (b + 0.5f) * prStep;
+            final float width = eR - eL, ratio = width / wExp;
+            final boolean near = eR >= -reach && eL <= reach;
+            float c1 = 0f, q1 = 0f, c2 = 0f, q2 = 0f;
+            boolean trim = false;
+            if (cl && cr) {
+                if (ratio >= 0.55f && ratio <= 1.6f) { c1 = 0.5f * (eL + eR); q1 = 1f - 0.4f * Math.abs(ratio - 1f); }
+                else if (ratio > 1.6f) {
+                    if (Math.abs(eL + 0.5f * wExp) <= tol) { c1 = eL + 0.5f * wExp; q1 = 0.55f; trim = true; }
+                    if (Math.abs(eR - 0.5f * wExp) <= tol) { c2 = eR - 0.5f * wExp; q2 = 0.55f; trim = true; }
+                    if (q1 == 0f && q2 == 0f && near) doubtNear = true;
+                } else if (near) doubtNear = true;                 // much thinner than the line
+            } else if (cl || cr) {
+                // One edge against floor, the other against unknown pixels (a glare /
+                // shadow / object over one side): the clean edge plus half the width.
+                final float c = cl ? eL + 0.5f * wExp : eR - 0.5f * wExp;
+                if (ratio >= 0.3f && ratio <= 1.6f) { c1 = c; q1 = 0.6f; }
+                else { c1 = c; q1 = 0.45f; trim = true; }   // the far side is unknown: only the clean edge counts
+            } else {
+                // Unknown pixels on both sides: only a full-width run is trusted (a
+                // partly hidden line would put its centre in the wrong place).
+                if (ratio >= 0.8f && ratio <= 1.25f) { c1 = 0.5f * (eL + eR); q1 = 0.35f; }
+                else if (near) doubtNear = true;
+            }
+            if (q1 > 0f && Math.abs(c1) <= gate) {
+                final float z = c1 / sig, s = q1 * (float) Math.exp(-0.5f * z * z);
+                if (s > best) { best = s; msOff = c1; msQual = q1; msTrim = trim; }
+            } else if (q1 > 0f && near) doubtNear = true;
+            if (q2 > 0f && Math.abs(c2) <= gate) {
+                final float z = c2 / sig, s = q2 * (float) Math.exp(-0.5f * z * z);
+                if (s > best) { best = s; msOff = c2; msQual = q2; msTrim = trim; }
+            }
+        }
+        if (best > 0f) {
+            msStatus = ST_MEAS;
+            if (msTrim) v3Rejected++;
+            return;
+        }
+        int nW = 0, nOut = 0, nF = 0, nU = 0;
+        for (int i = 0; i < n; i++) {
+            final float s = prH0 + i * prStep;
+            if (s < -reach || s > reach) continue;
+            nW++;
+            final byte c = prCls[i];
+            if (c == CL_OUT) nOut++; else if (c == CL_FLOOR) nF++; else nU++;
+        }
+        if (nW == 0 || nOut * 2 > nW) msStatus = ST_OUT;
+        else if (doubtNear || nU * 100 >= 15 * nW) msStatus = ST_UNREL;
+        else if (nF * 10 >= 7 * nW) msStatus = ST_ABSENT;
+        else msStatus = ST_UNREL;
+        if (doubtNear) v3Rejected++;
+    }
+
+    /** Measure the line at plane point (px,py), normal (nx,ny), within ±gate. */
+    private void measureAt(float px, float py, float nx, float ny, float gate, float wExp) {
+        sampleProfile(px, py, nx, ny, gate + 1.6f * wExp, wExp);
+        analyzeProfile(gate, wExp);
+    }
+
+    // =========================================================================
+    //  v3 — calibration
+    // =========================================================================
+    //
+    //  Phase 1 (colours, Config.colorCalibFrames frames): pixels are sampled over a
+    //  tall region above the robot (not only a strip), clustered (k-means, k = 2…4)
+    //  and the line is the cluster forming a narrow band in most row blocks; the
+    //  floor is the cluster filling both image edges. Further clusters are either
+    //  a second floor colour (they also fill the edges) or a DISTURBANCE (glare,
+    //  shadow patch, object) — excluded from both colour models.
+    //  Phase 2 (geometry, Config.calibFrames frames): rows are scanned from the
+    //  robot up to the top of the image; in each row the line is located with the
+    //  colour model. Rows where the line has clean edges give the line width per
+    //  row (→ perspective / camera tilt) and the line's position (→ straight-ahead
+    //  and heading zero). Rows where the floor stops (table edge, background) set
+    //  the top of the ROI. Disturbed rows (no clean edges) are simply not used.
+
+    private boolean calibrateV3() {
+        if (calibrated) return true;
+        laPathCount = 0;
+        boolean lineFound = false;
+        int centroidX = -1;
+        final boolean learnColors = cfg.autoColor && !colorReady;
+        if (learnColors) {
+            sampleRegionColors();
+            if (++colorFramesSampled >= Math.max(1, cfg.colorCalibFrames)) learnColorModelV3();
+        } else {
+            if (!modelReady) buildFallbackModels();
+            if (modelReady) {
+                centroidX = calibGeometryFrame();
+                lineFound = centroidX >= 0;
+                if (lineFound) {
+                    calibIssue = ISSUE_NONE;
+                    if (++calibCount >= Math.max(1, cfg.calibFrames)) finishGeometry();
+                } else calibIssue = ISSUE_NO_LINE;
+            }
+        }
+        fillCalibPath();
+        fireCallback(0, 100, lineFound, centroidX);
+        return calibrated;
+    }
+
+    /** Rows of the colour-learning region: from the robot body up 45 % of the frame. */
+    private int calibRegionTop() { return Math.max(0, ignoreTop - Math.round(0.45f * imgH)); }
+
+    /** Grid-sample up to SAMPLES_PER_FRAME (Y,U,V,column,row) tuples from the region above the robot. */
+    private void sampleRegionColors() {
+        final int W = imgW, r0 = calibRegionTop(), r1 = Math.max(r0 + 1, ignoreTop);
+        final int nRows = Math.min(24, r1 - r0);
+        final float stepR = (r1 - r0) / (float) nRows;
+        final int stepC = Math.max(1, (W * nRows + SAMPLES_PER_FRAME - 1) / SAMPLES_PER_FRAME);
+        final int cap = sampY.length;
+        for (int k = 0; k < nRows && sampleCount < cap; k++) {
+            final int row = Math.min(r1 - 1, r0 + Math.round((k + 0.5f) * stepR));
+            for (int col = 0; col < W && sampleCount < cap; col += stepC) {
+                final int i = row * W + col;
+                int y, u, v;
+                if (srcFormat == FMT_GRAY) { y = srcY[i] & 0xFF; u = 128; v = 128; }
+                else if (srcFormat == FMT_YUV420) {
+                    final int uvi = (row >> 1) * uvW + (col >> 1);
+                    y = srcY[i] & 0xFF; u = srcU[uvi] & 0xFF; v = srcV[uvi] & 0xFF;
+                } else { final int c = srcArgb[i]; y = lumaOf(c); u = chromaUOf(c); v = chromaVOf(c); }
+                sampY[sampleCount] = (short) y; sampU[sampleCount] = (short) u; sampV[sampleCount] = (short) v;
+                sampCol[sampleCount] = (short) col; sampRow[sampleCount] = (short) row;
+                sampleCount++;
+            }
+        }
+    }
+
+    /** Colour learning for v3 (runs once per calibration — allocation is fine here). */
+    private void learnColorModelV3() {
+        final int n = sampleCount;
+        sampleCount = 0;
+        colorFramesSampled = 0;
+        if (n < 32) { calibIssue = ISSUE_LOW_CONTRAST; return; }
+        int first = ISSUE_NONE;
+        for (int k = 2; k <= MAX_CLUSTERS; k++) {
+            if (tryColorModelV3(n, k)) { calibIssue = ISSUE_NONE; return; }
+            if (k == 2) first = calibIssue;
+        }
+        colorReady = false;
+        calibIssue = first;
+    }
+
+    private boolean tryColorModelV3(int n, int k) {
+        final double[] c = new double[k * 3];
+        if (!kMeans(n, k, c)) { calibIssue = ISSUE_LOW_CONTRAST; return false; }
+        final int edge = Math.max(1, imgW / 20);
+        final int[] left = new int[k], right = new int[k], count = new int[k];
+        int leftTotal = 0, rightTotal = 0;
+        for (int i = 0; i < n; i++) {
+            final int col = sampCol[i], lbl = sampLabel[i];
+            count[lbl]++;
+            if (col < edge) { left[lbl]++; leftTotal++; }
+            else if (col >= imgW - edge) { right[lbl]++; rightTotal++; }
+        }
+        // Floor: the cluster holding the most of both edge zones (and ≥ 40 % of each).
+        int floor = -1; double bestEdge = 0;
+        for (int j = 0; j < k; j++) {
+            final double l = left[j] / (double) Math.max(1, leftTotal), r = right[j] / (double) Math.max(1, rightTotal);
+            if (l >= 0.4 && r >= 0.4 && l + r > bestEdge) { bestEdge = l + r; floor = j; }
+        }
+        if (floor < 0) { calibIssue = ISSUE_NO_FLOOR; return false; }
+        // Line: a cluster that (almost) never reaches the edges and forms a narrow
+        // band in most row blocks (blocks where a disturbance merges with it are outvoted).
+        int line = -1; double bestD = Double.MAX_VALUE;
+        final double[] band = new double[3], b = new double[3];
+        for (int j = 0; j < k; j++) {
+            if (j == floor || count[j] < n / 200) continue;
+            if (left[j] > 0.2 * leftTotal || right[j] > 0.2 * rightTotal) continue;
+            if (bandBlocks(n, j, b) < 0.5 || b[1] > 0.5 * imgW) continue;
+            final double d = Math.abs(b[0] - imgW * 0.5);
+            if (d < bestD) { bestD = d; line = j; band[0] = b[0]; band[1] = b[1]; }
+        }
+        if (line < 0) { calibIssue = ISSUE_NO_FLOOR; return false; }
+        if (!fitDiscriminant(n, k, c, count, line, false)) return false;   // v2 projection + reported colours
+        if (!buildModelsV3(n, k, c, line, floor, left, right, leftTotal, rightTotal)) {
+            colorReady = false; colorSeparation = 0f; lineColorArgb = 0; floorColorArgb = 0;
+            calibIssue = ISSUE_LOW_CONTRAST;
+            return false;
+        }
+        learnedLineX = (float) band[0];
+        learnedLineW = (float) band[1];
+        return true;
+    }
+
+    /**
+     * Split the samples into 6 row blocks; in each, find the band (run of columns
+     * where cluster {@code cl} is the majority) holding most of the cluster's
+     * samples. Returns the fraction of blocks (with enough samples of the cluster)
+     * whose band holds ≥ 60 % of them; out = {centre, width} of the lowest such band.
+     */
+    private double bandBlocks(int n, int cl, double[] out) {
+        final int NB = 6, W = imgW;
+        int rMin = Integer.MAX_VALUE, rMax = -1;
+        for (int i = 0; i < n; i++) { rMin = Math.min(rMin, sampRow[i]); rMax = Math.max(rMax, sampRow[i]); }
+        if (rMax < rMin) return 0;
+        final float span = Math.max(1, rMax - rMin + 1) / (float) NB;
+        final int[][] total = new int[NB][W], in = new int[NB][W];
+        final int[] clTotal = new int[NB];
+        for (int i = 0; i < n; i++) {
+            final int blk = Math.min(NB - 1, (int) ((sampRow[i] - rMin) / span));
+            total[blk][sampCol[i]]++;
+            if (sampLabel[i] == cl) { in[blk][sampCol[i]]++; clTotal[blk]++; }
+        }
+        final int gapTol = runGapTol();
+        int used = 0, ok = 0;
+        out[0] = W * 0.5; out[1] = 0;
+        for (int blk = NB - 1; blk >= 0; blk--) {      // bottom block first
+            if (clTotal[blk] < 8) continue;
+            used++;
+            int bestIn = 0, bestS = -1, bestE = -1, curIn = 0, curS = -1, curLast = -1;
+            for (int col = 0; col <= W; col++) {
+                final boolean sampled = col < W && total[blk][col] > 0;
+                final boolean member = sampled && in[blk][col] * 2 > total[blk][col];
+                if (member) { if (curS < 0) { curS = col; curIn = 0; } curIn += in[blk][col]; curLast = col; }
+                else if (curS >= 0 && (col == W || (sampled && col - curLast > gapTol))) {
+                    if (curIn > bestIn) { bestIn = curIn; bestS = curS; bestE = curLast + 1; }
+                    curS = -1;
+                }
+            }
+            if (bestS >= 0 && bestIn >= 0.6 * clTotal[blk] && bestE - bestS <= 0.5 * W) {
+                if (ok == 0) { out[0] = (bestS + bestE) * 0.5; out[1] = bestE - bestS; }
+                ok++;
+            }
+        }
+        return used == 0 ? 0 : ok / (double) used;
+    }
+
+    /** Build the v3 line / floor colour models from the clustered samples. */
+    private boolean buildModelsV3(int n, int k, double[] c, int line, int floor,
+                                  int[] left, int[] right, int leftTotal, int rightTotal) {
+        modelLumaOnly = false;
+        if (!modelFromCluster(n, line, true, 0)) return false;
+        if (!modelFromCluster(n, floor, false, 0)) return false;
+        nFloorModels = 1;
+        finishModels();
+        // Other clusters: a second floor colour if it also fills both edges and is
+        // not explained by the floor / line colour under other light; otherwise a
+        // disturbance (glare, shadow patch, object) — excluded from the models.
+        final float r = Math.max(1.05f, cfg.lightLocalRange);
+        for (int j = 0; j < k && nFloorModels < FLOOR_MAX; j++) {
+            if (j == line || j == floor) continue;
+            final float y = (float) c[j * 3], u = (float) c[j * 3 + 1] - 128f, v = (float) c[j * 3 + 2] - 128f;
+            final byte cls = classify(y, u, v, 1f / (r * r), r * r, 1f);
+            if (cls != CL_UNK) continue;                                   // shadowed / lit floor or line
+            final double l = left[j] / (double) Math.max(1, leftTotal), rr = right[j] / (double) Math.max(1, rightTotal);
+            if (l >= 0.15 && rr >= 0.15 && modelFromCluster(n, j, false, nFloorModels)) nFloorModels++;
+        }
+        // The two colours must stay apart even under a local light change.
+        if (classify(cmL[0], cmL[1], cmL[2], 1f / r, r, 1f) != CL_LINE) return false;
+        for (int j = 0; j < nFloorModels; j++) {
+            if (classify(cmF[j * 3], cmF[j * 3 + 1], cmF[j * 3 + 2], 1f / r, r, 1f) != CL_FLOOR) return false;
+        }
+        return true;
+    }
+
+    /** Mean and covariance of cluster {@code cl} → model. */
+    private boolean modelFromCluster(int n, int cl, boolean line, int slot) {
+        double sy = 0, su = 0, sv = 0; int cnt = 0;
+        for (int i = 0; i < n; i++) {
+            if (sampLabel[i] != cl) continue;
+            sy += sampY[i]; su += sampU[i] - 128; sv += sampV[i] - 128; cnt++;
+        }
+        if (cnt < 4) return false;
+        final double my = sy / cnt, mu = su / cnt, mv = sv / cnt;
+        final double[] cov = new double[6];
+        for (int i = 0; i < n; i++) {
+            if (sampLabel[i] != cl) continue;
+            final double dy = sampY[i] - my, du = sampU[i] - 128 - mu, dv = sampV[i] - 128 - mv;
+            cov[0] += dy * dy; cov[1] += dy * du; cov[2] += dy * dv; cov[3] += du * du; cov[4] += du * dv; cov[5] += dv * dv;
+        }
+        for (int j = 0; j < 6; j++) cov[j] /= cnt;
+        cov[0] += 6.0; cov[3] += 3.0; cov[5] += 3.0;          // noise floor (σ ≈ 2.5 Y, 1.7 UV)
+        return setModel(line, slot, my, mu, mv, cov);
+    }
+
+    /**
+     * Models when the colours were not learned by clustering: preset colours
+     * (setTrackColors) or the classic brightness-only mode (autoColor = false),
+     * where the two brightness levels come from an Otsu split of the region above
+     * the robot and trackIsBright says which one is the line.
+     */
+    private void buildFallbackModels() {
+        final double[] cov = {100, 0, 0, 36, 0, 36};
+        if (cfg.autoColor && colorPreset) {
+            modelLumaOnly = false;
+            if (setModel(true, 0, presetY1, presetU1 - 128, presetV1 - 128, cov)
+                    && setModel(false, 0, presetY0, presetU0 - 128, presetV0 - 128, cov)) {
+                nFloorModels = 1; finishModels();
+            }
+            return;
+        }
+        modelLumaOnly = true;
+        final int[] hist = histogram;
+        java.util.Arrays.fill(hist, 0);
+        final int r0 = calibRegionTop(), r1 = Math.max(r0 + 1, ignoreTop), W = imgW;
+        long cnt = 0;
+        for (int row = r0; row < r1; row += 4) {
+            for (int col = 0; col < W; col += 4) {
+                final int i = row * W + col;
+                final int y = srcFormat == FMT_ARGB ? lumaOf(srcArgb[i]) : srcY[i] & 0xFF;
+                hist[y]++; cnt++;
+            }
+        }
+        final int t = otsuThreshold(hist, cnt);
+        if (otsuContrast < cfg.minContrast) { calibIssue = ISSUE_LOW_CONTRAST; return; }
+        double s0 = 0, n0 = 0, s1 = 0, n1 = 0;
+        for (int g = 0; g < 256; g++) { if (g <= t) { s0 += g * hist[g]; n0 += hist[g]; } else { s1 += g * hist[g]; n1 += hist[g]; } }
+        final double dark = s0 / Math.max(1, n0), bright = s1 / Math.max(1, n1);
+        double v0 = 0, v1 = 0;
+        for (int g = 0; g < 256; g++) { if (g <= t) v0 += (g - dark) * (g - dark) * hist[g]; else v1 += (g - bright) * (g - bright) * hist[g]; }
+        final double lineY = cfg.trackIsBright ? bright : dark, floorY = cfg.trackIsBright ? dark : bright;
+        final double lineV = (cfg.trackIsBright ? v1 / Math.max(1, n1) : v0 / Math.max(1, n0)) + 6;
+        final double floorV = (cfg.trackIsBright ? v0 / Math.max(1, n0) : v1 / Math.max(1, n1)) + 6;
+        if (setModel(true, 0, lineY, 0, 0, new double[]{lineV, 0, 0, 4, 0, 4})
+                && setModel(false, 0, floorY, 0, 0, new double[]{floorV, 0, 0, 4, 0, 4})) {
+            nFloorModels = 1; finishModels();
+        }
+    }
+
+    /** Allocate the geometry accumulators (scan rows from the robot body to the top). */
+    private void initCalibRows() {
+        final int step = Math.max(2, imgH / 160);
+        int n = 0;
+        for (int row = ignoreTop - 1 - step / 2; row >= 1; row -= step) n++;
+        cgN = n;
+        cgRow = new int[n]; cgSumC = new float[n]; cgSumW = new float[n]; cgSumGood = new float[n];
+        cgClean = new int[n]; cgFrames = new int[n];
+        int j = 0;
+        for (int row = ignoreTop - 1 - step / 2; row >= 1 && j < n; row -= step) cgRow[j++] = row;
+    }
+
+    private void clearCalibRows() {
+        if (cgRow == null) return;
+        java.util.Arrays.fill(cgSumC, 0f); java.util.Arrays.fill(cgSumW, 0f); java.util.Arrays.fill(cgSumGood, 0f);
+        java.util.Arrays.fill(cgClean, 0); java.util.Arrays.fill(cgFrames, 0);
+    }
+
+    /**
+     * One geometry-calibration frame: locate the line in every scan row, from the
+     * robot upward, following it. Returns the line column in the bottom rows (−1 if
+     * the line was not found there).
+     */
+    private int calibGeometryFrame() {
+        if (cgRow == null) initCalibRows();
+        final int W = imgW;
+        float pred = learnedLineW > 0f ? learnedLineX : W * 0.5f;
+        float predW = learnedLineW > 0f ? learnedLineW : 0f;
+        float slope = 0f;                 // columns per scan row (upward)
+        int lastJ = -1, bottomCol = -1, found = 0;
+        float firstC = -1f;
+        for (int j = 0; j < cgN; j++) {
+            final int row = cgRow[j];
+            scanRowSamples(row, Math.max(2, (int) (predW > 0f ? predW / 10f : W / 160f)));
+            final int n = prN;
+            int good = 0, valid = 0;
+            for (int i = 0; i < n; i++) { if (prCls[i] == CL_OUT) continue; valid++; if (prCls[i] != CL_UNK) good++; }
+            cgFrames[j]++;
+            cgSumGood[j] += valid > 0 ? good / (float) valid : 0f;
+            // Candidate nearest the prediction with clean edges on both sides.
+            final float p = lastJ >= 0 ? pred + slope * (j - lastJ) : pred;
+            final float gate = lastJ >= 0 ? Math.max(12f, (predW > 0f ? predW : 40f) * Math.min(3f, 0.6f + 0.1f * (j - lastJ))) : W * 0.3f;
+            float bestC = -1f, bestW = 0f, bestD = Float.MAX_VALUE;
+            int i = 0;
+            while (i < n) {
+                if (prCls[i] != CL_LINE) { i++; continue; }
+                final int a = i; int b = i, q = i + 1;
+                while (q < n) {
+                    if (prCls[q] == CL_LINE) { b = q; q++; }
+                    else if (prCls[q] == CL_UNK && q + 1 < n && prCls[q + 1] == CL_LINE) q++;
+                    else break;
+                }
+                i = b + 1;
+                if (a == 0 || b == n - 1 || prCls[a - 1] != CL_FLOOR || prCls[b + 1] != CL_FLOOR) continue;
+                final float eL = edgePos(a - 1), eR = edgePos(b), w = eR - eL, cc = 0.5f * (eL + eR);
+                if (w < 3f) continue;
+                if (predW > 0f && (w < 0.5f * predW * (lastJ >= 0 ? 0.8f : 0.5f) || w > 1.6f * predW)) continue;
+                final float d = Math.abs(cc - p);
+                if (d <= gate && d < bestD) { bestD = d; bestC = cc; bestW = w; }
+            }
+            if (bestC >= 0f) {
+                cgClean[j]++; cgSumC[j] += bestC; cgSumW[j] += bestW;
+                if (lastJ >= 0) {
+                    final float sNew = (bestC - pred) / (j - lastJ);
+                    slope = lastJ >= 0 && j - lastJ <= 3 ? 0.7f * slope + 0.3f * sNew : sNew;
+                }
+                pred = bestC; predW = predW > 0f ? 0.7f * predW + 0.3f * bestW : bestW; lastJ = j;
+                if (bottomCol < 0 && j < 6) bottomCol = Math.round(bestC);
+                if (found++ == 0) firstC = bestC;
+            }
+        }
+        // The line counts as found when it was located cleanly in enough rows — not
+        // necessarily the lowest ones (a disturbance may cover the near part).
+        if (bottomCol < 0 && found >= 6) bottomCol = Math.round(firstC);
+        return found >= 6 ? bottomCol : -1;
+    }
+
+    /** Sample image row {@code row} every {@code step} px (2×2 average) and classify with the row's light level. */
+    private void scanRowSamples(int row, int step) {
+        final int W = imgW;
+        int n = 0, nG = 0;
+        for (int col = 0; col + 1 < W && n < prY.length; col += step) {
+            readPixel(col, row);
+            prY[n] = sY; prU[n] = sU; prV[n] = sV; prCls[n] = CL_UNK;
+            final float g = floorGain(sY, sU, sV);
+            if (g > 0f && nG < prTmp.length) prTmp[nG++] = g;
+            n++;
+        }
+        prN = n; prStep = step; prH0 = 0.5f + 0.5f;   // sample i covers column i·step … i·step+1 → centre i·step + 1
+        prGain = 1f;
+        classifyProfile(n, nG);
+    }
+
+    /**
+     * End of the geometry phase: ROI, width model (→ tilt), line width on the floor,
+     * straight-ahead / heading zero, initial path memory. On failure the geometry
+     * phase restarts (calibCount = 0).
+     */
+    private void finishGeometry() {
+        final int n = cgN;
+        final boolean[] good = new boolean[n], clean = new boolean[n];
+        final float[] cC = new float[n], cW = new float[n];
+        int nClean = 0;
+        for (int j = 0; j < n; j++) {
+            final int f = Math.max(1, cgFrames[j]);
+            clean[j] = cgClean[j] * 2 >= f && cgClean[j] > 0;
+            good[j] = clean[j] && cgSumGood[j] / f >= 0.7f;
+            if (clean[j]) { cC[j] = cgSumC[j] / cgClean[j]; cW[j] = cgSumW[j] / cgClean[j]; nClean++; }
+        }
+        // ── ROI bottom: just above the robot body (skip low rows that are not floor) ──
+        int jb = 0;
+        while (jb < n / 6 && !(good[jb] && (jb + 1 >= n || good[jb + 1]))) jb++;
+        if (jb >= n / 6) jb = 0;
+        // ── ROI top: the highest good row with mostly bad rows above it ──
+        int jt = -1, above = 0, aboveGood = 0;
+        for (int j = n - 1; j >= jb; j--) {
+            if (good[j] && aboveGood * 4 <= above) { jt = j; break; }
+            above++; if (good[j]) aboveGood++;
+        }
+        if (!cfg.roiAuto) jt = n - 1;
+        if (jt < 0 || nClean < 6 || jt - jb < 4) { calibIssue = ISSUE_NO_LINE; calibCount = 0; clearCalibRows(); return; }
+        // ── width model w(v) = A + B·v, robust (rows with clean edges inside the ROI) ──
+        double A = 0, B = 0;
+        final float[] wt = new float[n];
+        for (int j = jb; j <= jt; j++) wt[j] = clean[j] ? 1f : 0f;
+        for (int it = 0; it < 4; it++) {
+            double s = 0, sx = 0, sy = 0, sxx = 0, sxy = 0;
+            for (int j = jb; j <= jt; j++) {
+                if (wt[j] <= 0f) continue;
+                final double x = cgRow[j] + 0.5, y = cW[j], w = wt[j];
+                s += w; sx += w * x; sy += w * y; sxx += w * x * x; sxy += w * x * y;
+            }
+            final double det = s * sxx - sx * sx;
+            if (s < 3 || Math.abs(det) < 1e-9) break;
+            B = (s * sxy - sx * sy) / det; A = (sy - B * sx) / s;
+            double mad = 0; int m = 0;
+            for (int j = jb; j <= jt; j++) if (clean[j]) { mad += Math.abs(cW[j] - (A + B * (cgRow[j] + 0.5))); m++; }
+            final double sc = Math.max(1.5, 2.5 * mad / Math.max(1, m));
+            for (int j = jb; j <= jt; j++) {
+                if (!clean[j]) continue;
+                final double r = Math.abs(cW[j] - (A + B * (cgRow[j] + 0.5))) / sc;
+                wt[j] = r >= 1 ? 0f : (float) ((1 - r * r) * (1 - r * r));
+            }
+        }
+        calWA = (float) A; calWB = (float) B;
+        // ── camera tilt from the width model (tan T = w(cy) / (f · dw/dv)) ──
+        setGeometry(cfg.cameraTiltDeg);
+        if (cfg.learnCameraTilt && B > 1e-6) {
+            final double wc = A + B * gCy;
+            final double t = Math.toDegrees(Math.atan2(wc, gFoc * B));
+            int used = 0; for (int j = jb; j <= jt; j++) if (wt[j] > 0.3f) used++;
+            final float spanFrac = (cgRow[jb] - cgRow[jt]) / (float) imgH;
+            if (wc > 0 && t >= 15 && t <= 89.5 && used >= 8 && spanFrac >= 0.25f) setGeometry((float) t);
+        } else if (cfg.learnCameraTilt && Math.abs(B) <= 1e-6 && A > 0) {
+            setGeometry(89.5f);                                  // constant width: camera looks straight down
+        }
+        // ── ROI rows (top with the safety margin, as a fraction of the floor distance) ──
+        roiBot = Math.min(ignoreTop, cgRow[jb] + Math.max(2, imgH / 320) + 1);
+        int topRow = cgRow[jt];
+        rfA = 0f; rfCos = 1f; rfSin = 0f;
+        final boolean fs = cfg.pathFloorSpace;
+        cfg.pathFloorSpace = true;     // geometry measurements are always made on the floor
+        if (imageToPlane((float) gCx, roiBot - 0.5f)) {
+            final float xb = qX;
+            if (imageToPlane((float) gCx, topRow + 0.5f)) {
+                final float xt = qX - cfg.roiTopMarginFrac * Math.max(0f, qX - xb);
+                // invert forward distance → row on the centre column
+                final double c = gCosT, sn = gSinT;
+                final double yn = (c - xt * sn) / (xt * c + sn);
+                topRow = (int) Math.ceil(gCy + gFoc * yn);
+            }
+        }
+        roiTop = Math.max(0, Math.min(roiBot - 8, topRow));
+        // ── line width on the floor and the calibrated line (straight-ahead, heading zero) ──
+        int m = 0;
+        final float[] wf = new float[n];
+        double s = 0, sx = 0, sy = 0, sxx = 0, sxy = 0;
+        for (int j = jb; j <= jt; j++) {
+            if (wt[j] <= 0.3f || cgRow[j] < roiTop) continue;
+            final float v = cgRow[j] + 0.5f;
+            if (!imageToPlane(cC[j], v)) continue;
+            final float x = qX, y = qY;
+            wf[m++] = cW[j] * pixelSizeAt(x, y);
+            s += 1; sx += x; sy += y; sxx += x * x; sxy += x * y;
+        }
+        if (m < 4) { cfg.pathFloorSpace = fs; calibIssue = ISSUE_NO_LINE; calibCount = 0; clearCalibRows(); return; }
+        final float wFloor = median(wf, m);
+        final double det = s * sxx - sx * sx;
+        double bh = Math.abs(det) > 1e-9 ? (s * sxy - sx * sy) / det : 0;
+        double ah = (sy - bh * sx) / s;
+        if (Math.abs(Math.toDegrees(Math.atan(bh))) > cfg.steerHeadingCalibMaxDeg) {
+            bh = 0; ah = sy / s;        // robot clearly not straight: keep only the offset
+        }
+        final double psi = Math.atan(bh);
+        rfA = (float) ah; rfCos = (float) Math.cos(psi); rfSin = (float) Math.sin(psi);
+        cfg.pathFloorSpace = fs;
+        lineW = wFloor;
+        // ── image-plane variant: pixel size at the ROI bottom = 1 unit ≈ 1 camera height ──
+        {
+            final boolean f2 = cfg.pathFloorSpace;
+            cfg.pathFloorSpace = true;
+            planeToImage(0f, 0f);
+            final float u0 = pU;
+            ipV0 = roiBot - 0.5f;
+            imageToPlane(u0, ipV0);
+            ipK = pixelSizeAt(qX, qY);
+            final float xb = qX;
+            planeToImage(xb, 0f); ipU0 = pU;
+            planeToImage(xb + 1.5f, 0f);
+            ipSlope = (pU - ipU0) / Math.max(1f, ipV0 - pV);
+            cfg.pathFloorSpace = f2;
+            if (!f2) lineW = Math.max(3f, calWA + calWB * ipV0) * ipK;
+        }
+        // ── legacy (v2) references for FrameData / getters ──
+        {
+            final int hr = (hRoiTop + hRoiBot) / 2;
+            float bestD = Float.MAX_VALUE; float col = imgW * 0.5f;
+            for (int j = 0; j < n; j++) if (clean[j] && Math.abs(cgRow[j] - hr) < bestD) { bestD = Math.abs(cgRow[j] - hr); col = cC[j]; }
+            steerRefX = col; trackRefX = col;
+            calibWidthPx = Math.max(1f, calWA + calWB * hr);
+            lastCentroidX = Math.round(col);
+            lastTrackWidthPx = calibWidthPx;
+        }
+        roiFarFwd = 0f;
+        if (imageToPlane(imgW * 0.5f, roiTop + 0.5f)) roiFarFwd = qX;
+        // ── initial path memory: the calibrated straight line ──
+        resetPathState();
+        final float step = Math.max(0.02f, cfg.pathStep);
+        final float xs = -(cfg.pursuitPivotBehind + 0.2f);
+        for (float x = xs; x <= roiFarFwd && memN < NODE_MAX; x += step) {
+            memX[memN] = x; memY[memN] = 0f; memConf[memN] = 1f; memAge[memN] = 0; memN++;
+        }
+        v3Ready = true;
+        calibrated = true;
+        calibIssue = ISSUE_NONE;
+    }
+
+    /** Forget the traced path, the motion estimate and the control state. */
+    private void resetPathState() {
+        memN = 0; ndN = 0;
+        velX = 0f; velY = 0f; velT = 0f; corrX = 0f; corrY = 0f; corrT = 0f;
+        v3Tracking = 100f; v3LostFrames = 0; v3HoldFrames = 0; v3LastSteer = 0f;
+        prGain = 1f; pathEnd = END_OUT; pathExitSide = 0f;
+        ctTarget = false;
+        ctCurvAheadPrev = 0f;
+    }
+
+    /** During calibration the overlay shows the rows where the line was found (path arrays). */
+    private void fillCalibPath() {
+        ndN = 0;
+        if (cgRow == null) return;
+        for (int j = 0; j < cgN && ndN < NODE_MAX; j += 3) {
+            if (cgClean[j] == 0) continue;
+            ndX[ndN] = cgSumC[j] / cgClean[j];          // image column (calibration only)
+            ndY[ndN] = cgRow[j] + 0.5f;
+            ndSrc[ndN] = PATH_SRC_FRESH;
+            ndN++;
+        }
+    }
+
+    // =========================================================================
+    //  v3 — tracing the path (hot path: no allocation)
+    // =========================================================================
+
+    /** Unit normals (pointing right of the path direction) of polyline x/y[0…n). */
+    private static void normals(float[] x, float[] y, int n, float[] nx, float[] ny) {
+        for (int i = 0; i < n; i++) {
+            final int a = Math.max(0, i - 1), b = Math.min(n - 1, i + 1);
+            float tx = x[b] - x[a], ty = y[b] - y[a];
+            final float len = (float) Math.sqrt(tx * tx + ty * ty);
+            if (len < 1e-6f) { tx = 1f; ty = 0f; } else { tx /= len; ty /= len; }
+            nx[i] = -ty; ny[i] = tx;
+        }
+    }
+
+    /** Move the remembered path by the predicted robot motion (constant velocity) and age it. */
+    private void predictMemory() {
+        // Prior: a robot that follows the path turns at (speed × path curvature);
+        // the measurements correct this every frame.
+        velT += 0.25f * (velX * ctCurv - velT);
+        final float c = (float) Math.cos(velT), s = (float) Math.sin(velT);
+        // While the path is being tracked (the motion is registered every frame) the
+        // memory stays valid much longer; it fades at the full rate only while
+        // nothing is measured.
+        final float life = Math.max(1, cfg.pathMemoryFrames) * (v3LostFrames == 0 ? 4f : 1f);
+        final float decay = (float) Math.exp(-1.0 / life);
+        final float a = cfg.pursuitPivotBehind;
+        for (int i = 0; i < memN; i++) {
+            // the robot moved forward velX and turned velT (+ = right) about its axle
+            // (a wheeled robot cannot slide sideways): p' = R(−velT)·(p − (velX,0) − P) + P
+            final float dx = memX[i] - velX + a, dy = memY[i];
+            memX[i] = c * dx + s * dy - a;
+            memY[i] = -s * dx + c * dy;
+            memConf[i] *= decay;
+            if (memAge[i] < Short.MAX_VALUE) memAge[i]++;
+        }
+    }
+
+    /**
+     * Trace the path using the remembered path as the prediction. Fills nd*; false
+     * if the memory is clearly contradicted (clean floor where it says the line is,
+     * nowhere confirmed) — the caller then searches from scratch.
+     */
+    private boolean traceWithMemory() {
+        final int n = memN;
+        ndN = n;
+        for (int i = 0; i < n; i++) {
+            ndPX[i] = memX[i]; ndPY[i] = memY[i]; ndConf[i] = memConf[i]; ndAge[i] = memAge[i];
+            ndSt[i] = ST_NONE; ndR[i] = 0f; ndQ[i] = 0f; ndSrc[i] = PATH_SRC_MEMORY;
+        }
+        normals(ndPX, ndPY, n, ndNX, ndNY);
+        for (int i = 0; i < n; i++) if (!insideRoi(ndPX[i], ndPY[i], 2f)) ndSt[i] = ST_OUT;
+
+        final int dir = cfg.pathTraceDirection;
+        if (dir == TRACE_TOP_DOWN) walkMemory(n - 1, -1, -1); else walkMemory(0, n, 1);
+        if (dir == TRACE_BOTH) fillGaps();
+
+        int meas = 0, absent = 0, unrel = 0;
+        for (int i = 0; i < n; i++) {
+            if (ndSt[i] == ST_MEAS) meas++; else if (ndSt[i] == ST_ABSENT) absent++; else if (ndSt[i] == ST_UNREL) unrel++;
+        }
+        if (meas == 0 && absent >= 2 && absent >= unrel) return false;
+
+        estimateCorrection();
+        assembleFromMemory();
+        // Trailing points at the far end that are clean floor now: the path does not go there.
+        while (ndN > 0 && ndSt[ndN - 1] == ST_ABSENT) ndN--;
+        // Far end: continue into newly visible territory; near end: down to the ROI bottom.
+        pathEnd = END_OUT;
+        if (ndN >= 2) extendPath(true);
+        if (ndN >= 2) extendPath(false);
+        return ndN >= 2;
+    }
+
+    /** Walk the remembered points in index order a → b (step ±1), measuring visible ones. */
+    private void walkMemory(int a, int b, int step) {
+        final float ds = Math.max(0.02f, cfg.pathStep);
+        boolean have = false;
+        float rLast = 0f, gLast = 0f; int iLast = 0;
+        for (int i = a; i != b; i += step) {
+            if (ndSt[i] == ST_OUT) continue;
+            final float wExp = widthAt(ndPX[i], ndPY[i]);
+            final int gapN = have ? Math.abs(i - iLast) : 0;
+            float pred = have ? rLast + gLast * (i - iLast) * ds : 0f;
+            pred = Math.max(-2.5f * wExp, Math.min(2.5f * wExp, pred));
+            final float age = Math.min(60, ndAge[i]);
+            float gate = (have ? 0.5f : 0.9f) * wExp + 0.01f * age * wExp + 0.12f * wExp * gapN;
+            gate = Math.min(2.5f * wExp, gate);
+            measureAt(ndPX[i] + pred * ndNX[i], ndPY[i] + pred * ndNY[i], ndNX[i], ndNY[i], gate, wExp);
+            ndSt[i] = msStatus;
+            if (msStatus == ST_MEAS) {
+                final float r = pred + msOff;
+                ndR[i] = r; ndQ[i] = msQual;
+                if (have) {
+                    final float g = (r - rLast) / ((i - iLast) * ds);
+                    gLast = Math.max(-0.6f, Math.min(0.6f, 0.5f * gLast + 0.5f * g));
+                }
+                rLast = r; iLast = i; have = true;
+            }
+        }
+    }
+
+    /** Re-read runs of unmeasured visible points lying between two measured points, interpolating from both sides. */
+    private void fillGaps() {
+        final int n = ndN;
+        int i = 0;
+        while (i < n) {
+            if (ndSt[i] != ST_MEAS) { i++; continue; }
+            int j = i + 1;
+            while (j < n && ndSt[j] != ST_MEAS) j++;
+            if (j >= n) break;
+            if (j - i > 1) {
+                for (int k = i + 1; k < j; k++) {
+                    if (ndSt[k] == ST_OUT) continue;
+                    final float t = (k - i) / (float) (j - i);
+                    final float pred = ndR[i] + t * (ndR[j] - ndR[i]);
+                    final float wExp = widthAt(ndPX[k], ndPY[k]);
+                    final int dist = Math.min(k - i, j - k);
+                    final float gate = Math.min(2f * wExp, 0.45f * wExp + 0.08f * wExp * dist);
+                    measureAt(ndPX[k] + pred * ndNX[k], ndPY[k] + pred * ndNY[k], ndNX[k], ndNY[k], gate, wExp);
+                    if (msStatus == ST_MEAS) { ndSt[k] = ST_MEAS; ndR[k] = pred + msOff; ndQ[k] = msQual; }
+                    else if (ndSt[k] != ST_ABSENT || msStatus == ST_UNREL) ndSt[k] = msStatus;
+                }
+            }
+            i = j;
+        }
+    }
+
+    /**
+     * Robot-motion correction from the measured points: the small rigid motion
+     * (corrX, corrY, corrT) that best moves the predicted path onto the measured
+     * one (normal residuals, weighted least squares with a weak prior; Huber).
+     * Along a straight line the motion along the line is not observable and stays
+     * at the prediction — it does not matter there.
+     */
+    private void estimateCorrection() {
+        corrX = 0f; corrY = 0f; corrT = 0f;
+        final float hub = 0.3f * lineW, a = cfg.pursuitPivotBehind;
+        for (int it = 0; it < 2; it++) {
+            double a00 = 0, a01 = 0, a11 = 0, b0 = 0, b1 = 0, sw = 0;
+            int m = 0;
+            for (int i = 0; i < ndN; i++) {
+                if (ndSt[i] != ST_MEAS) continue;
+                // 2 degrees of freedom: travel along x, rotation about the axle (x = −a)
+                final double jx = ndNX[i], jt = ndNY[i] * (ndPX[i] + a) - ndNX[i] * ndPY[i];
+                double w = ndQ[i];
+                if (it > 0) {
+                    final double res = Math.abs(ndR[i] - (jx * corrX + jt * corrT));
+                    if (res > hub) w *= hub / res;
+                }
+                a00 += w * jx * jx; a01 += w * jx * jt; a11 += w * jt * jt;
+                b0 += w * jx * ndR[i]; b1 += w * jt * ndR[i];
+                sw += w; m++;
+            }
+            if (m < 2) return;
+            a00 += 0.05 * sw; a11 += 0.01 * sw;
+            final double det = a00 * a11 - a01 * a01;
+            if (Math.abs(det) < 1e-12) return;
+            corrX = (float) Math.max(-0.3, Math.min(0.3, (a11 * b0 - a01 * b1) / det));
+            corrT = (float) Math.max(-0.15, Math.min(0.15, (a00 * b1 - a01 * b0) / det));
+        }
+        corrY = corrT * a;
+    }
+
+    /**
+     * Final positions: measured points where measured; elsewhere the remembered
+     * point moved by the motion correction plus the remaining residual interpolated
+     * from the nearest measured points (so a hidden section bends with its ends).
+     */
+    private void assembleFromMemory() {
+        final int n = ndN;
+        final float decayAbsent = 0.6f;
+        for (int i = 0; i < n; i++) {
+            final float px = ndPX[i], py = ndPY[i], nx = ndNX[i], ny = ndNY[i];
+            if (ndSt[i] == ST_MEAS) {
+                ndX[i] = px + ndR[i] * nx; ndY[i] = py + ndR[i] * ny;
+                ndConf[i] = Math.max(ndQ[i], Math.min(1f, ndConf[i] + ndQ[i]));
+                ndAge[i] = 0;
+                ndSrc[i] = PATH_SRC_FRESH;
+                continue;
+            }
+            final float bx = px + corrX - corrT * py, by = py + corrT * (px + cfg.pursuitPivotBehind);
+            // remaining residual from the nearest measured neighbours
+            int lo = i - 1; while (lo >= 0 && ndSt[lo] != ST_MEAS) lo--;
+            int hi = i + 1; while (hi < n && ndSt[hi] != ST_MEAS) hi++;
+            float rr = 0f;
+            if (lo >= 0 && hi < n) {
+                final float rl = ndR[lo] - rigidN(lo), rh = ndR[hi] - rigidN(hi);
+                rr = rl + (rh - rl) * (i - lo) / (float) (hi - lo);
+            } else if (lo >= 0) {
+                rr = (ndR[lo] - rigidN(lo)) * Math.max(0f, 1f - (i - lo) / 8f);
+            } else if (hi < n) {
+                rr = (ndR[hi] - rigidN(hi)) * Math.max(0f, 1f - (hi - i) / 8f);
+            }
+            ndX[i] = bx + rr * nx; ndY[i] = by + rr * ny;
+            // "Absent" between two measured sections is a gap (the line is hidden by
+            // something that looks like the floor), not the end of the line.
+            if (ndSt[i] == ST_ABSENT && lo >= 0 && hi < n) ndSt[i] = ST_UNREL;
+            if (ndSt[i] == ST_ABSENT) ndConf[i] *= decayAbsent;
+            ndSrc[i] = ndSt[i] == ST_UNREL ? PATH_SRC_UNRELIABLE : PATH_SRC_MEMORY;
+        }
+    }
+
+    /** Normal displacement of point i under the rigid correction. */
+    private float rigidN(int i) {
+        return ndNX[i] * corrX + (ndNY[i] * (ndPX[i] + cfg.pursuitPivotBehind) - ndNX[i] * ndPY[i]) * corrT;
+    }
+
+    /** Append (far = true) or prepend a point. */
+    private boolean addNode(boolean far, float x, float y, byte st, byte src, float conf, float q) {
+        if (ndN >= NODE_MAX) return false;
+        int i = ndN;
+        if (!far) {
+            for (int k = ndN; k > 0; k--) {
+                ndX[k] = ndX[k - 1]; ndY[k] = ndY[k - 1]; ndSt[k] = ndSt[k - 1]; ndSrc[k] = ndSrc[k - 1];
+                ndConf[k] = ndConf[k - 1]; ndQ[k] = ndQ[k - 1]; ndAge[k] = ndAge[k - 1];
+            }
+            i = 0;
+        }
+        ndX[i] = x; ndY[i] = y; ndSt[i] = st; ndSrc[i] = src; ndConf[i] = conf; ndQ[i] = q; ndAge[i] = 0;
+        ndN++;
+        return true;
+    }
+
+    /** Index of the k-th point from the far (or near) end. */
+    private int endIdx(boolean far, int k) { return far ? ndN - 1 - k : k; }
+
+    /**
+     * Continue the path beyond its far end (or before its near end) into territory
+     * not remembered yet: predict the next point from the end direction and
+     * curvature, measure across it, and repeat. An unreadable stretch is bridged
+     * (up to Config.pathMaxGap) and kept only if the line is found again beyond
+     * it. Clean floor ahead triggers a corner search (a sharp turn) and then a
+     * jump search (the line continues after a floor-coloured object); if both fail
+     * the path ends there.
+     */
+    private void extendPath(boolean far) {
+        final float ds = Math.max(0.02f, cfg.pathStep);
+        final int e0 = endIdx(far, 0), e1 = endIdx(far, Math.min(ndN - 1, 2));
+        // the end must be in view (else there is nothing to see beyond it)
+        if (!insideRoi(ndX[e0], ndY[e0], 1f)) {
+            if (far && planeToImage(ndX[e0], ndY[e0])) {
+                pathEnd = END_OUT;
+                pathExitSide = pU < imgW * 0.5f ? -1f : 1f;
+                if (pV < roiTop + 2f) pathExitSide = 0f;
+            }
+            return;
+        }
+        float hx = ndX[e0] - ndX[e1], hy = ndY[e0] - ndY[e1];
+        float len = (float) Math.sqrt(hx * hx + hy * hy);
+        if (len < 1e-6f) return;
+        hx /= len; hy /= len;
+        float kappa = endCurvature(far) * (far ? 1f : -1f);
+        float lx = ndX[e0], ly = ndY[e0];          // last measured (or end) point
+        int pending = 0;                           // unmeasured points appended since the last measurement
+        int absentRun = 0;
+        float gap = 0f;
+        final int budget = NODE_MAX - ndN;
+        for (int step = 0; step < budget; step++) {
+            // rotate the direction by the curvature (decaying, so a wrong estimate cannot spiral)
+            final float a = kappa * ds;
+            final float c = (float) Math.cos(a), s = (float) Math.sin(a);
+            final float nhx = c * hx - s * hy, nhy = s * hx + c * hy;
+            hx = nhx; hy = nhy;
+            kappa *= 0.9f;
+            final float px = lx + ds * hx * (pending + 1), py = ly + ds * hy * (pending + 1);
+            final float nx = -hy, ny = hx;
+            if (!insideRoi(px, py, 1f)) {
+                if (far) {
+                    pathEnd = END_OUT;
+                    planeToImage(px, py);
+                    pathExitSide = pU < imgW * 0.5f ? -1f : 1f;
+                    if (pV < roiTop + 2f) pathExitSide = 0f;
+                }
+                break;
+            }
+            final float wExp = widthAt(px, py);
+            final float gate = Math.min(3f * wExp, 0.7f * wExp + 0.3f * wExp * pending);
+            measureAt(px, py, nx, ny, gate, wExp);
+            if (msStatus == ST_MEAS) {
+                final float mx = px + msOff * nx, my = py + msOff * ny;
+                // bridge points get positions on the straight segment last → this one
+                for (int k = 0; k < pending; k++) {
+                    final int idx = endIdx(far, pending - 1 - k);
+                    final float t = (k + 1f) / (pending + 1f);
+                    ndX[idx] = lx + t * (mx - lx); ndY[idx] = ly + t * (my - ly);
+                }
+                if (!addNode(far, mx, my, ST_MEAS, PATH_SRC_FRESH, msQual, msQual)) break;
+                // new direction from the measured points (smoothed)
+                float dx = mx - lx, dy = my - ly;
+                final float dl = (float) Math.sqrt(dx * dx + dy * dy);
+                if (dl > 1e-6f) {
+                    dx /= dl; dy /= dl;
+                    final float cross = hx * dy - hy * dx;            // turn since the prediction
+                    kappa = Math.max(-2.5f, Math.min(2.5f, kappa + 0.5f * cross / Math.max(ds, dl)));
+                    hx = 0.5f * hx + 0.5f * dx; hy = 0.5f * hy + 0.5f * dy;
+                    final float hl = (float) Math.sqrt(hx * hx + hy * hy); hx /= hl; hy /= hl;
+                }
+                lx = mx; ly = my; pending = 0; absentRun = 0; gap = 0f;
+                continue;
+            }
+            if (msStatus == ST_OUT) { if (far) pathEnd = END_OUT; break; }
+            if (msStatus == ST_ABSENT) absentRun++; else absentRun = 0;
+            gap += ds;
+            if (absentRun >= 2 || (msStatus == ST_ABSENT && pending == 0 && absentRun >= 1 && step == 0)) {
+                // clean floor where the path should continue: a corner, or a hidden piece, or the end
+                removeTrailing(far, pending); pending = 0;
+                if (cornerSearch(far, lx, ly, hx, hy)) {
+                    final int i0 = endIdx(far, 0), i1 = endIdx(far, 1);
+                    hx = ndX[i0] - ndX[i1]; hy = ndY[i0] - ndY[i1];
+                    final float hl = (float) Math.sqrt(hx * hx + hy * hy); hx /= hl; hy /= hl;
+                    lx = ndX[i0]; ly = ndY[i0]; kappa = 0f; absentRun = 0; gap = 0f;
+                    continue;
+                }
+                if (jumpSearch(far, lx, ly, hx, hy, kappa / 0.9f)) {
+                    final int i0 = endIdx(far, 0);
+                    lx = ndX[i0]; ly = ndY[i0]; absentRun = 0; gap = 0f;
+                    continue;
+                }
+                if (far) pathEnd = END_ABSENT;
+                break;
+            }
+            if (gap > cfg.pathMaxGap) { removeTrailing(far, pending); pending = 0; if (far) pathEnd = END_UNKNOWN; break; }
+            if (!addNode(far, px, py, msStatus, PATH_SRC_PREDICTED, 0.25f, 0f)) break;
+            pending++;
+        }
+        if (pending > 0) { removeTrailing(far, pending); if (far && pathEnd == END_OUT) pathEnd = END_UNKNOWN; }
+    }
+
+    /** Remove the last {@code k} points at the far (or near) end. */
+    private void removeTrailing(boolean far, int k) {
+        if (k <= 0) return;
+        if (far) { ndN = Math.max(0, ndN - k); return; }
+        final int m = Math.min(k, ndN);
+        for (int i = m; i < ndN; i++) {
+            ndX[i - m] = ndX[i]; ndY[i - m] = ndY[i]; ndSt[i - m] = ndSt[i]; ndSrc[i - m] = ndSrc[i];
+            ndConf[i - m] = ndConf[i]; ndQ[i - m] = ndQ[i]; ndAge[i - m] = ndAge[i];
+        }
+        ndN -= m;
+    }
+
+    /** Curvature of the path near its far (near) end, from the last three points (1/plane unit, + = right). */
+    private float endCurvature(boolean far) {
+        if (ndN < 5) return 0f;
+        final int a = endIdx(far, 0), b = endIdx(far, 2), c = endIdx(far, 4);
+        final float x1 = ndX[c], y1 = ndY[c], x2 = ndX[b], y2 = ndY[b], x3 = ndX[a], y3 = ndY[a];
+        final float ax = x2 - x1, ay = y2 - y1, bx = x3 - x2, by = y3 - y2;
+        final float la = (float) Math.sqrt(ax * ax + ay * ay), lb = (float) Math.sqrt(bx * bx + by * by);
+        if (la < 1e-6f || lb < 1e-6f) return 0f;
+        final float cross = ax * by - ay * bx;
+        final float k = 2f * cross / (la * lb * (la + lb));
+        return Math.max(-2f, Math.min(2f, (far ? 1f : -1f) * k));
+    }
+
+    /** The line turns sharply: probe directions turned up to ±100° from the last point. */
+    private boolean cornerSearch(boolean far, float lx, float ly, float hx, float hy) {
+        final float ds = Math.max(0.02f, cfg.pathStep);
+        final float[] angles = {25f, 40f, 55f, 70f, 85f, 100f};
+        float bestQ = 0f, bx = 0f, by = 0f;
+        for (float ang : angles) {
+            for (int sgn = -1; sgn <= 1; sgn += 2) {
+                final double a = Math.toRadians(ang * sgn);
+                final float c = (float) Math.cos(a), s = (float) Math.sin(a);
+                final float dx = c * hx - s * hy, dy = s * hx + c * hy;
+                for (float d = 1.5f; d <= 2.6f; d += 1.0f) {
+                    final float px = lx + d * ds * dx, py = ly + d * ds * dy;
+                    if (!insideRoi(px, py, 1f)) continue;
+                    final float wExp = widthAt(px, py);
+                    measureAt(px, py, -dy, dx, 0.5f * wExp, wExp);
+                    if (msStatus == ST_MEAS && msQual >= 0.75f && msQual > bestQ + 0.05f) {
+                        bestQ = msQual; bx = px - msOff * dy; by = py + msOff * dx;
+                    }
+                }
+            }
+            if (bestQ > 0f) break;          // prefer the gentlest turn that works
+        }
+        if (bestQ <= 0f) return false;
+        return addNode(far, bx, by, ST_MEAS, PATH_SRC_FRESH, bestQ, bestQ);
+    }
+
+    /** The line may continue after a floor-coloured object: look further along the direction. */
+    private boolean jumpSearch(boolean far, float lx, float ly, float hx, float hy, float kappa) {
+        final float ds = Math.max(0.02f, cfg.pathStep);
+        for (float d = 3f; d * ds <= cfg.pathMaxGap; d += 1.5f) {
+            // follow the current curvature along the gap (chord of the arc)
+            final float ang = 0.5f * kappa * d * ds;
+            final float ca = (float) Math.cos(ang), sa = (float) Math.sin(ang);
+            final float ux = ca * hx - sa * hy, uy = sa * hx + ca * hy;
+            final float ang2 = kappa * d * ds;
+            final float tx = (float) Math.cos(ang2) * hx - (float) Math.sin(ang2) * hy, ty = (float) Math.sin(ang2) * hx + (float) Math.cos(ang2) * hy;
+            final float px = lx + d * ds * ux, py = ly + d * ds * uy;
+            if (!insideRoi(px, py, 1f)) return false;
+            final float wExp = widthAt(px, py);
+            measureAt(px, py, -ty, tx, Math.min(2f * wExp, 0.5f * wExp + 0.05f * d * wExp), wExp);
+            if (msStatus == ST_MEAS && msQual >= 0.75f) {
+                final float mx = px - msOff * ty, my = py + msOff * tx;
+                final int k = (int) d;
+                for (int i = 1; i < k; i++) {
+                    final float t = i / (float) k;
+                    if (!addNode(far, lx + t * (mx - lx), ly + t * (my - ly), ST_UNREL, PATH_SRC_PREDICTED, 0.25f, 0f)) return false;
+                }
+                return addNode(far, mx, my, ST_MEAS, PATH_SRC_FRESH, msQual, msQual);
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Find the path from scratch: scan a few image rows across the full width for a
+     * run with the line's colour, width and clean edges (preferring straight
+     * ahead, or the side where the line was last seen), find its direction, and
+     * trace from there in both directions. Rows are tried near → far, or far →
+     * near with TRACE_TOP_DOWN.
+     */
+    private boolean acquire() {
+        ndN = 0;
+        pathEnd = END_OUT;
+        final int rows = 8;
+        final boolean topDown = cfg.pathTraceDirection == TRACE_TOP_DOWN;
+        for (int k = 0; k < rows; k++) {
+            final int kk = topDown ? rows - 1 - k : k;
+            final float fr = (kk + 0.5f) / rows;
+            final int row = Math.max(roiTop + 1, Math.min(roiBot - 3, Math.round(roiBot - 2 - fr * (roiBot - roiTop - 4))));
+            if (!seedRow(row)) continue;
+            final float sx = qX, sy = qY, sq = msQual;
+            // direction: probe a fan of directions
+            final float ds = Math.max(0.02f, cfg.pathStep);
+            final float base = topDown ? (float) Math.PI : 0f;
+            float bestS = 0f, bdx = 0f, bdy = 0f, bmx = 0f, bmy = 0f;
+            for (int a = -8; a <= 8; a++) {
+                final double ang = base + Math.toRadians(10 * a);
+                final float dx = (float) Math.cos(ang), dy = (float) Math.sin(ang);
+                final float px = sx + 1.5f * ds * dx, py = sy + 1.5f * ds * dy;
+                if (!insideRoi(px, py, 1f)) continue;
+                final float wExp = widthAt(px, py);
+                measureAt(px, py, -dy, dx, 0.45f * wExp, wExp);
+                if (msStatus != ST_MEAS) continue;
+                final float score = msQual * (1f - 0.25f * Math.abs(a) / 8f);
+                if (score > bestS) { bestS = score; bdx = dx; bdy = dy; bmx = px - msOff * dy; bmy = py + msOff * dx; }
+            }
+            if (bestS <= 0f) continue;
+            // two points: the seed and the probe, ordered near → far
+            final boolean probeFar = bmx >= sx;
+            ndN = 0;
+            if (probeFar) { addNode(true, sx, sy, ST_MEAS, PATH_SRC_FRESH, sq, sq); addNode(true, bmx, bmy, ST_MEAS, PATH_SRC_FRESH, bestS, bestS); }
+            else          { addNode(true, bmx, bmy, ST_MEAS, PATH_SRC_FRESH, bestS, bestS); addNode(true, sx, sy, ST_MEAS, PATH_SRC_FRESH, sq, sq); }
+            extendPath(true);
+            extendPath(false);
+            if (ndN >= 3) {
+                for (int i = 0; i < ndN; i++) ndAge[i] = 0;
+                return true;
+            }
+        }
+        ndN = 0;
+        return false;
+    }
+
+    /** Best line candidate on image row {@code row} (full width). Sets qX / qY (plane) and msQual. */
+    private boolean seedRow(int row) {
+        final float wPx = Math.max(4f, calWA + calWB * (row + 0.5f));
+        final int step = Math.max(2, Math.round(wPx / 9f));
+        scanRowSamples(row, step);
+        final int n = prN;
+        // preferred column: straight ahead (robot frame y = pref) at this row's distance
+        float prefU = imgW * 0.5f;
+        if (imageToPlane(imgW * 0.5f, row + 0.5f) && planeToImage(qX, v3PrefLateral())) prefU = pU;
+        float best = 0f, bestC = -1f, bestQ = 0f;
+        int i = 0;
+        while (i < n) {
+            if (prCls[i] != CL_LINE) { i++; continue; }
+            final int a = i; int b = i, q = i + 1;
+            while (q < n) {
+                if (prCls[q] == CL_LINE) { b = q; q++; }
+                else if (prCls[q] == CL_UNK && q + 1 < n && prCls[q + 1] == CL_LINE) q++;
+                else break;
+            }
+            i = b + 1;
+            final boolean cl = a > 0 && prCls[a - 1] == CL_FLOOR, cr = b + 1 < n && prCls[b + 1] == CL_FLOOR;
+            if (!cl && !cr) continue;
+            final float eL = cl ? edgePos(a - 1) : prH0 + (a - 0.5f) * prStep;
+            final float eR = cr ? edgePos(b) : prH0 + (b + 0.5f) * prStep;
+            final float ratio = (eR - eL) / wPx;
+            float c, qual;
+            if (cl && cr) { if (ratio < 0.6f || ratio > 1.5f) continue; c = 0.5f * (eL + eR); qual = 1f - 0.4f * Math.abs(ratio - 1f); }
+            else {
+                if (ratio > 1.3f) continue;
+                // cut by the image edge: fine; cut by unknown pixels: lower quality
+                final boolean atEdge = (!cl && a == 0) || (!cr && b == n - 1);
+                if (!atEdge && ratio < 0.5f) continue;
+                c = cl ? eL + 0.5f * wPx : eR - 0.5f * wPx; qual = atEdge ? 0.8f : 0.55f;
+            }
+            final float d = (c - prefU) / (imgW * 0.3f);
+            final float score = qual / (1f + d * d);
+            if (score > best) { best = score; bestC = c; bestQ = qual; }
+        }
+        if (bestC < 0f || bestQ < 0.55f) return false;
+        if (!imageToPlane(bestC, row + 0.5f)) return false;
+        msQual = bestQ;
+        return true;
+    }
+
+    /** Lateral position (robot frame) where re-acquisition looks first. */
+    private float v3PrefLateral() {
+        return v3LostFrames > 0 ? 0.6f * pathExitSide * Math.max(0.5f, roiFarFwd * 0.25f) : 0f;
+    }
+
+    // =========================================================================
+    //  v3 — path post-processing and control
+    // =========================================================================
+
+    /**
+     * Re-sample the path at equal steps (Config.pathStep) from its first point, and
+     * drop points behind the robot's turning point. Status / source / confidence /
+     * age are taken from the nearer original point; FRESH wins over the others.
+     */
+    private void resamplePath() {
+        final float ds = Math.max(0.02f, cfg.pathStep);
+        final float xMin = -(cfg.pursuitPivotBehind + 0.4f);
+        int start = 0;
+        while (start < ndN - 2 && ndX[start + 1] < xMin) start++;
+        int m = 0;
+        float acc = 0f;               // distance along the original polyline to the next output point
+        tmpA[m] = ndX[start]; tmpB[m] = ndY[start]; tmpC[m] = ndConf[start]; tmpS[m] = ndSt[start]; tmpT[m] = ndSrc[start]; tmpG[m] = ndAge[start]; m++;
+        for (int i = start; i < ndN - 1 && m < NODE_MAX; i++) {
+            final float dx = ndX[i + 1] - ndX[i], dy = ndY[i + 1] - ndY[i];
+            final float seg = (float) Math.sqrt(dx * dx + dy * dy);
+            if (seg < 1e-6f) continue;
+            float pos = ds - acc;
+            while (pos <= seg && m < NODE_MAX) {
+                final float t = pos / seg;
+                final int near = t < 0.5f ? i : i + 1, other = near == i ? i + 1 : i;
+                tmpA[m] = ndX[i] + t * dx; tmpB[m] = ndY[i] + t * dy;
+                final boolean fresh = ndSrc[near] == PATH_SRC_FRESH || (ndSrc[other] == PATH_SRC_FRESH && Math.abs(t - 0.5f) < 0.25f);
+                tmpS[m] = fresh && ndSt[near] != ST_MEAS ? ST_MEAS : ndSt[near];
+                tmpT[m] = fresh ? PATH_SRC_FRESH : ndSrc[near];
+                tmpC[m] = ndConf[i] + t * (ndConf[i + 1] - ndConf[i]);
+                tmpG[m] = (short) Math.min(ndAge[i], ndAge[i + 1]);
+                m++;
+                pos += ds;
+            }
+            acc = seg - (pos - ds);
+        }
+        for (int i = 0; i < m; i++) {
+            ndX[i] = tmpA[i]; ndY[i] = tmpB[i]; ndConf[i] = tmpC[i]; ndSt[i] = tmpS[i]; ndSrc[i] = tmpT[i]; ndAge[i] = tmpG[i];
+        }
+        ndN = m;
+    }
+
+    /**
+     * Smooth, outlier-robust curve through the path points: at every point a
+     * weighted local quadratic (x(s), y(s) over ±3 points, tricube × confidence
+     * weights) gives position, direction and curvature; then points far from the
+     * curve (Tukey) are down-weighted and the fit repeated.
+     */
+    private void smoothPath() {
+        final int n = ndN, K = 3;
+        for (int i = 0; i < n; i++) {
+            float w = ndConf[i];
+            if (ndSrc[i] == PATH_SRC_FRESH) w = Math.max(0.3f, w);
+            else if (ndSrc[i] == PATH_SRC_PREDICTED) w *= 0.3f;
+            else w *= 0.6f;
+            smW[i] = Math.max(1e-3f, w);
+            tmpC[i] = 1f;                                   // robust weight
+        }
+        for (int pass = 0; pass < 2; pass++) {
+            for (int i = 0; i < n; i++) {
+                double s0 = 0, s1 = 0, s2 = 0, s3 = 0, s4 = 0, x0 = 0, x1 = 0, x2 = 0, y0 = 0, y1 = 0, y2 = 0;
+                for (int j = Math.max(0, i - K); j <= Math.min(n - 1, i + K); j++) {
+                    final double t = j - i, u = Math.abs(t) / (K + 1.0);
+                    final double tri = (1 - u * u * u); final double w = smW[j] * tmpC[j] * tri * tri * tri;
+                    s0 += w; s1 += w * t; s2 += w * t * t; s3 += w * t * t * t; s4 += w * t * t * t * t;
+                    x0 += w * ndX[j]; x1 += w * t * ndX[j]; x2 += w * t * t * ndX[j];
+                    y0 += w * ndY[j]; y1 += w * t * ndY[j]; y2 += w * t * t * ndY[j];
+                }
+                final double det = s0 * (s2 * s4 - s3 * s3) - s1 * (s1 * s4 - s3 * s2) + s2 * (s1 * s3 - s2 * s2);
+                if (Math.abs(det) < 1e-9 || n < 3) {
+                    smX[i] = ndX[i]; smY[i] = ndY[i];
+                    final int a = Math.max(0, i - 1), b = Math.min(n - 1, i + 1);
+                    float tx = ndX[b] - ndX[a], ty = ndY[b] - ndY[a];
+                    final float l = (float) Math.sqrt(tx * tx + ty * ty);
+                    smTX[i] = l > 1e-6f ? tx / l : 1f; smTY[i] = l > 1e-6f ? ty / l : 0f; smK[i] = 0f;
+                    continue;
+                }
+                // Cramer for [s0 s1 s2; s1 s2 s3; s2 s3 s4]·(c0,c1,c2) = (r0,r1,r2)
+                final double ax0 = cramer(s0, s1, s2, s3, s4, x0, x1, x2, 0, det), ax1 = cramer(s0, s1, s2, s3, s4, x0, x1, x2, 1, det),
+                             ax2 = cramer(s0, s1, s2, s3, s4, x0, x1, x2, 2, det);
+                final double ay0 = cramer(s0, s1, s2, s3, s4, y0, y1, y2, 0, det), ay1 = cramer(s0, s1, s2, s3, s4, y0, y1, y2, 1, det),
+                             ay2 = cramer(s0, s1, s2, s3, s4, y0, y1, y2, 2, det);
+                smX[i] = (float) ax0; smY[i] = (float) ay0;
+                final double sp = Math.sqrt(ax1 * ax1 + ay1 * ay1);
+                if (sp < 1e-9) { smTX[i] = 1f; smTY[i] = 0f; smK[i] = 0f; continue; }
+                smTX[i] = (float) (ax1 / sp); smTY[i] = (float) (ay1 / sp);
+                smK[i] = (float) Math.max(-5, Math.min(5, 2 * (ax1 * ay2 - ay1 * ax2) / (sp * sp * sp)));
+            }
+            if (pass == 1) {
+                // Curvature: change of direction over ±3 points of the smoothed curve
+                // (direction is much less noisy than a second derivative).
+                for (int i = 0; i < n; i++) {
+                    final int a = Math.max(0, i - 3), b = Math.min(n - 1, i + 3);
+                    if (b - a < 2) { tmpA[i] = 0f; continue; }
+                    float arc = 0f;
+                    for (int k = a; k < b; k++) arc += dist(smX[k + 1] - smX[k], smY[k + 1] - smY[k]);
+                    final float cr = smTX[a] * smTY[b] - smTY[a] * smTX[b], dt = smTX[a] * smTX[b] + smTY[a] * smTY[b];
+                    tmpA[i] = arc > 1e-6f ? (float) Math.atan2(cr, dt) / arc : 0f;
+                }
+                for (int i = 0; i < n; i++) smK[i] = tmpA[i];
+            }
+            if (pass == 0) {
+                final float c = 0.6f * Math.max(1e-3f, lineW);
+                for (int i = 0; i < n; i++) {
+                    final float dx = ndX[i] - smX[i], dy = ndY[i] - smY[i];
+                    final float r = (float) Math.sqrt(dx * dx + dy * dy) / c;
+                    tmpC[i] = r >= 1f ? 0.02f : (1f - r * r) * (1f - r * r);
+                }
+            }
+        }
+    }
+
+    /** Component {@code k} of the solution of the symmetric 3×3 moment system (Cramer). */
+    private static double cramer(double s0, double s1, double s2, double s3, double s4,
+                                 double r0, double r1, double r2, int k, double det) {
+        if (k == 0) return (r0 * (s2 * s4 - s3 * s3) - s1 * (r1 * s4 - s3 * r2) + s2 * (r1 * s3 - s2 * r2)) / det;
+        if (k == 1) return (s0 * (r1 * s4 - s3 * r2) - r0 * (s1 * s4 - s3 * s2) + s2 * (s1 * r2 - r1 * s2)) / det;
+        return (s0 * (s2 * r2 - r1 * s3) - s1 * (s1 * r2 - r1 * s2) + r0 * (s1 * s3 - s2 * s2)) / det;
+    }
+
+    /**
+     * Steering and tracking from the smoothed path.
+     *   Steering: pure pursuit — the point T of the path at distance L
+     *   (pursuitLookAhead) from the robot's turning point P; the arc from P through
+     *   T has curvature κ = 2·lateral / distance²; steering = steerPerCurvature·κ.
+     *   Tracking: 100 on a straight path, lower with the sharpest curvature within
+     *   powerPreview ahead, and lower when the known path ends (clean floor) before
+     *   the far edge of the view; scaled by the path confidence; rate-limited.
+     */
+    private void computeControl() {
+        final int n = ndN;
+        final float px = -cfg.pursuitPivotBehind, L = Math.max(0.05f, cfg.pursuitLookAhead);
+        ctTarget = false; ctKappa = 0f; ctSteer = 0f;
+        // robot point on the path: where the path crosses x = 0 (or its nearest point)
+        int iR = 0; float tR = 0f;
+        {
+            boolean found = false;
+            for (int i = 0; i < n - 1; i++) {
+                if ((smX[i] <= 0f && smX[i + 1] > 0f)) { iR = i; tR = -smX[i] / (smX[i + 1] - smX[i]); found = true; break; }
+            }
+            if (!found) { iR = 0; tR = 0f; }
+        }
+        final boolean before = smX[0] > 0f;             // path starts ahead of the camera's floor point
+        if (before) {
+            ctOffset = smY[0] - smX[0] * (smTX[0] > 0.05f ? smTY[0] / smTX[0] : 0f);
+            ctHeading = (float) Math.toDegrees(Math.atan2(smTY[0], smTX[0]));
+            ctCurv = smK[0];
+        } else {
+            final int j = Math.min(n - 1, iR + 1);
+            ctOffset = smY[iR] + tR * (smY[j] - smY[iR]);
+            ctHeading = (float) Math.toDegrees(Math.atan2(smTY[iR] + tR * (smTY[j] - smTY[iR]), smTX[iR] + tR * (smTX[j] - smTX[iR])));
+            ctCurv = smK[iR] + tR * (smK[j] - smK[iR]);
+        }
+        // closest point to the pivot, then the first point at distance ≥ L beyond it
+        int iC = 0; float dC = Float.MAX_VALUE;
+        for (int i = 0; i < n; i++) {
+            final float dx = smX[i] - px;
+            final float d = dx * dx + smY[i] * smY[i];
+            if (d < dC) { dC = d; iC = i; }
+        }
+        for (int i = Math.max(iC, 1); i < n; i++) {
+            final float d1 = dist(smX[i] - px, smY[i]);
+            if (d1 >= L) {
+                final float d0 = dist(smX[i - 1] - px, smY[i - 1]);
+                final float t = d1 - d0 > 1e-6f ? (L - d0) / (d1 - d0) : 1f;
+                final float tt = Math.max(0f, Math.min(1f, t));
+                ctTX = smX[i - 1] + tt * (smX[i] - smX[i - 1]);
+                ctTY = smY[i - 1] + tt * (smY[i] - smY[i - 1]);
+                ctTarget = true;
+                break;
+            }
+        }
+        if (!ctTarget && n >= 1) {
+            // path shorter than L: continue along its end direction
+            final int e = n - 1;
+            final float ex = smX[e] - px, ey = smY[e], tx = smTX[e], ty = smTY[e];
+            final float b = ex * tx + ey * ty, c = ex * ex + ey * ey - L * L;
+            final float disc = b * b - c;
+            final float tau = disc >= 0f ? -b + (float) Math.sqrt(disc) : 0f;
+            ctTX = smX[e] + Math.max(0f, tau) * tx; ctTY = smY[e] + Math.max(0f, tau) * ty;
+            ctTarget = true;
+        }
+        if (ctTarget) {
+            final float dx = ctTX - px, dy = ctTY;
+            final float d2 = Math.max(1e-4f, dx * dx + dy * dy);
+            ctKappa = 2f * dy / d2;
+            if (dx < 0f) ctKappa = Math.signum(dy) * Math.max(Math.abs(ctKappa), 2f / L);
+            ctSteer = Math.max(-50f, Math.min(50f, cfg.steerPerCurvature * ctKappa));
+        }
+        // ── path statistics ahead of the robot ──
+        float sRun = 0f, kMax = 0f, kSigned = 0f, len = 0f, confSum = 0f, wSum = 0f, memLen = 0f;
+        ctFresh = 0; ctMem = 0; ctUnrel = 0;
+        int lastKnown = -1;
+        for (int i = 0; i < n; i++) {
+            if (ndSrc[i] == PATH_SRC_FRESH) ctFresh++; else if (ndSrc[i] == PATH_SRC_UNRELIABLE) ctUnrel++; else ctMem++;
+        }
+        final int i0 = before ? 0 : iR;
+        // A point counts as known when measured now, or when it lies between two
+        // points measured now (no more than pathMaxGap apart): a hidden stretch with
+        // the path visible on both sides is not unknown. Otherwise: its memory confidence.
+        final float ds = Math.max(0.02f, cfg.pathStep);
+        final int gapMax = Math.max(1, Math.round(cfg.pathMaxGap / ds));
+        int prevFresh = -1;
+        for (int i = 0; i < n; i++) {
+            if (ndSrc[i] == PATH_SRC_FRESH) { prevFresh = i; tmpA[i] = 1f; continue; }
+            int next = i + 1; while (next < n && ndSrc[next] != PATH_SRC_FRESH) next++;
+            final boolean bracketed = prevFresh >= 0 && next < n && next - prevFresh <= gapMax;
+            tmpA[i] = bracketed ? 1f : (ndSrc[i] == PATH_SRC_PREDICTED ? 0.3f * ndConf[i] : Math.min(1f, ndConf[i]));
+        }
+        for (int i = i0; i < n; i++) {
+            if (i > i0) sRun += dist(smX[i] - smX[i - 1], smY[i] - smY[i - 1]);
+            if (ndConf[i] >= 0.2f) lastKnown = i;
+            if (sRun <= cfg.powerPreview) {
+                final float w = ndSrc[i] == PATH_SRC_PREDICTED ? 0.5f : 1f;
+                // curvature averaged over ±2 points (the maximum of single noisy values would flicker)
+                float ka = 0f; int kn = 0;
+                for (int q = Math.max(0, i - 2); q <= Math.min(n - 1, i + 2); q++) { ka += smK[q]; kn++; }
+                ka /= kn;
+                if (Math.abs(ka) * w > kMax && ndConf[i] >= 0.15f) { kMax = Math.abs(ka) * w; kSigned = ka; }
+                confSum += tmpA[i]; wSum += 1f;
+                if (ndSrc[i] != PATH_SRC_FRESH && i > i0) memLen += dist(smX[i] - smX[i - 1], smY[i] - smY[i - 1]);
+            }
+        }
+        len = 0f;
+        for (int i = i0 + 1; i <= lastKnown; i++) len += dist(smX[i] - smX[i - 1], smY[i] - smY[i - 1]);
+        if (before) len += Math.max(0f, smX[0]);
+        ctLength = len;
+        // light temporal smoothing (the path is re-measured every frame)
+        ctCurvAhead = ctCurvAheadPrev + 0.15f * (kSigned - ctCurvAheadPrev);
+        ctCurvAheadPrev = ctCurvAhead;
+        ctConf = wSum > 0f ? confSum / wSum : 0f;
+        ctMemFrac = Math.min(1f, memLen / Math.max(1e-3f, Math.min(cfg.powerPreview, Math.max(sRun, 1e-3f))));
+    }
+
+    private static float dist(float dx, float dy) { return (float) Math.sqrt(dx * dx + dy * dy); }
+
+    /** Tracking target [min … 100] from the computed path statistics. */
+    private float trackingTarget() {
+        final float tMin = cfg.trackingMinValue;
+        final float k0 = cfg.powerCurvatureDeadband, k1 = Math.max(k0 + 1e-3f, cfg.powerFullCurvature);
+        final float c = Math.max(0f, Math.min(1f, (Math.abs(ctCurvAhead) - k0) / (k1 - k0)));
+        float t = 100f - (100f - tMin) * c;
+        if (cfg.trackLengthSlowdown && pathEnd == END_ABSENT) {
+            final float full = Math.max(1e-3f, cfg.trackLengthFullFrac * roiFarFwd);
+            t = Math.min(t, 100f * Math.max(0f, Math.min(1f, ctLength / full)));
+        }
+        if (ctConf < 0.5f) t = tMin + (t - tMin) * Math.max(0f, ctConf) / 0.5f;
+        return Math.max(tMin, Math.min(100f, t));
+    }
+
+    /** Reliability grid: 4 samples per cell over the ROI; a cell is unreliable if ≥ 2 match neither colour. */
+    private void buildReliabilityGrid() {
+        final int GC = RELIABILITY_GRID_COLS, GR = RELIABILITY_GRID_ROWS;
+        final float cw = imgW / (float) GC, ch = (roiBot - roiTop) / (float) GR;
+        final float r = Math.max(1.05f, cfg.lightLocalRange);
+        int cnt = 0;
+        float gl = 1f;
+        for (int gy = 0; gy < GR; gy++) {
+            for (int gx = 0; gx < GC; gx++) {
+                int nU = 0, nG = 0;
+                for (int s = 0; s < 4; s++) {
+                    final int col = (int) ((gx + 0.25f + 0.5f * (s & 1)) * cw);
+                    final int row = roiTop + (int) ((gy + 0.25f + 0.5f * (s >> 1)) * ch);
+                    readPixel(col, row);
+                    gridY[s] = sY; gridU[s] = sU; gridV[s] = sV;
+                    final float g = floorGain(sY, sU, sV);
+                    if (g > 0f) gridG[nG++] = g;
+                }
+                // local light level of the cell (its floor-like samples), else the previous cell's
+                if (nG > 0) gl = median(gridG, nG);
+                for (int s = 0; s < 4; s++) {
+                    final byte c = classify(gridY[s], gridU[s], gridV[s], gl / r, gl * r, gl);
+                    if (c == CL_UNK) nU++;
+                }
+                final byte v = (byte) (nU >= 2 ? 1 : 0);
+                relGrid[gy * GC + gx] = v;
+                cnt += v;
+            }
+        }
+        relCells = cnt;
+    }
+
+    /** One v3 frame: trace, control, memory update. Writes the internal output holder. */
+    private void processV3() {
+        v3Rejected = 0;
+        buildReliabilityGrid();
+        final boolean haveMem = cfg.pathMemory && memN >= 2;
+        if (haveMem) predictMemory();
+        boolean ok = haveMem && traceWithMemory();
+        if (!ok) { corrX = 0f; corrY = 0f; corrT = 0f; ok = acquire(); }
+        int fresh = 0;
+        if (ok) {
+            resamplePath();
+            for (int i = 0; i < ndN; i++) if (ndSrc[i] == PATH_SRC_FRESH) fresh++;
+            if (ndN >= 2) { smoothPath(); computeControl(); } else ok = false;
+        }
+        // ── found / hidden / lost ──
+        final boolean found = ok && fresh >= 2;
+        float steering, tracking;
+        boolean held = false;
+        if (found) {
+            v3LostFrames = 0; v3HoldFrames = 0;
+            steering = ctSteer;
+            final float tt = trackingTarget();
+            v3Tracking += Math.max(-cfg.powerFallRate, Math.min(cfg.powerRiseRate, tt - v3Tracking));
+            tracking = v3Tracking;
+        } else {
+            v3LostFrames++;
+            // Why is nothing measured? Count what the remembered path shows now.
+            int nOut = 0, nAbs = 0, nUnr = 0;
+            for (int i = 0; i < ndN; i++) {
+                if (ndSt[i] == ST_OUT) nOut++; else if (ndSt[i] == ST_ABSENT) nAbs++; else if (ndSt[i] == ST_UNREL) nUnr++;
+            }
+            if (DBG) { final StringBuilder sb = new StringBuilder("DBG ok=" + ok + " n=" + ndN + " st="); for (int i = 0; i < ndN; i++) sb.append(ndSt[i]); System.out.println(sb); }
+            final boolean hidden = ok && nUnr > 0 && nUnr >= nAbs && v3LostFrames <= cfg.pathMemoryFrames;
+            final boolean midImage = ok && nAbs > 0 && nAbs >= nOut && v3HoldFrames < cfg.trackHoldFrames;
+            if (hidden) {
+                // covered by a disturbance: follow the remembered path, confidence fades slowly
+                steering = ctSteer;
+                final float tt = trackingTarget();
+                v3Tracking += Math.max(-cfg.powerFallRate, Math.min(cfg.powerRiseRate, tt - v3Tracking));
+                tracking = v3Tracking;
+                held = true;
+            } else if (midImage) {
+                v3HoldFrames++;
+                steering = v3LastSteer; tracking = v3Tracking; held = true;
+            } else {
+                // left the view (or gone for good): full turn toward the side it was last on
+                float side = Math.signum(ctTarget ? ctTY : 0f);
+                if (side == 0f) side = pathExitSide != 0f ? pathExitSide : Math.signum(v3LastSteer);
+                if (side == 0f) side = 1f;
+                steering = 50f * side;
+                tracking = cfg.trackingMinValue;
+                v3Tracking = cfg.trackingMinValue;
+                pathExitSide = side;
+            }
+        }
+        if (found || held) v3LastSteer = steering;
+        // ── motion estimate and memory for the next frame ──
+        if (ok && haveMem && fresh >= 3) {
+            velX = Math.max(-0.1f, Math.min(0.25f, velX - 0.6f * corrX));
+            velT = Math.max(-0.12f, Math.min(0.12f, velT - 0.6f * corrT));
+            velY = velT * cfg.pursuitPivotBehind;
+        } else if (!ok) {
+            velX *= 0.95f; velY *= 0.9f; velT *= 0.9f;
+        }
+        if (ok) {
+            memN = ndN;
+            for (int i = 0; i < ndN; i++) { memX[i] = ndX[i]; memY[i] = ndY[i]; memConf[i] = Math.min(1f, ndConf[i]); memAge[i] = ndAge[i]; }
+            if (cfg.pathMemory && !found) {
+                // nothing confirmed now: the memory fades (it is the only knowledge)
+                for (int i = 0; i < memN; i++) memConf[i] *= 0.97f;
+            }
+        } else if (v3LostFrames > cfg.trackLostGraceFrames) {
+            memN = 0;          // gone for good: search from scratch
+        }
+        v3Found = found; v3Held = held;
+        // ── internal output (same holder as v2; internal steering is ±100) ──
+        output.steering     = 2f * steering;
+        output.intersection = 100f - tracking;
+        output.trackFound   = found;
+        output.held         = held;
+        output.rejected     = v3Rejected;
+        output.threshold    = 128;
+        output.headingDeg   = found || held ? ctHeading : 0f;
+        output.headingConf  = found || held ? ctConf : 0f;
+        final float offPart = ctTarget ? cfg.steerPerCurvature * 2f * ctOffset / Math.max(1e-3f, cfg.pursuitLookAhead * cfg.pursuitLookAhead) : 0f;
+        output.offsetTerm   = found ? 2f * Math.max(-50f, Math.min(50f, offPart)) : 0f;
+        output.headingTerm  = found ? 2f * steering - output.offsetTerm : 0f;
+        // near-line column at the v2 strip row (legacy FrameData.centroidXFrac)
+        int cx = -1;
+        if (found) {
+            final float hr = (hRoiTop + hRoiBot) * 0.5f;
+            for (int i = 0; i < ndN - 1; i++) {
+                if (!planeToImage(smX[i], smY[i])) continue;
+                final float u0 = pU, v0 = pV;
+                if (!planeToImage(smX[i + 1], smY[i + 1])) continue;
+                if ((v0 - hr) * (pV - hr) <= 0f && Math.abs(pV - v0) > 1e-3f) {
+                    cx = Math.round(u0 + (hr - v0) / (pV - v0) * (pU - u0)); break;
+                }
+            }
+            if (cx < 0 && ndN > 0 && planeToImage(smX[0], smY[0])) cx = Math.round(pU);
+            if (cx >= 0) { lastCentroidX = cx; }
+            output.tiltDeg = 0f;
+            if (ndN >= 2 && planeToImage(smX[0], smY[0])) {
+                final float u0 = pU, v0 = pV;
+                final int j = Math.min(ndN - 1, 6);
+                if (planeToImage(smX[j], smY[j]) && v0 - pV > 1f) output.tiltDeg = (float) Math.toDegrees(Math.atan2(pU - u0, v0 - pV));
+            }
+            lastTrackWidthPx = Math.max(1f, calWA + calWB * hr);
+        }
+        output.centroidX    = found ? cx : -1;
+        output.trackWidthPx = lastTrackWidthPx;
+        // overlay poly-line of the legacy look-ahead arrays: the path (all sources)
+        laPathCount = 0;
+        if (ok) {
+            final int stepIdx = Math.max(1, (ndN + LA_MAX_PTS - 1) / LA_MAX_PTS);
+            for (int i = 0; i < ndN && laPathCount < LA_MAX_PTS; i += stepIdx) {
+                if (!planeToImage(smX[i], smY[i])) continue;
+                laPathColFrac[laPathCount] = pU / imgW; laPathRowFrac[laPathCount] = pV / imgH; laPathCount++;
+            }
+        }
+    }
+
+    /** v3 per-frame driver (after calibration). */
+    private int[] processBoundV3() {
+        updateFps();
+        processV3();
+        result[0] = Math.round(output.steering * 0.5f);
+        result[1] = Math.max(cfg.trackingMinValue, Math.min(100, Math.round(100f - output.intersection)));
+        isProcessing = true;
+        fireCallback(result[0], result[1], output.trackFound, output.centroidX);
+        isProcessing = false;
+        return result;
+    }
+
+    /** Copy the v3 fields into FrameData. */
+    private void fillPathFrameData(FrameData d) {
+        d.pathMode = cfg.pathTracking;
+        d.roiTopFrac = (cfg.pathTracking && v3Ready ? roiTop : vRoiTop) / (float) imgH;
+        d.roiBotFrac = (cfg.pathTracking && v3Ready ? roiBot : hRoiBot) / (float) imgH;
+        d.cameraTiltUsedDeg = v3Ready ? gTiltDeg : cfg.cameraTiltDeg;
+        d.lineWidthFloor = v3Ready ? lineW : 0f;
+        int np = 0;
+        if (cfg.pathTracking && !calibrated) {
+            // calibration: rows where the line was found (image coordinates)
+            for (int i = 0; i < ndN && np < PATH_MAX_POINTS; i++) {
+                d.pathColFrac[np] = ndX[i] / imgW; d.pathRowFrac[np] = ndY[i] / imgH;
+                d.pathFwd[np] = 0f; d.pathLat[np] = 0f; d.pathSource[np] = PATH_SRC_FRESH; np++;
+            }
+        } else if (cfg.pathTracking && v3Ready && isProcessing) {
+            final int stepIdx = Math.max(1, (ndN + PATH_MAX_POINTS - 1) / PATH_MAX_POINTS);
+            for (int i = 0; i < ndN && np < PATH_MAX_POINTS; i += stepIdx) {
+                if (!planeToImage(ndX[i], ndY[i])) continue;
+                d.pathColFrac[np] = pU / imgW; d.pathRowFrac[np] = pV / imgH;
+                d.pathFwd[np] = ndX[i]; d.pathLat[np] = ndY[i]; d.pathSource[np] = ndSrc[i]; np++;
+            }
+        }
+        d.pathPointCount = np;
+        final boolean live = cfg.pathTracking && v3Ready && isProcessing && ndN > 0;
+        d.pathFreshPoints = live ? ctFresh : 0;
+        d.pathMemoryPoints = live ? ctMem : 0;
+        d.pathUnreliablePoints = live ? ctUnrel : 0;
+        d.pathMemoryFrac = live ? ctMemFrac : 0f;
+        d.lookAheadValid = live && ctTarget;
+        d.lookAheadFwd = live ? ctTX : 0f; d.lookAheadLat = live ? ctTY : 0f;
+        if (live && ctTarget && planeToImage(ctTX, ctTY)) { d.lookAheadXFrac = pU / imgW; d.lookAheadYFrac = pV / imgH; }
+        else { d.lookAheadXFrac = -1f; d.lookAheadYFrac = -1f; }
+        d.pathCurvature = live ? ctCurv : 0f;
+        d.pathCurvatureAhead = live ? ctCurvAhead : 0f;
+        d.pathOffset = live ? ctOffset : 0f;
+        d.pathHeadingDeg = live ? ctHeading : 0f;
+        d.pathLength = live ? ctLength : 0f;
+        d.pathConfidence = live ? (v3Found ? ctConf : ctConf * 0.5f) : 0f;
+        if (cfg.pathTracking && v3Ready && isProcessing) {
+            System.arraycopy(relGrid, 0, d.unreliableGrid, 0, relGrid.length);
+            d.unreliableCells = relCells;
+        } else {
+            java.util.Arrays.fill(d.unreliableGrid, (byte) 0);
+            d.unreliableCells = 0;
+        }
+        d.motionFwd = live ? velX : 0f; d.motionLat = live ? velY : 0f;
+        d.motionYawDeg = live ? (float) Math.toDegrees(velT) : 0f;
     }
 
     // =========================================================================
