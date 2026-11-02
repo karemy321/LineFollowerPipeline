@@ -2822,6 +2822,7 @@ public final class LineFollowerPipeline {
     private byte    msStatus;
     private float   msOff, msQual;
     private boolean msTrim;
+    private boolean msLineNear;             // a line-like run lies just beside the prediction (not taken)
     // results of the conversions
     private float   pU, pV, qX, qY;
     // last sampled pixel
@@ -3215,7 +3216,7 @@ public final class LineFollowerPipeline {
      */
     private void analyzeProfile(float gate, float wExp) {
         final int n = prN;
-        msStatus = ST_NONE; msOff = 0f; msQual = 0f; msTrim = false;
+        msStatus = ST_NONE; msOff = 0f; msQual = 0f; msTrim = false; msLineNear = false;
         final float tol = Math.max(0.3f * wExp, 1.5f * prStep);
         final float sig = Math.max(0.35f * wExp, 0.5f * gate);
         final float reach = gate + 0.5f * wExp;
@@ -3266,7 +3267,7 @@ public final class LineFollowerPipeline {
             if (q1 > 0f && Math.abs(c1) <= g1) {
                 final float z = c1 / sig, s = q1 * (float) Math.exp(-0.5f * z * z);
                 if (s > best) { best = s; msOff = c1; msQual = q1; msTrim = trim; }
-            } else if (q1 > 0f && near) doubtNear = true;
+            } else if (q1 > 0f && near) { doubtNear = true; msLineNear = true; }
             if (q2 > 0f && Math.abs(c2) <= gate) {
                 final float z = c2 / sig, s = q2 * (float) Math.exp(-0.5f * z * z);
                 if (s > best) { best = s; msOff = c2; msQual = q2; msTrim = trim; }
@@ -3984,6 +3985,7 @@ public final class LineFollowerPipeline {
             gate = Math.min(2.5f * wExp, gate);
             measureAt(ndPX[i] + pred * ndNX[i], ndPY[i] + pred * ndNY[i], ndNX[i], ndNY[i], gate, wExp);
             ndSt[i] = msStatus;
+            if (msStatus == ST_UNREL && msLineNear) ndQ[i] = -1f;      // marks "the line seems to have moved"
             if (msStatus == ST_MEAS) {
                 final float r = pred + msOff;
                 ndR[i] = r; ndQ[i] = msQual;
@@ -4478,6 +4480,15 @@ public final class LineFollowerPipeline {
             ndX[i] = tmpA[i]; ndY[i] = tmpB[i]; ndConf[i] = tmpC[i]; ndSt[i] = tmpS[i]; ndSrc[i] = tmpT[i]; ndAge[i] = tmpG[i];
         }
         ndN = m;
+        // A real path cannot fold back: a turn of more than 150° within 3 steps (no
+        // corner is that tight) means the trace ran back along itself — cut it there.
+        for (int i = 1; i + 3 < ndN; i++) {
+            final float ax = ndX[i] - ndX[i - 1], ay = ndY[i] - ndY[i - 1];
+            final float bx = ndX[i + 3] - ndX[i + 2], by = ndY[i + 3] - ndY[i + 2];
+            final float la = dist(ax, ay), lb = dist(bx, by);
+            if (la < 1e-6f || lb < 1e-6f) continue;
+            if ((ax * bx + ay * by) / (la * lb) < -0.87f) { ndN = i + 1; break; }
+        }
     }
 
     /**
@@ -4838,13 +4849,19 @@ public final class LineFollowerPipeline {
             if (!any) ok = false;
         }
         if (ok) {
-            // (Almost) nothing of the remembered path confirmed this frame: maybe it is hidden,
-            // maybe the line moved more than expected. A fresh search decides: a
+            // (Almost) nothing of the remembered path confirmed this frame and clean floor
+            // where it should be: maybe the line moved more than expected. A fresh search decides: a
             // well-measured path found elsewhere replaces the memory; otherwise the
             // memory is kept (hidden line).
-            int conf = 0;
-            for (int i = 0; i < ndN; i++) if (ndSt[i] == ST_MEAS) conf++;
-            if (conf < 3) {
+            // Only when there is evidence AGAINST the memory (clean floor where it says
+            // the line is, or a full line-like run just beside it: the line moved); a
+            // path that is merely out of view or unreadable is kept.
+            int conf = 0, against = 0;
+            for (int i = 0; i < ndN; i++) {
+                if (ndSt[i] == ST_MEAS) conf++;
+                else if (ndSt[i] == ST_ABSENT || (ndSt[i] == ST_UNREL && ndQ[i] < 0f)) against++;
+            }
+            if (conf < 3 && against >= 3) {
                 saveNodes();
                 final float cx = corrX, cy = corrY, ct = corrT;
                 final int pe = pathEnd;

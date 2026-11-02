@@ -81,22 +81,25 @@
 <p class="eyebrow">Engineer Integration Guide</p>
 <h1>LineFollowerPipeline</h1>
 <p class="subtitle">Pure-Java, zero-dependency line-following vision processor</p>
-<p class="meta">Single-file library<span class="sep">•</span>Java 8+<span class="sep">•</span>No external dependencies<span class="sep">•</span>Updated October 2026 (v2)</p>
+<p class="meta">Single-file library<span class="sep">•</span>Java 8+<span class="sep">•</span>No external dependencies<span class="sep">•</span>Updated November 2026 (v3)</p>
 
 <div class="box green whatsnew">
-  <h4>What's new in this version (v2)</h4>
+  <h4>What's new in this version (v3 — path tracking)</h4>
   <ul>
-    <li><strong>Distractor rejection.</strong> A dark chair leg, a bag, a shadow or the dark floor past a table edge is no longer taken for the line: a band only counts as the line if its width and line-ness match the line measured at calibration (<code>rejectDistractors</code>, <code>bandMaxWidthMult</code>, <code>bandMinWidthMult</code>).</li>
-    <li><strong>Steering uses the whole ⊥.</strong> Steering = offset of the line in the scan strip (as before) + heading of the line from the look-ahead (new). A robot at an angle to the line now gets a steering value (±15° → ≈ ±8, ±30° → ≈ ±17). Range <code>-50 … +50</code> and sign are unchanged.</li>
-    <li><strong>Hidden line is held.</strong> A line that disappears mid-image is held for up to 6 frames (<code>trackHoldFrames</code>) instead of kicking steering to ±50 at once.</li>
-    <li><strong>Steadier lock.</strong> The gate follows the predicted line position and can no longer grow to the whole frame; a valid-looking lock is not stolen by a nearby object.</li>
-    <li><strong>Richer callback.</strong> <code>FrameData</code> adds <code>steerOffsetTerm</code>, <code>steerHeadingTerm</code>, <code>headingDeg</code>, <code>headingConfidence</code>, <code>lineHeld</code>, <code>rejectedBands</code>.</li>
-    <li><strong>No API break.</strong> Nothing was removed or renamed — existing integration code compiles and runs unchanged.</li>
+    <li><strong>The whole visible path is traced.</strong> The "⊥" (scan strip + look-ahead) is replaced by a tracer that follows the line along its full visible length, on the floor (bird's-eye coordinates — only path points are converted, the image is never warped).</li>
+    <li><strong>Local disturbances do not break the path.</strong> Glare, reflections, shadows, uneven light, a colour cast, dirt, a patch of another colour or an object over the line: pixels that match neither learned colour are <em>unreliable</em> and the hidden section is bridged from the path memory and from the line before and after it — STEER and POWER stay as on the undisturbed path, for any colour pair.</li>
+    <li><strong>Path memory.</strong> The path is kept between frames and moved with the robot's estimated motion.</li>
+    <li><strong>Pure-pursuit steering, smooth tracking.</strong> No weaving, curves followed without cutting them; tracking from the sharpest curve ahead and the known path length, changing a few units per frame (no stop-and-go). The steering scale adapts to the robot.</li>
+    <li><strong>Calibration learns the scene</strong> — the working region (up to the table edge), the line width per row and the camera tilt, the straight-ahead line — and succeeds with a disturbance over part of the line.</li>
+    <li><strong>No API break.</strong> Only additions (Config, FrameData, constants). <code>pathTracking = false</code> runs v2 unchanged.</li>
   </ul>
 </div>
 
 <h2>Changelog — What an Integrator Needs to Know <span class="badge">NEW</span></h2>
-<p>In this guide <span class="badge" style="margin-left:0">NEW</span> marks what v2 adds and <span class="badge changed" style="margin-left:0">CHANGED</span> marks existing items whose behaviour changed in v2.</p>
+<p>In this guide <span class="badge" style="margin-left:0">NEW</span> marks what v3 adds and <span class="badge changed" style="margin-left:0">CHANGED</span> marks existing items whose behaviour changed in v3.</p>
+<h3>v3 — November 2026 (path tracking)</h3>
+<!--TABLE "### v3 — November 2026 (path tracking)" plain="" class="" nowrap=""-->
+<div class="box green"><p><strong>Do I need to change my integration code?</strong> No. No public method, constant or field was removed or renamed; v3 only adds Config fields, FrameData fields and constants. RoboPhoneApp and the Blockly block work unchanged. The <strong>values</strong> behave differently: steering is gentler on a pure sideways offset and follows curves exactly, tracking is smooth. Measured results: <code>_investigation/CHANGES_v3.md</code>.</p></div>
 <h3>v2 — October 2026</h3>
 <!--TABLE "### v2 — October 2026 (distractor rejection + steering from the whole ⊥)" plain="" class="" nowrap=""-->
 
@@ -113,6 +116,21 @@
 
 <h2>What This Library Does</h2>
 <p><code>LineFollowerPipeline.java</code> is a pure-Java, zero-dependency line-following vision processor. You feed it raw camera frames — <strong>grayscale, YUV 4:2:0 or ARGB</strong> — and it returns two integer control values your robot can act on directly: a <strong>steering direction</strong> and a <strong>speed/tracking signal</strong>. No OpenCV, no Android APIs, and no native libraries are required.</p>
+
+<h2>How v3 Works (path tracking) <span class="badge">NEW</span></h2>
+<p>Everything below is on by default; <code>cfg.pathTracking = false</code> gives the v2 pipeline instead.</p>
+<ol>
+  <li><strong>Calibration learns the scene.</strong> With the robot centred and straight on a straight section: the <em>colours</em> (pixels over a tall region above the robot, clustered; extra clusters are a second floor colour, the floor / line under other light, or a <em>disturbance</em> — excluded from both models); the <em>working region (ROI)</em> — full image width, from just above the robot body to where the floor and line stop being reliably visible (table edge, background) minus a safety margin; the <em>geometry</em> — line width per row (rows with clean edges only) → camera tilt, line width on the floor, straight-ahead line and heading zero.</li>
+  <li><strong>Every frame the path is traced on the floor.</strong> A chain of points one <code>pathStep</code> apart; at each point a short profile across the predicted path is sampled (~10 samples per line width) and every sample is <em>line</em>, <em>floor</em> or <em>unreliable</em>. A measurement must have the line colour, the expected width at that distance, clean edges (or one clean edge + the known width), and continue the path. The search starts from the remembered path; the whole width is searched only when the line is lost.</li>
+  <li><strong>Damaged sections are bridged, never guessed.</strong> Unreliable points are filled from memory and from the measured path on both sides. Clean floor where the path should be is <em>absent</em> only if no more line is measured after it and the light is normal. Beyond the remembered path the tracer continues by curvature, bridges unreadable stretches (<code>pathMaxGap</code>), searches a sharp corner and looks past floor-coloured objects.</li>
+  <li><strong>Path memory.</strong> The path is moved with the robot's motion (forward travel + rotation about the axle, matched to the measured path); points on the smooth continuation of the measured path are confirmed by it.</li>
+  <li><strong>Control.</strong> A robust smooth curve through the path gives offset, heading, curvature and known length. <em>Steering</em>: pure pursuit to the point at <code>pursuitLookAhead</code> from the axle (shorter before sharp bends; raised if the path leaves the image side close in front). <em>Tracking</em>: the sharpest curve within <code>powerPreview</code> (relaxed with distance), the requested turn, the known length before a dead end, the confidence; rate-limited.</li>
+</ol>
+<div class="box blue"><p><strong>"Top to bottom"</strong> — both readings of the suggestion were measured in the simulation: working on the <strong>floor</strong> (bird's-eye view, path points only) is clearly better than in image coordinates, and tracing near → far with a second pass that re-reads gaps from both sides (<code>TRACE_BOTH</code>) is slightly better than one direction alone.</p></div>
+<h3>Disturbances — unreliable data instead of a wrong decision</h3>
+<p>A pixel is <strong>line</strong> only if it matches the learned line colour, <strong>floor</strong> only if it matches the learned floor colour (both relative to the local light level), and <strong>unreliable</strong> otherwise or if both match about equally well. The same rule works for every kind of disturbance and every colour pair:</p>
+<!--TABLE "### Disturbances — unreliable data instead of a wrong decision" plain="" class="" nowrap=""-->
+<div class="box amber"><p><strong>Limits.</strong> If a disturbance hides <em>all</em> of the visible path for a long time (a large glare right in front of the robot while the path curves out of the image) the path is truly unknown: steering follows the remembered path and tracking decreases gradually. A black line whitened by glare on a <em>white floor</em> at the far end of the view cannot be told from the line's end until the line is seen beyond it.</p></div>
 
 <h2>Requirements</h2>
 <ul>
@@ -150,20 +168,21 @@
 <p>To tune the pipeline for your camera mount, track, or robot body size, create a <code>Config</code> object and pass it <strong>before the first frame</strong>:</p>
 <!--CODE 7 "LineFollowerPipeline.Config cfg"-->
 <p>Calling <code>configure()</code> later discards the calibration (colours given with <code>setTrackColors()</code> are kept), so calibrate again afterwards. The <strong>Range</strong> column gives the values the code accepts or that make sense; values outside it are clamped or have no useful effect.</p>
+<div class="box blue"><p><strong>v3 / v2.</strong> The v3 path tracker (default) uses <em>Line Colour</em>, <em>Camera Mount</em>, <code>trackLostGraceFrames</code>, <code>trackHoldFrames</code>, <code>trackLengthSlowdown</code>, <code>trackLengthFullFrac</code>, <code>trackingMinValue</code>, <code>calibFrames</code>, <code>steerHeadingCalibMaxDeg</code> and the five v3 tables at the end of this section. <em>Scan Strip</em>, <em>Look-Ahead Column</em>, <em>Track Memory</em>, <em>Distractor Rejection</em>, <em>Steering from the Whole ⊥</em> and <em>Sensitivity</em> apply to the v2 pipeline (<code>pathTracking = false</code>). Distances in the v3 fields are in <strong>camera heights</strong> (1.0 = the camera's height above the floor).</p></div>
 
 <h3>Line Colour</h3>
 <!--TABLE "### Line Colour" plain="1,2,3" class="cfg" nowrap=""-->
-<h3>Scan Strip (H-ROI — Near Line / Steering)</h3>
+<h3>Scan Strip (H-ROI — Near Line / Steering) — v2</h3>
 <!--TABLE "### Scan Strip (H-ROI — Near Line / Steering)" plain="1,2,3" class="cfg" nowrap=""-->
-<h3>Look-Ahead Column (V-ROI — Turn Preview / Tracking)</h3>
+<h3>Look-Ahead Column (V-ROI — Turn Preview / Tracking) — v2</h3>
 <!--TABLE "### Look-Ahead Column (V-ROI — Turn Preview / Tracking)" plain="1,2,3" class="cfg" nowrap=""-->
 <h3>Camera Mount</h3>
 <!--TABLE "### Camera Mount" plain="1,2,3" class="cfg" nowrap=""-->
-<h3>Track Memory</h3>
+<h3>Track Memory — v2</h3>
 <!--TABLE "### Track Memory" plain="1,2,3" class="cfg" nowrap=""-->
 <p>When searching for the line (start-up, or after it was lost), the pipeline no longer simply takes the biggest band in view: it prefers the band nearest the calibrated straight-ahead column whose width matches the line width measured during calibration. While the locked line is lost at the frame edge, steering reads ±50 toward the side it left; a line that vanishes mid-image is held first (see <em>When the Line Is Lost or Hidden</em>).</p>
 
-<h3>Distractor Rejection (chair, bag, shadow, table edge) <span class="badge">NEW</span></h3>
+<h3>Distractor Rejection (chair, bag, shadow, table edge) — v2</h3>
 <p>Objects with a colour close to the line's (a black chair leg on a black-tape track, a shadow on wood, the dark floor beyond a table edge) pass the threshold exactly like the line. With <code>rejectDistractors</code> on, a band only counts as the line if it <strong>looks like the line learned at calibration</strong>:</p>
 <ul>
   <li><strong>Width</strong> — the band must be between <code>bandMinWidthMult</code> × and <code>bandMaxWidthMult</code> × the calibrated line width (the maximum is corrected for the line's slant in the image). Wide blobs, dark regions at the frame edge and thin specks are rejected.</li>
@@ -184,7 +203,7 @@
 </div>
 <!--TABLE "### Distractor Rejection (chair, bag, shadow, table edge)" plain="1,2,3" class="cfg" nowrap=""-->
 
-<h3>Steering from the Whole ⊥ (offset + heading) <span class="badge">NEW</span></h3>
+<h3>Steering from the Whole ⊥ (offset + heading) — v2</h3>
 <p>The pipeline looks at the line as a <strong>⊥</strong> (an inverted "T"): the <strong>base</strong> is the horizontal scan strip (H-ROI), the <strong>vertical part</strong> is the line followed up the look-ahead (V-ROI). The v1 steering used only the base of the ⊥ — where the line crosses the scan strip — so a robot at 30° to the line and a robot straight on it read the <strong>same</strong> value if the line crossed the strip at the same point. The steering now also uses the line's <strong>heading</strong> from the vertical part of the ⊥:</p>
 <!--FENCE "offset   ="-->
 <ul>
@@ -197,7 +216,7 @@
 </ul>
 <!--TABLE "### Steering from the Whole ⊥ (offset + heading)" plain="1,2,3" class="cfg" nowrap=""-->
 
-<h3>Sensitivity &amp; Tracking</h3>
+<h3>Sensitivity &amp; Tracking — v2 (tracking fields also v3)</h3>
 <!--TABLE "### Sensitivity" plain="1,2,3" class="cfg" nowrap=""-->
 <h3>Tracking Minimum Value</h3>
 <p>By default Tracking <strong>never reaches zero</strong>: <code>result[1]</code> is clamped to a floor of 5, so the robot always receives at least a small speed signal. This prevents mechanical problems caused by a complete stop command.</p>
@@ -205,6 +224,17 @@
 <!--CODE 8 "cfg.trackingMinValue"-->
 <h3>Calibration Frames</h3>
 <!--TABLE "### Calibration Frames" plain="1,2,3" class="cfg" nowrap=""-->
+<h3>Path Tracking (v3) — Working Region and Geometry <span class="badge">NEW</span></h3>
+<!--TABLE "### Path Tracking (v3) — Working Region and Geometry" plain="1,2,3" class="cfg" nowrap=""-->
+<h3>Path Tracing and Memory (v3) <span class="badge">NEW</span></h3>
+<!--TABLE "### Path Tracing and Memory (v3)" plain="1,2,3" class="cfg" nowrap=""-->
+<h3>Disturbance Handling (v3) <span class="badge">NEW</span></h3>
+<!--TABLE "### Disturbance Handling (v3)" plain="1,2,3" class="cfg" nowrap=""-->
+<h3>Steering — Pure Pursuit (v3) <span class="badge">NEW</span></h3>
+<!--TABLE "### Steering — Pure Pursuit (v3)" plain="1,2,3" class="cfg" nowrap=""-->
+<h3>Tracking from the Path (v3) <span class="badge">NEW</span></h3>
+<!--TABLE "### Tracking from the Path (v3)" plain="1,2,3" class="cfg" nowrap=""-->
+<p><code>trackLengthSlowdown</code> / <code>trackLengthFullFrac</code> keep their meaning: tracking ramps down when the known path ends on clean floor before <code>trackLengthFullFrac</code> of the view's depth.</p>
 
 <h2 class="pb">Calibration</h2>
 <p>Before calling <code>processFrame()</code> you must calibrate. Place the robot correctly on the line, then call <code>calibrate()</code> (or the YUV / ARGB version) once per camera frame until it returns <code>true</code>:</p>
@@ -214,14 +244,15 @@
   <li><strong>Learn the colours</strong> (<code>colorCalibFrames</code>, default 5 frames). The scan strip is sampled and split into two colour clusters (k-means). The <strong>floor</strong> is the cluster that fills both the left and right frame edges; the other is the <strong>line</strong>. If that fails — typically a shadow or uneven light making part of the floor almost as dark as a dark line — 3 and then 4 clusters are tried: the line is the cluster that forms one band and never reaches the frame edges, and all other clusters (lit floor, shadowed floor…) count as floor. A Fisher linear discriminant then gives the colour direction that best separates line from floor, and every later frame is converted to a "line-ness" image (line bright, floor dark) before the usual Otsu + line-lock processing. Skipped when <code>autoColor = false</code> or when the colours were given with <code>setTrackColors()</code>.</li>
   <li><strong>Find straight-ahead</strong> <span class="badge changed">CHANGED</span> Collects <code>calibFrames</code> (default 10) solid line detections — preferring the band where colour learning saw the line and, with <code>rejectDistractors</code>, of the width colour learning measured — and takes their <strong>median</strong> as: the steering zero reference (straight-ahead column); the typical <strong>line width</strong> and <strong>line-ness level</strong> (used by distractor rejection); and the <strong>heading zero</strong> ψ₀ (only when <code>steerHeadingWeight ≠ 0</code>): the median line heading of the frames that saw enough look-ahead. It is used only if at least half of the frames saw it and it is within <code>steerHeadingCalibMaxDeg</code>; otherwise ψ₀ = 0.</li>
 </ol>
+<p><strong>v3 (default)</strong> <span class="badge changed">CHANGED</span> Phase 1 samples a tall region above the robot instead of the strip and keeps further colour clusters apart as disturbances; phase 2 scans the rows from the robot to the top of the image in each of the <code>calibFrames</code> frames and derives the working region (ROI), the line width per row and the camera tilt, the line width on the floor, the straight-ahead line and the heading zero, and the initial path. Rows hidden by a disturbance are not used, so calibration also works with glare or a shadow over part of the line.</p>
 <p>With the defaults calibration needs at least <strong>15 frames</strong> (5 + 10). It returns <code>true</code> once both phases are done. Progress and problems are reported in the callback (<code>calibPhase</code>, <code>calibProgress</code>, <code>calibIssue</code>):</p>
 <!--TABLE "## Calibration" plain="" class="" nowrap="0"-->
 
-<h3>Before you calibrate — checklist <span class="badge">NEW</span></h3>
+<h3>Before you calibrate — checklist</h3>
 <ul>
-  <li>The robot stands <strong>on the line, straight</strong>, on a <strong>straight section</strong> (the heading zero is learned here).</li>
-  <li>The line is inside the scan strip, near the middle, with <strong>floor visible on both sides</strong> (both frame edges must show floor).</li>
-  <li>No chair leg, bag, shadow edge or second tape inside the scan strip.</li>
+  <li>The robot stands <strong>on the line, straight and centred</strong>, on a <strong>straight section</strong> (the heading zero and the straight-ahead line are learned here).</li>
+  <li><strong>Floor visible on both sides</strong> of the line (both image edges must show floor) in the lower part of the image.</li>
+  <li>v3: a glare spot or a shadow over part of the line is tolerated; a second tape or a large object of the line's colour near the line should be avoided.</li>
   <li>The tape width is the one used on the whole track.</li>
 </ul>
 <div class="box amber"><p><strong>If calibration cannot complete</strong>, <code>calibrate()</code> simply keeps returning <code>false</code> — there is no timeout. Show <code>calibIssue</code> to the user, fix the cause (see the table) and keep feeding frames; call <code>requestRecalibration()</code> to start again from phase 1. Do <strong>not</strong> drive on <code>processFrame()</code> output before calibration is done: until then the steering zero is the image centre, there is no calibrated line width (so distractor rejection cannot work), and if the colours were not learned yet the frame is read as plain brightness with <code>trackIsBright</code> polarity.</p></div>
@@ -235,6 +266,8 @@
 
 <h2>When the Line Is Lost or Hidden <span class="badge">NEW</span></h2>
 <!--TABLE "## When the Line Is Lost or Hidden" plain="1,2" class="" nowrap="3,4"-->
+<h3>Lost or hidden line with path tracking (v3) <span class="badge">NEW</span></h3>
+<!--TABLE "### Lost or hidden line with path tracking (v3)" plain="" class="" nowrap="3,4"-->
 <p>Use <code>trackFound</code> (not <code>tracking == 5</code>) to show "TRACK LOST" — a hard turn also reads 5. With <code>trackMemory = false</code> there is no lock, no pinning and no hold: a missing line keeps the steering of its last position and tracking drops to the minimum. If calibration has not completed, see <em>If calibration cannot complete</em> above.</p>
 
 <h2 class="pb">Runtime Utility Methods</h2>
@@ -243,7 +276,7 @@
 <!--CODE 13 "int     imgW"-->
 
 <h2>Frame Callback — Overlay Geometry</h2>
-<p>Register a single callback once, and the library calls it automatically on <strong>every calibration frame and every <code>processFrame()</code> frame</strong>, passing a <code>FrameData</code> object with everything needed to draw a visual overlay and a status display: the H-ROI strip, the V-ROI look-ahead band, the dynamic road path, the live centroid, calibration progress and the learned colours.</p>
+<p>Register a single callback once, and the library calls it automatically on <strong>every calibration frame and every <code>processFrame()</code> frame</strong>, passing a <code>FrameData</code> object with everything needed to draw a visual overlay and a status display: in v3 the working region, the traced path with the source of every point, the look-ahead target and the unreliable cells; in v2 the H-ROI strip, the V-ROI look-ahead band and the live centroid; calibration progress and the learned colours in both.</p>
 <div class="box green"><p>No extra computation is added. The data already exists inside the pipeline — the callback just packages and delivers it (≈ 0.02 ms per frame). The callback runs on the thread that called calibrate / processFrame.</p></div>
 <!--CODE 14 "pipeline.setFrameCallback(data"-->
 <div class="box amber"><p><strong>Important:</strong> the same <code>FrameData</code> instance is reused on every call. Copy any fields you need to keep beyond the current frame.</p></div>
@@ -255,7 +288,8 @@
 <p>Every field is a <strong>fraction</strong>, so convert to screen pixels first:</p>
 <!--CODE 15 "float screenX"-->
 <div class="box blue"><p><strong>Cropped previews:</strong> if the preview is scaled to fill the screen (Android <code>PreviewView</code> default FILL_CENTER), part of the image is cropped. Map with the same scale, or the overlay will drift: <code>scale = max(viewW / imgW, viewH / imgH)</code>, <code>x = (viewW − imgW·scale)/2 + xFrac·imgW·scale</code> (same for y). RoboPhoneApp's <code>OverlayView</code> does this.</p></div>
-<p><strong>H-ROI strip</strong> (a full-width horizontal band):</p>
+<div class="box green"><p><strong>v3 overlay</strong> <span class="badge">NEW</span>: draw the ROI (<code>roiTopFrac</code> … <code>roiBotFrac</code>, full width), the cells of <code>unreliableGrid</code> (24 × 32 over the ROI), the path <code>pathColFrac[i]</code> / <code>pathRowFrac[i]</code> for <code>i &lt; pathPointCount</code> coloured by <code>pathSource[i]</code> (measured now / memory / hidden-now / bridged), and the target <code>lookAheadXFrac</code> / <code>lookAheadYFrac</code> when <code>lookAheadValid</code>. RoboPhoneApp's <code>OverlayView</code> is a complete example. The v2 drawing below applies when <code>pathMode</code> is false.</p></div>
+<p><strong>H-ROI strip</strong> (v2 — a full-width horizontal band):</p>
 <!--CODE 16 "float top    ="-->
 <p><strong>V-ROI trapezoid</strong> (perspective-tapered box — the far edge is narrower, and leans toward <code>trackRefX</code>):</p>
 <!--CODE 17 "float centre"-->
@@ -275,7 +309,7 @@
 <!--TABLE "## Behaviour Reference" plain="1,2" class="" nowrap=""-->
 
 <h2>Recommended Starting Values (lecturer's test program) <span class="badge">NEW</span></h2>
-<p>For the Blockly test program — <strong>motor steering = (0 − Steering) × c</strong> and <strong>motor power = round(x × (Power / 8) + 5)</strong>, where <em>Steering</em> is <code>result[0]</code> and <em>Power</em> is the Tracking value <code>result[1]</code> — the closed-loop simulation (<code>_investigation/CHANGES_v2.md</code>, §7) recommends:</p>
+<p>For the Blockly test program — <strong>motor steering = (0 − Steering) × c</strong> and <strong>motor power = round(x × (Power / 8) + 5)</strong>, where <em>Steering</em> is <code>result[0]</code> and <em>Power</em> is the Tracking value <code>result[1]</code> — the closed-loop simulation (<code>_investigation/CHANGES_v3.md</code>) recommends:</p>
 <!--TABLE "## Recommended Starting Values (lecturer's test program)" plain="" class="" nowrap="0"-->
 <div class="box blue"><p>These values come from simulation, not from the real robot — verify them on the track (and keep <code>x = 0</code> if the measured Blockly loop rate is well below ~15 Hz).</p></div>
 
@@ -285,20 +319,20 @@
   <li>The returned <code>int[]</code> is reused on every call. Copy the values if you need them past the next frame.</li>
   <li>Calibration assumes the robot is correctly placed on the line, with floor visible on both sides. If it is not, call <code>requestRecalibration()</code> once it is repositioned, then calibrate again. Recalibrate whenever you move to a track with different colours, different lighting or a different tape width.</li>
   <li>A line that jumps sideways by more than the line-lock gate in a single frame (<code>trackMemoryGateMult</code> × line width, around the line's predicted position) is treated as leaving the line — this is what makes the lock ignore reflections.</li>
-  <li>The heading part of the steering relies on <code>cameraTiltDeg</code> and <code>verticalFovDeg</code> matching the real camera. The Android app runs at 960 × 1280 (CameraX picks 1280 × 960, rotated to portrait).</li>
+  <li>v3 needs the camera geometry only roughly (<code>cameraTiltDeg</code> within ~25°, <code>verticalFovDeg</code>): the tilt is learned at calibration and the line width per row is measured. The Android app runs at 960 × 1280 (CameraX picks 1280 × 960, rotated to portrait).</li>
   <li>Very harsh scenes can still defeat colour learning: e.g. a dark floor in deep shadow, with strong texture, where the tape is only ~10 grey-levels darker than the shadowed floor. Even lighting helps.</li>
-  <li>Performance: ≈ 0.9 ms per frame in YUV colour mode at 960 × 1280 on a desktop CPU (several times more on a phone, still far below the 16.7 ms of 60 Hz); all per-frame buffers are pre-allocated (no garbage per frame, in all three input formats).</li>
+  <li>Performance (v3): {{PERF}} per frame in YUV colour mode at 960 × 1280 on a desktop CPU (v2: ≈ 0.9 ms) — v3 reads only the pixels along the path, never the whole image; all per-frame buffers are pre-allocated (no garbage per frame, in all three input formats).</li>
 </ul>
 
 <h2>RoboPhoneApp — Android Reference Integration</h2>
 <p><code>RoboPhoneApp/</code> runs the library live on the phone camera (CameraX → packed YUV 4:2:0 → <code>calibrateYuv420</code> / <code>processFrameYuv420</code>). Everything on screen comes from the <code>FrameCallback</code>:</p>
 <ul>
-  <li><strong>Overlay</strong> — cyan STEER strip with the detected line, magenta look-ahead band that bends along the line, dashed calibrated straight-ahead line, red ignored robot-body band; mapped with the preview's FILL_CENTER crop so it lines up with the camera image.</li>
-  <li><strong>HUD</strong> — STEER bar (−50…+50), TRACK bar (min…100 %), status (calibration progress and problems / TRACKING / TRACK LOST), FPS, learned LINE and FLOOR colour swatches, threshold and colour separation. The app does not show the new v2 <code>FrameData</code> fields yet.</li>
+  <li><strong>Overlay (v3)</strong> <span class="badge changed">CHANGED</span> — the working region (white frame), unreliable cells (red), the traced path coloured by where each point came from (green = measured now, blue = memory, orange = hidden now and filled from memory, yellow = bridged), the look-ahead target (magenta) with a line from the robot, a steering arrow, red ignored robot-body band; with <code>pathTracking = false</code> the v2 ⊥. Mapped with the preview's FILL_CENTER crop so it lines up with the camera image.</li>
+  <li><strong>HUD</strong> — STEER bar (−50…+50), TRACK bar (min…100 %), status (calibration progress and problems / TRACKING / TRACK LOST), FPS, learned LINE and FLOOR colour swatches, colour separation, and in v3 the path confidence and the share of the path from memory.</li>
   <li><strong>RECALIBRATE</strong> button — re-learns the colours and the straight-ahead reference (place the robot on the line first).</li>
 </ul>
 <p>The app builds the library <strong>from source</strong> through a Gradle composite build (<code>includeBuild("../LineFollowerLibrary")</code>), so library changes show up in the app on the next build — no jar copying. Library tests: <code>cd LineFollowerLibrary &amp;&amp; gradlew test</code> (format / colour unit tests plus camera-simulator scenes: shadows, wood grain, turns, line loss, distractor tapes, dead ends).</p>
-<div class="box green"><p><strong>Unit tests and v2:</strong> all <strong>26 tests pass</strong> with the v2 defaults. The steering tests check the offset part (19 for a line 60 px right) and that the heading part steers the same way; <code>lostLineReportsTrackLost</code> checks the hold of <code>trackHoldFrames</code> frames before tracking drops to 5. Two tests (<code>v1SteeringIsOffsetOnly</code>, <code>v1LostLineDropsTrackingAtOnce</code>) check that <code>steerHeadingWeight = 0</code> and <code>trackHoldFrames = 0</code> give the v1 behaviour. <code>gradlew jar</code> and the app build do not run the tests.</p></div>
+<div class="box green"><p><strong>Unit tests:</strong> all <strong>45 tests pass</strong> with the v3 defaults — the 26 earlier tests (expectations adapted where the approach changed; the v1/v2 tests run with <code>pathTracking = false</code>) and 19 v3 scenario tests (<code>PathTrackingTest</code>: straight, curves both ways, S-curve, line leaving the side, start at an angle / offset, table edge, blob and bright stripe beside the line, the robot's own shadow, glare on a straight and on a curve, a 4-colour-pair × 6-disturbance matrix, disturbances during calibration, the new <code>FrameData</code> fields, option switches). <code>gradlew jar</code> and the app build do not run the tests.</p></div>
 
 </body>
 </html>

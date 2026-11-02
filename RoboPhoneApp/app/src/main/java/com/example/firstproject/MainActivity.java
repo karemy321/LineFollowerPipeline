@@ -127,6 +127,9 @@ public class MainActivity extends AppCompatActivity {
     private volatile long    hudTotalFrames  = 0L;
     private volatile double  hudElapsedSec   = 0.0;
     private volatile boolean hudPending      = false;
+    private volatile boolean hudPathMode     = false;
+    private volatile float   hudPathConf     = 0f;
+    private volatile float   hudMemoryFrac   = 0f;
 
     // Set by the RECALIBRATE button (UI thread), consumed on the camera thread so
     // the pipeline is only ever touched from one thread.
@@ -454,6 +457,9 @@ public class MainActivity extends AppCompatActivity {
         hudFloorColor    = d.floorColorArgb;
         hudSeparation    = d.colorSeparation;
         hudThreshold     = d.threshold;
+        hudPathMode      = d.pathMode;
+        hudPathConf      = d.pathConfidence;
+        hudMemoryFrac    = d.pathMemoryFrac;
         hudFps           = pipeline.getFramesPerSecond();
         hudTotalFrames   = pipeline.getTotalFrames();
         hudElapsedSec    = pipeline.getElapsedSeconds();
@@ -576,9 +582,15 @@ public class MainActivity extends AppCompatActivity {
         swatchLine.setBackgroundColor(colors ? hudLineColor : Color.DKGRAY);
         swatchFloor.setBackgroundColor(colors ? hudFloorColor : Color.DKGRAY);
         final String thr = hudThreshold < 0 ? "none" : String.valueOf(hudThreshold);
-        tvDebug.setText(colors
-                ? String.format(Locale.US, "thr: %s  sep: %.1fσ", thr, hudSeparation)
-                : String.format(Locale.US, "thr: %s  sep: --", thr));
+        if (hudPathMode && hudCalibrated) {
+            // v3: separation of the learned colours, path confidence, share of the path from memory
+            tvDebug.setText(String.format(Locale.US, "sep: %.1fσ  conf: %.0f%%  mem: %.0f%%",
+                    hudSeparation, hudPathConf * 100f, hudMemoryFrac * 100f));
+        } else {
+            tvDebug.setText(colors
+                    ? String.format(Locale.US, "thr: %s  sep: %.1fσ", thr, hudSeparation)
+                    : String.format(Locale.US, "thr: %s  sep: --", thr));
+        }
 
         hudPending = false;
     }
@@ -592,7 +604,7 @@ public class MainActivity extends AppCompatActivity {
             case LineFollowerPipeline.ISSUE_NO_FLOOR:
                 return "CALIBRATING " + pct + "% — place the robot ON the line (floor on both sides)";
             case LineFollowerPipeline.ISSUE_NO_LINE:
-                return "CALIBRATING " + pct + "% — line not visible in the STEER strip";
+                return "CALIBRATING " + pct + "% — line not found ahead of the robot";
             default:
                 return hudCalibPhase == LineFollowerPipeline.CALIB_LEARNING_COLORS
                         ? "CALIBRATING " + pct + "% — learning line / floor colours"

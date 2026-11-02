@@ -16,6 +16,21 @@ No OpenCV. No Android APIs. No native libraries.
 
 ## What's New
 
+### v3 — November 2026 (path tracking)
+
+| Change | What it means for you | Code change needed? |
+|---|---|---|
+| **The whole visible path is traced** — new `pathTracking` (on by default) | The "⊥" (scan strip + look-ahead column) is gone. Every frame the library follows the line along its **full visible length**, from just above the robot to where the floor stops being reliably visible, on the **floor** (bird's-eye coordinates — only the path points are converted, the image is never warped). See [How v3 Works](#how-v3-works-path-tracking). | No |
+| **Local disturbances do not break the path** — glare, reflections, shadows (the robot's own or an object's), uneven light, a colour cast, dirt, scratches, a patch of another colour, an object over the line | A pixel that matches **neither** the line nor the floor colour learned at calibration is **unreliable** — it counts as neither. A damaged section is bridged from the **path memory** and from the line before and after it, so **STEER and POWER stay the same** as on the undisturbed path. Works for any colour pair (dark on light, light on dark, coloured on coloured). See [Disturbances](#disturbances--unreliable-data-instead-of-a-wrong-decision). | No |
+| **Path memory** — new `pathMemory`, `pathMemoryFrames`, `pathMaxGap` | The traced path is kept between frames on the floor and moved with the robot's motion (estimated from how the path shifts). A part that is hidden now — or already under the robot — is known from earlier frames. | No |
+| **Pure-pursuit steering** — new `pursuitLookAhead`, `pursuitPivotBehind`, `steerPerCurvature`, `steerAutoGain` | Steering aims at the point of the path about 1.2 camera heights ahead of the axle and is the curvature of the arc that reaches it: no weaving, curves followed without cutting them. **Range and sign unchanged** (−50 … +50, negative = turn left). The scale adapts itself to the robot (`steerAutoGain`). | No — see [Recommended Starting Values](#recommended-starting-values-lecturers-test-program) |
+| **Smooth tracking** — new `powerFullCurvature`, `powerCurvatureDeadband`, `powerPreview`, `powerRiseRate`, `powerFallRate` | Tracking (POWER) comes from the **sharpest curve ahead (and how near it is)** and from the **known length** of the path. It changes by at most a few units per frame — no more jumping between high values and the minimum (stop-and-go). | No |
+| **Calibration learns the scene** — new `roiAuto`, `roiTopMarginFrac`, `learnCameraTilt` | Calibration finds the working region (ROI: from just above the robot to where the floor stops — table edge, background — minus a margin; full image width), the line width per row (perspective) and from it the **camera tilt**, the straight-ahead line and the heading zero. It succeeds even if glare or a shadow covers part of the path at that moment (those pixels are excluded). | No |
+| **New `FrameData` fields** | The path points (with where each came from: measured now / memory / hidden-now / bridged), the look-ahead point, curvature, offset, heading, path length, confidence, share from memory, the ROI, a grid of unreliable cells, the estimated motion. See [FrameData Fields](#framedata-fields). | No (optional for an overlay) |
+| **v2 still available** | `cfg.pathTracking = false` runs the v2 pipeline unchanged (for comparison). | — |
+
+**Do I need to change my integration code?** No. No public method, constant or field was removed or renamed; v3 only adds Config fields, FrameData fields and constants. RoboPhoneApp and the Blockly block work unchanged. The **values** behave differently: steering is gentler on a pure sideways offset and follows curves exactly, tracking is smooth. Measured results: `_investigation/CHANGES_v3.md`.
+
 ### v2 — October 2026 (distractor rejection + steering from the whole ⊥)
 
 | Change | What it means for you | Code change needed? |
@@ -40,6 +55,46 @@ pipeline.configure(v1);
 
 - **11 Oct 2026** — **Steering output is `-50 … +50`** (was `-100 … +100`): only the output is halved, the pipeline itself is unchanged. If your control program multiplies steering by a gain, **double the gain** to keep the same steering authority. **`trackingMinValue` default is `5`** (was `2`), so Tracking is `5 … 100`.
 - **8 Oct 2026** — Automatic colour learning at calibration (`autoColor = true` by default; `trackIsBright` is now only the manual fallback); YUV 4:2:0 and ARGB input; Tracking ramps down with the remaining visible road; lock correction after turns (`trackRelockFrames`); `minContrast`; richer `FrameData` (calibration phase / progress / problem, learned colours, threshold, line width, frame size).
+
+---
+
+## How v3 Works (path tracking)
+
+Everything below is on by default; `cfg.pathTracking = false` gives the v2 pipeline instead.
+
+**1. Calibration learns the scene.** With the robot standing **centred and straight on a straight section**:
+- *Colours*: pixels are sampled over a tall region above the robot and clustered (k-means, 2 … 4 colours). The floor is the colour filling both image edges, the line the colour that forms one narrow band in most rows. A further colour is either a second floor colour (it also fills the edges), the floor or line under other light (a shadow), or a **disturbance** (glare, an object) — disturbances are **excluded** from both colour models.
+- *Working region (ROI)*: rows are scanned from the robot up to the top of the image. The bottom of the ROI is just above the robot body (`bottomIgnoreFrac`); the top is where the floor and line stop being reliably visible (table edge, floor and chairs beyond it), minus `roiTopMarginFrac` of the visible distance. The ROI is the **full image width**: in curves the line reaches the image edge (the "robot is centred" assumption holds only during calibration).
+- *Geometry*: the line width in each row (rows with clean line edges only — disturbed rows are skipped) gives the perspective and from it the **camera tilt** (`learnCameraTilt`), then the line width on the floor, the **straight-ahead** line and the **heading zero** (phone yaw on its mount). These convert image points to floor points (bird's-eye view).
+
+**2. Every frame the path is traced on the floor.** The path is a chain of points one `pathStep` apart, in robot coordinates (forward / sideways, camera heights). At each point a short profile **across** the predicted path is sampled (a window on a subsampled image, ~10 samples per line width) and every sample is classified as **line**, **floor** or **unreliable**. A measurement must look like the line: line colour, the **expected width at that distance**, clean edges against floor (or one clean edge + the known width when the other side is hidden), and it must **continue** the path (it is searched only near the prediction). So a shadow, a blob, a bright scratch or the background is not taken for the line. The search starts from the path remembered from the previous frame (moved by the robot's motion); the whole image width is searched only when the line is lost.
+
+**3. Damaged sections are bridged, never guessed.** A point where the window shows unreliable pixels (or a run that is too wide / too thin to be the line) is **unreliable** — it is filled from the path memory and from the measured path on both sides of it. Clean floor where the path should be is **absent** — but only if it is not followed by more measured path (then it is a gap, e.g. a black line whitened by glare on a white floor) and only under normal light. Beyond the end of the remembered path the tracer continues by curvature, bridges unreadable stretches up to `pathMaxGap`, looks for a sharp corner and, after clean floor, looks further along (the line may continue after a floor-coloured object).
+
+**4. Path memory.** The path is kept between frames and moved with the robot's motion, which is estimated by matching the predicted path to the measured one (a wheeled robot only drives forward and turns about its axle — no sideways slide). The part the robot is reaching now was seen earlier, farther ahead; a section hidden now is filled from memory. Remembered points that lie on the smooth continuation of the measured path are confirmed by it.
+
+**5. Control.** A smooth, outlier-robust curve is fitted through the path (local weighted quadratics, Tukey weights); from it come the offset, heading and curvature at the robot, the sharpest curve ahead and the known length ahead.
+- *Steering*: **pure pursuit** — the point T of the path at distance `pursuitLookAhead` from the robot's turning point (axle, `pursuitPivotBehind` behind the camera); steering = `steerPerCurvature` × 2·lateral(T) / distance(T)². The look-ahead shortens automatically before a sharp bend so a corner is followed, not cut. If the path leaves the side of the image close in front of the robot (it is not turning enough), the steering toward that side is raised.
+- *Tracking*: 100 on a straight path; lower for the sharpest curve within `powerPreview` (relaxed with its distance) and for the turn the robot is asked to make; lower when the known path ends on clean floor before the far edge of the view (dead end); scaled down only when the path ahead is truly unknown (`pathConfidence` < 0.5); changes at most `powerRiseRate` / `powerFallRate` per frame.
+
+**"Top to bottom"** — both readings of the lecturer's suggestion were measured in the simulation (`_investigation/CHANGES_v3.md`): working on the **floor** (bird's-eye view, path points only) is clearly better than in image coordinates, and tracing **near → far with a second pass that re-reads gaps from both sides** (`TRACE_BOTH`, default) is slightly better than near → far alone and than far → near alone.
+
+### Disturbances — unreliable data instead of a wrong decision
+
+The rule is the same for every kind of disturbance and every colour pair: a pixel is **line** only if it matches the learned line colour, **floor** only if it matches the learned floor colour (both allowing the local light level to change ×/÷ `lightLocalRange` — shadows and uneven light dim line and floor alike), and **unreliable** otherwise or if both match about equally well.
+
+| Disturbance | What the library sees | What happens |
+|---|---|---|
+| Glare / reflection that whitens a dark line | unreliable pixels (off both colours); with a white floor the whitened tape looks like floor | the measured path before and after the spot plus the memory carry the hidden part; a stretch that looks like bare floor *before* more visible line is a gap, not an end |
+| Glare on a white line / a bright stripe on a white-line track (looks like the line) | a line-coloured region that is **too wide** or **too thin** for the line at that distance | rejected by the expected width and the continuity; only an edge where the line's edge is predicted is used |
+| Room-fixed shadow, uneven lighting | line and floor colours under a different light level | matched relative to the local light level |
+| The robot's own shadow | moves with the robot: always in the same image place | the part under it was seen before it got there (memory) and continues the measured path |
+| Patch of another colour under the line | floor = unreliable around the line | the line is still measured (one clean edge + the known width, or a full-width run) |
+| Object covering the line / colour cast | unreliable (or floor-coloured) section | bridged from memory and continuity |
+
+`FrameData.unreliableGrid` shows the unreliable cells, `pathSource[]` where every path point came from, `pathMemoryFrac` how much of the path ahead came from memory, `pathConfidence` how well the path ahead is known.
+
+**Limits** (also in `_investigation/CHANGES_v3.md`): if a disturbance hides **all** of the visible path for a long time (e.g. a large glare right in front of the robot while the path curves out of the image) the path is truly unknown — steering follows the remembered path and tracking decreases gradually. A black line whitened by glare on a **white floor** at the **far end** of the view cannot be told from the end of the line until the line is seen beyond it — tracking then slows as before a dead end.
 
 ---
 
@@ -111,8 +166,8 @@ Each format has a matching calibrate / process pair. Use the **same format** for
 
 | Index | Name | Range | Meaning |
 |---|---|---|---|
-| `result[0]` | **Steering** | `-50 … +50` | `0` = robot is on the line and parallel to it. **Negative = turn left** (the line is to the left, or heads to the left). **Positive = turn right** (the line is to the right, or heads to the right). It combines where the line crosses the scan strip (offset) and which way the line runs ahead (heading) — see [Steering from the Whole ⊥](#steering-from-the-whole--offset--heading). `±50` toward the side where the line was lost (see [When the Line Is Lost or Hidden](#when-the-line-is-lost-or-hidden)). |
-| `result[1]` | **Tracking** | `5 … 100` | `100` = straight path ahead, full speed. Drops as a turn or curve is detected, and ramps down linearly as the visible road ahead gets shorter (dead end, sharp corner). Never falls below `Config.trackingMinValue` (default **5**), so the robot is never sent a full stop. Set that field to `0` for the full 0–100 range. |
+| `result[0]` | **Steering** | `-50 … +50` | `0` = robot is on the line and parallel to it. **Negative = turn left** (the path ahead is to the left). **Positive = turn right**. v3: the curvature of the arc from the robot to the look-ahead point of the path (pure pursuit) — see [Steering — Pure Pursuit](#steering--pure-pursuit-v3). (v2: offset + heading of the ⊥.) `±50` toward the side where the line was lost (see [When the Line Is Lost or Hidden](#when-the-line-is-lost-or-hidden)). |
+| `result[1]` | **Tracking** | `5 … 100` | `100` = straight path ahead, full speed. Drops before a curve (the sharper and the nearer, the lower) and ramps down as the known path ahead gets shorter (dead end). Changes smoothly (a few units per frame). Never falls below `Config.trackingMinValue` (default **5**), so the robot is never sent a full stop. Set that field to `0` for the full 0–100 range. |
 
 **Typical robot wiring:**
 
@@ -134,6 +189,8 @@ pipeline.configure(cfg);  // must be called BEFORE the first processFrame()
 ```
 
 Calling `configure()` later discards the calibration (colours given with `setTrackColors()` are kept), so calibrate again afterwards. The **Range** column gives the values the code accepts or that make sense; values outside it are clamped or have no useful effect.
+
+> **v3 / v2.** The v3 path tracker (default) uses *Line Colour*, *Camera Mount*, `trackLostGraceFrames`, `trackHoldFrames`, `trackLengthSlowdown`, `trackLengthFullFrac`, `trackingMinValue`, `calibFrames`, `steerHeadingCalibMaxDeg` and the v3 sections at the end ([Path Tracking](#path-tracking-v3--working-region-and-geometry) … [Tracking from the Path](#tracking-from-the-path-v3)). *Scan Strip*, *Look-Ahead Column*, *Track Memory* (except the two fields above), *Distractor Rejection*, *Steering from the Whole ⊥* and *Sensitivity* (except the tracking fields above) apply only to the v2 pipeline (`pathTracking = false`); the scan strip is still used to report `centroidXFrac`.
 
 ### Line Colour
 
@@ -266,6 +323,57 @@ cfg.trackingMinValue = 5;   // set before calling pipeline.configure(cfg)
 |---|---|---|---|---|
 | `calibFrames` | `int` | `10` | `≥ 1` | Number of solid detections `calibrate()` collects before locking the straight-ahead zero reference (it takes their median), the line width, the line-ness level and the heading zero. Assumes the robot is correctly placed on the line. Increase for more robust calibration. |
 
+
+### Path Tracking (v3) — Working Region and Geometry
+
+| Field | Type | Default | Range | Description |
+|---|---|---|---|---|
+| `pathTracking` | `boolean` | `true` | `true` / `false` | **v3** path tracking. `false` = the v2 ⊥ pipeline, unchanged (for comparison). Before calibration frames are processed by the v2 pipeline. |
+| `roiAuto` | `boolean` | `true` | `true` / `false` | Find the top of the working region during calibration (where the floor / line stop being reliably visible). `false` = up to the top of the image. The bottom is always just above the robot body (`bottomIgnoreFrac`). |
+| `roiTopMarginFrac` | `float` | `0.10f` | `0 … 0.5` | Safety margin below the found top, as a fraction of the visible floor distance. |
+| `learnCameraTilt` | `boolean` | `true` | `true` / `false` | Learn the camera tilt from how the line width changes with the row during calibration. Used only when consistent and within 25° of `cameraTiltDeg`; otherwise `cameraTiltDeg` is used. `FrameData.cameraTiltUsedDeg` shows the value used. |
+
+Distances in the v3 fields are in **camera heights** (the height of the phone's camera above the floor: 1.0 = 20 cm for a camera 20 cm high); curvatures in 1 / camera height.
+
+### Path Tracing and Memory (v3)
+
+| Field | Type | Default | Range | Description |
+|---|---|---|---|---|
+| `pathStep` | `float` | `0.10f` | `0.02 … 0.3` | Distance between two path points (camera heights). |
+| `pathTraceDirection` | `int` | `TRACE_BOTH` | `TRACE_BOTTOM_UP`, `TRACE_TOP_DOWN`, `TRACE_BOTH` | Order of tracing: near → far, far → near, or near → far plus a second pass that re-reads the gaps between two good sections from both sides (measured best). |
+| `pathFloorSpace` | `boolean` | `true` | `true` / `false` | Trace, fit and remember the path on the floor (bird's-eye; only path points are converted). `false` = the same algorithm in image coordinates (comparison only — clearly worse). |
+| `pathMemory` | `boolean` | `true` | `true` / `false` | Keep the path between frames, moved with the robot's motion. `false` = every frame from scratch (comparison only). |
+| `pathMemoryFrames` | `int` | `120` | `≥ 1` frames | How long a remembered point stays trusted without being confirmed (its confidence halves after ~0.7 × this while nothing is measured, ~4× longer while the path is tracked). Also the longest time the robot follows a remembered path while it is hidden or out of view in front of the robot. |
+| `pathMaxGap` | `float` | `2.5f` | `≥ 0` | Longest unreadable stretch (camera heights) bridged by continuity where there is no memory of the path. |
+
+### Disturbance Handling (v3)
+
+| Field | Type | Default | Range | Description |
+|---|---|---|---|---|
+| `colorMatchSigma` | `float` | `4.0f` | `2 … 8` | Colour match tolerance in standard deviations of the colours learned at calibration. A pixel within this of neither colour is unreliable. Smaller = more pixels unreliable; larger = disturbances may pass as line or floor. |
+| `lightLocalRange` | `float` | `1.6f` | `1.05 … 3` | Brightness change (×/÷) allowed around the local light level (measured from the floor next to the line) when matching colours. With brightness-only input (grayscale, `autoColor = false`) at most 1.3 is used. |
+
+### Steering — Pure Pursuit (v3)
+
+| Field | Type | Default | Range | Description |
+|---|---|---|---|---|
+| `pursuitLookAhead` | `float` | `1.2f` | `0.5 … 3` | Distance (camera heights) from the robot's turning point to the target point on the path. Larger = smoother, more inclined to cut tight curves; smaller = tighter, more weaving. Shortened automatically before sharp bends (never below 0.5). |
+| `pursuitPivotBehind` | `float` | `0.4f` | `0 … 2` | The robot's turning point (axle centre) behind the camera's floor point, camera heights (0.4 = 8 cm at 20 cm height). |
+| `steerPerCurvature` | `float` | `30f` | `> 0` | Steering per unit of pursuit curvature: steering = this × 2·lateral / distance² of the target point (limited to ±50). Suits "move steering" with gain 1 on a robot whose wheelbase is about 0.65 camera heights. |
+| `steerAutoGain` | `boolean` | `true` | `true` / `false` | Scale the steering to the robot automatically (×0.5 … ×2.5): while the robot follows a curve steadily it turns exactly as much as the path curves, so the ratio of path curvature to requested curvature reveals the program's gain and the robot's response. |
+
+### Tracking from the Path (v3)
+
+| Field | Type | Default | Range | Description |
+|---|---|---|---|---|
+| `powerFullCurvature` | `float` | `1.5f` | `> powerCurvatureDeadband` | Curvature (1 / camera height) at which tracking reaches its minimum (1.5 = radius 0.67 camera heights, 13 cm at 20 cm height). |
+| `powerCurvatureDeadband` | `float` | `0.2f` | `≥ 0` | Curvature up to which tracking stays 100 (gentle curves at full speed). |
+| `powerPreview` | `float` | `2.0f` | `> 0` | How far ahead (camera heights) curves count; a curve's effect fades with its distance. |
+| `powerRiseRate` | `float` | `3f` | `> 0` | Largest rise of the tracking output per frame. |
+| `powerFallRate` | `float` | `8f` | `> 0` | Largest fall per frame (a truly lost line still drops at once). |
+
+`trackLengthSlowdown` / `trackLengthFullFrac` keep their meaning: tracking ramps down when the known path ends on clean floor before `trackLengthFullFrac` of the view's depth (reaching the minimum when the end reaches the bottom of the view).
+
 ---
 
 ## Calibration
@@ -290,6 +398,8 @@ Calibration has two phases:
    - the steering zero reference (straight-ahead column),
    - the typical **line width** and **line-ness level** (used by distractor rejection),
    - the **heading zero** ψ₀ (only when `steerHeadingWeight ≠ 0`): the median line heading of the frames that saw enough look-ahead. It is used only if at least half of the frames saw it and it is within `steerHeadingCalibMaxDeg`; otherwise ψ₀ = 0.
+
+**v3 (default).** Phase 1 samples a tall region above the robot instead of the strip and keeps further colour clusters apart as disturbances (see [How v3 Works](#how-v3-works-path-tracking)); phase 2 scans the rows from the robot to the top of the image in each of the `calibFrames` frames and derives the working region (ROI), the line width per row and the camera tilt, the line width on the floor, the straight-ahead line and the heading zero, and the initial path. Rows hidden by a disturbance are simply not used, so calibration also works with glare or a shadow over part of the line.
 
 With the defaults calibration needs at least **15 frames** (5 + 10). It returns `true` once both phases are done. Progress and problems are reported in the callback (`calibPhase`, `calibProgress`, `calibIssue`):
 
@@ -340,6 +450,19 @@ pipeline.requestRecalibration();
 | Line comes back inside the lock gate (where it left) within `trackLostGraceFrames` (default 8) | normal again — the **same** line is re-locked | normal | `true` | `false` |
 | Gone for more than `trackLostGraceFrames` | stays at the last edge value (`±50`, slightly less if the calibrated column is far off-centre) | `trackingMinValue` | `false` | `false` |
 | A new line appears after that | full-width search: the band nearest the calibrated column with the calibrated width is taken | normal | `true` | `false` |
+
+### Lost or hidden line with path tracking (v3)
+
+v3 (the default) keeps the same rules and adds the path memory:
+
+| Situation (v3) | Steering | Tracking | `trackFound` | `lineHeld` |
+|---|---|---|---|---|
+| Path measured this frame (also when parts are hidden — they come from memory) | pure pursuit on the path | from the path | `true` | `false` |
+| Nothing measured, the remembered path lies in **unreliable** pixels (glare, shadow, object over all of the visible line) | pure pursuit on the remembered path | from it, decreasing gradually with the confidence | `false` | `true` |
+| Nothing measured, the remembered path has moved **below the view** (a sharp corner just in front of the robot) | pure pursuit on the remembered path, up to `pathMemoryFrames` | from it | `false` | `true` |
+| Clean floor where the line should be, in the middle of the image | last value held for `trackHoldFrames` (tracking keeps ramping down if the line's end was seen) | held | `false` | `true` |
+| Line left through the image **side**, or still gone after the above | `±50` toward the side the robot was turning to / the path leads | `trackingMinValue` | `false` | `false` |
+| Gone for more than `trackLostGraceFrames` | the whole view is searched every frame; a line found (nearest straight ahead / the side it left) replaces the memory | normal once found | — | — |
 
 Use `trackFound` (not `tracking == 5`) to show "TRACK LOST" — a hard turn also reads 5. With `trackMemory = false` there is no lock, no pinning and no hold: a missing line keeps the steering of its last position and tracking drops to the minimum. If calibration has not completed, see [If calibration cannot complete](#calibration).
 
@@ -439,7 +562,24 @@ pipeline.setFrameCallback(null);
 | `headingDeg` | `float` | Line heading relative to the robot on the floor, perspective-corrected, minus the calibrated zero. Degrees, positive = the line heads to the right. `0` when unknown (line not found, too little look-ahead, or `steerHeadingWeight = 0`). |
 | `headingConfidence` | `float` | Weight `0 … 1` the heading got this frame (`0` = too little / not a smooth line ahead → offset-only steering; also `0` when `steerHeadingWeight = 0`). |
 | `lineHeld` | `boolean` | `true` while the line is momentarily hidden mid-image and the last output is held (`trackHoldFrames`). |
-| `rejectedBands` | `int` | Number of candidate bands in the scan strip rejected or trimmed as distractors this frame (`0` with `rejectDistractors = false` and during calibration). |
+| `rejectedBands` | `int` | Number of candidate bands in the scan strip rejected or trimmed as distractors this frame (`0` with `rejectDistractors = false` and during calibration). v3: number of path measurements trimmed or rejected as too wide / too thin. |
+| `pathMode` | `boolean` | `true` when the frame was processed by the v3 path tracker. |
+| `roiTopFrac`, `roiBotFrac` | `float` | The working region (full width) — fractions of frame height. |
+| `pathColFrac[]`, `pathRowFrac[]` | `float[]` | The path, nearest to farthest, in image fractions (may lie outside `0 … 1` for remembered points out of view). Array size `PATH_MAX_POINTS` (**64**). During calibration: the rows where the line was found. |
+| `pathFwd[]`, `pathLat[]` | `float[]` | The same points on the floor, robot frame, camera heights (forward / lateral, + = right). |
+| `pathSource[]` | `byte[]` | Where each point came from: `PATH_SRC_FRESH` (measured now), `PATH_SRC_MEMORY` (remembered: out of the ROI or not readable), `PATH_SRC_UNRELIABLE` (in an unreliable region now, filled from memory), `PATH_SRC_PREDICTED` (bridged by continuity). |
+| `pathPointCount` | `int` | Number of valid path points. |
+| `pathFreshPoints`, `pathMemoryPoints`, `pathUnreliablePoints` | `int` | Counts by source (whole path). |
+| `pathMemoryFrac` | `float` | Fraction `0 … 1` of the path ahead (within `powerPreview`) that came from memory. |
+| `lookAheadValid`, `lookAheadXFrac`, `lookAheadYFrac`, `lookAheadFwd`, `lookAheadLat` | | The pure-pursuit target point: image fractions and floor (robot frame, camera heights). |
+| `pathCurvature`, `pathCurvatureAhead` | `float` | Curvature at the robot and the sharpest curvature ahead (1 / camera height, + = curves right). |
+| `pathOffset`, `pathHeadingDeg` | `float` | Lateral offset (camera heights, + = path right of the robot) and direction (degrees, + = heads right) of the path at the camera's floor point. |
+| `pathLength` | `float` | Length of the known path ahead (camera heights). |
+| `pathConfidence` | `float` | `0 … 1`: how well the path ahead is known (1 = measured now, or hidden but seen on both sides; drops only while it is truly unknown). |
+| `unreliableGrid` | `byte[]` | `RELIABILITY_GRID_COLS × RELIABILITY_GRID_ROWS` (24 × 32) cells over the ROI, row-major from its top-left; `1` = pixels match neither colour (glare, shadow edge, object, colour patch). |
+| `unreliableCells` | `int` | Number of unreliable cells. |
+| `motionFwd`, `motionLat`, `motionYawDeg` | `float` | Estimated robot motion per frame (camera heights, degrees + = right). |
+| `cameraTiltUsedDeg`, `lineWidthFloor` | `float` | Camera tilt used for the floor geometry; line width on the floor (camera heights). |
 
 ### Drawing the overlay
 
@@ -598,6 +738,9 @@ while (running) {
 | Hard turn | `±50` | `5–30` |
 | Line completely lost | `±50` | `5` *(the floor)* |
 | Back on a straight after a turn | `returns to 0` | `~100` |
+| *v3:* glare / shadow / object over part of the line, line visible before or after it | unchanged *(bridged from memory and continuity)* | unchanged |
+| *v3:* sharp corner just in front of the robot (below the view) | follows the remembered corner | low |
+| *v3:* background beyond a table edge at the top of the view | unchanged *(outside the ROI found at calibration)* | unchanged |
 
 ---
 
@@ -624,7 +767,8 @@ These values come from simulation, not from the real robot — verify them on th
 - A line that jumps sideways by more than the line-lock gate in a single frame (`trackMemoryGateMult` × line width, around the line's predicted position) is treated as leaving the line — this is what makes the lock ignore reflections.
 - The heading part of the steering relies on `cameraTiltDeg` and `verticalFovDeg` matching the real camera. The Android app runs at 960 × 1280 (CameraX picks 1280 × 960, rotated to portrait).
 - Very harsh scenes can still defeat colour learning: e.g. a dark floor in deep shadow, with strong texture, where the tape is only ~10 grey-levels darker than the shadowed floor. Even lighting helps.
-- Performance: ≈ 0.9 ms per frame in YUV colour mode at 960 × 1280 on a desktop CPU (several times more on a phone, still far below the 16.7 ms of 60 Hz); all per-frame buffers are pre-allocated (no garbage per frame, in all three input formats).
+- Performance (v3): {{PERF}} per frame in YUV colour mode at 960 × 1280 on a desktop CPU (v2: ≈ 0.9 ms) — v3 reads only the pixels along the path (a few thousand samples), never the whole image; all per-frame buffers are pre-allocated (no garbage per frame, in all three input formats).
+- v3 needs the camera geometry only roughly (`cameraTiltDeg` within ~25°, `verticalFovDeg`): the tilt is learned at calibration and the line width per row is measured. Calibrate on a straight section, robot straight and centred.
 
 ---
 
@@ -632,8 +776,8 @@ These values come from simulation, not from the real robot — verify them on th
 
 `RoboPhoneApp/` is an Android app that runs the library live on the phone camera (CameraX → packed YUV 4:2:0 → `calibrateYuv420` / `processFrameYuv420`). Everything on screen comes from the library's `FrameCallback`:
 
-- **Overlay** — cyan STEER strip with the detected line, magenta look-ahead band that bends along the line, dashed calibrated straight-ahead line, red ignored robot-body band. The overlay is mapped with the preview's FILL_CENTER crop so it lines up with the camera image.
-- **HUD** — STEER bar (−50…+50), TRACK bar (min…100 %), status (calibration progress and problems / TRACKING / TRACK LOST), FPS, learned LINE and FLOOR colour swatches, threshold and colour separation. The app does not show the new v2 `FrameData` fields yet.
+- **Overlay (v3)** — the working region (white frame), unreliable cells (red), the traced path coloured by where each point came from (green = measured now, blue = memory, orange = hidden now and filled from memory, yellow = bridged), the look-ahead target (magenta circle) with a line from the robot, a steering arrow, red ignored robot-body band. With `pathTracking = false` the v2 ⊥ (cyan strip, magenta look-ahead band) is drawn. The overlay is mapped with the preview's FILL_CENTER crop so it lines up with the camera image.
+- **HUD** — STEER bar (−50…+50), TRACK bar (min…100 %), status (calibration progress and problems / TRACKING / TRACK LOST), FPS, learned LINE and FLOOR colour swatches, colour separation, and in v3 the path confidence and the share of the path from memory.
 - **RECALIBRATE** button — re-learns the colours and the straight-ahead reference (place the robot on the line first).
 
 ---
@@ -647,6 +791,6 @@ cd LineFollowerLibrary
 gradlew test
 ```
 
-All **26 tests pass** with the v2 defaults. The steering tests check the offset part (19 for a line 60 px right) and that the heading part steers the same way; `lostLineReportsTrackLost` checks the hold of `trackHoldFrames` frames before tracking drops to 5. Two tests (`v1SteeringIsOffsetOnly`, `v1LostLineDropsTrackingAtOnce`) check that `steerHeadingWeight = 0` and `trackHoldFrames = 0` give the v1 behaviour. `gradlew jar` and the app build do not run the tests.
+All **45 tests pass** with the v3 defaults: the 26 earlier tests (expectations adapted to v3 where the approach changed — see `_investigation/CHANGES_v3.md`; the v1/v2 tests run with `pathTracking = false`) and 19 v3 regression tests in `PathTrackingTest` — one per scenario: straight, gentle and sharp curves both ways, S-curve, line leaving the side, start at an angle / offset, table edge at the top, a blob and a bright stripe beside the line, the robot's own shadow, glare on a straight and on a curve (the real example), a disturbance matrix of 4 colour pairs × 6 disturbance types, disturbances during calibration, the new `FrameData` fields, and the option switches. `gradlew jar` and the app build do not run the tests.
 
 RoboPhoneApp pulls the library in **from source** through a Gradle composite build (`includeBuild("../LineFollowerLibrary")` in `settings.gradle.kts`), so library changes show up in the app on the next build — no jar copying.

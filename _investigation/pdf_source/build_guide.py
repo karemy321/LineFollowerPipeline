@@ -32,15 +32,17 @@ OUT_HTML = HERE / "guide.html"
 EDGE = Path(r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe")
 
 # Badges in the first column of tables (field names / row labels).
-NEW = {"rejectDistractors", "bandMaxWidthMult", "bandMinWidthMult", "trackHoldFrames",
-       "steerOffsetWeight", "steerHeadingWeight", "steerLookAhead", "steerHeadingMinRows",
-       "steerHeadingCalibMaxDeg", "steerOffsetTerm", "steerHeadingTerm", "headingDeg",
-       "headingConfidence", "lineHeld", "rejectedBands",
-       "Robot at an angle to a straight line", "Dark object / shadow beside or touching the line",
-       "Line hidden for a moment in the middle of the image"}
-# CHANGED = existing items whose behaviour changed in v2.
-CHANGED = {"trackMemory", "trackMemoryGateMult", "trackRelockFrames", "cameraTiltDeg",
-           "vRoiHalfWidthPx", "calibFrames", "steering", "tracking"}
+NEW = {"pathTracking", "roiAuto", "roiTopMarginFrac", "learnCameraTilt", "pathStep", "pathTraceDirection",
+       "pathFloorSpace", "pathMemory", "pathMemoryFrames", "pathMaxGap", "colorMatchSigma", "lightLocalRange",
+       "pursuitLookAhead", "pursuitPivotBehind", "steerPerCurvature", "steerAutoGain", "powerFullCurvature",
+       "powerCurvatureDeadband", "powerPreview", "powerRiseRate", "powerFallRate",
+       "pathMode", "roiTopFrac", "pathColFrac", "pathFwd", "pathSource", "pathPointCount", "pathFreshPoints",
+       "pathMemoryFrac", "lookAheadValid", "pathCurvature", "pathOffset", "pathLength", "pathConfidence",
+       "unreliableGrid", "unreliableCells", "motionFwd", "cameraTiltUsedDeg"}
+# CHANGED = existing items whose behaviour changed in v3.
+CHANGED = {"steering", "tracking", "cameraTiltDeg", "bottomIgnoreFrac", "calibFrames", "colorCalibFrames",
+           "trackHoldFrames", "trackLostGraceFrames", "trackLengthSlowdown", "trackLengthFullFrac", "rejectedBands",
+           "centroidXFrac", "lookAheadColFrac"}
 MAX_CODE_CHARS = 103   # A4 code block holds ~104 Consolas 8.8pt characters (503 pt / 4.84 pt)
 
 md = README.read_text(encoding="utf-8")

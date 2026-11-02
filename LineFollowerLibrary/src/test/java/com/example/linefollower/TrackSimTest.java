@@ -124,8 +124,14 @@ public class TrackSimTest {
         return out;
     }
 
+    /**
+     * The last frames on the exit straight read 0. (v2 checked the last 8 frames; v3
+     * follows its path memory while the line is out of view in the scripted cut —
+     * the pose moves 2 cm per frame and is not driven by the steering — and is back
+     * on the line 3 frames later, so the last 5 are checked.)
+     */
     private static void assertEndsCentred(List<int[]> run) {
-        for (int i = run.size() - 8; i < run.size(); i++) {
+        for (int i = run.size() - 5; i < run.size(); i++) {
             assertEquals("steering back to 0 on the straight (frame " + i + ")", 0, run.get(i)[0], 2);
             assertEquals("line found", 1, run.get(i)[1]);
         }
