@@ -51,7 +51,10 @@ def num(s):
     s = s.strip("`").strip()
     if s in ("true", "false"):
         return s
-    return float(s.rstrip("f"))
+    try:
+        return float(s.rstrip("f"))
+    except ValueError:
+        return s.strip("`")   # symbolic default (e.g. TRACE_BOTH): compared as text
 
 
 def in_pdf(text, name):

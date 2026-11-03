@@ -746,14 +746,14 @@ while (running) {
 
 ## Recommended Starting Values (lecturer's test program)
 
-For the Blockly test program — **motor steering = (0 − Steering) × c** and **motor power = round(x × (Power / 8) + 5)**, where *Steering* is `result[0]` and *Power* is the Tracking value `result[1]` — the closed-loop simulation (`_investigation/CHANGES_v2.md`, §7) recommends:
+For the Blockly test program — **motor steering = (0 − Steering) × c** and **motor power = round(x × (Power / 8) + 5)**, where *Steering* is `result[0]` and *Power* is the Tracking value `result[1]` — the closed-loop simulation (`_investigation/CHANGES_v3.md`, §9) recommends:
 
 | Setting | Start with | Notes |
 |---|---|---|
-| Steering gain **c** | **`1.0`** | Not `0.5`: the steering output was halved to ±50 (11 Oct 2026) after the program was written, so `0.5` now gives only half the steering authority. `0.5` is a gentler alternative on tracks without sharp corners. Keep `c ≤ 1.0` when power follows Tracking (`x = 1`). |
-| Power mode **x** | **`0`** first (constant power 5), then **`1`** | With `x = 1` the power is about 6 … 18 and drops before turns. If the robot weaves with `x = 1`, use a larger divisor (e.g. `Power / 12`) before lowering `c`. |
-| Offset **+ 5** | `5` | If the robot does not move at power 5 (motor dead zone), raise it to 6–8 rather than raising `c`. |
-| Library | defaults | `steerHeadingWeight = 1`, `steerLookAhead = 0.5`. Set `cameraTiltDeg` to the real mount angle. If the robot cuts tight curves, lower `steerLookAhead` to `0.25`; if it hesitates when crossing the line at an angle, raise it to `0.75 … 1.0`. |
+| Steering gain **c** (Ks) | **`1.0`** — unchanged | v3 completed all 88 runs with c = 1 in the realistic regime (RMS lateral error 1.1 cm, v2 2.7 cm). `0.5` also works (85 / 88; the 3 failures are the sharp 90° corner with distractors — v2 fails the mirrored corner there) and `steerAutoGain` adapts the scale. No change is needed in the block. |
+| Power mode **x** (Kp) | **`0`** first, then **`1`** with `Power / 8` — unchanged | Tracking is now smooth (no stop-and-go), so `x = 1` is safe to try earlier than with v2. |
+| Offset **+ 5** | `5` | If the robot does not move at power 5 (motor dead zone), raise it to 6–8. |
+| Library | defaults | Set `cameraTiltDeg` roughly (it is refined at calibration) and `bottomIgnoreFrac` so the robot body is excluded. If the robot weaves, raise `pursuitLookAhead` (1.5); if it cuts tight curves, lower it (1.0). |
 
 These values come from simulation, not from the real robot — verify them on the track (and keep `x = 0` if the measured Blockly loop rate is well below ~15 Hz).
 
@@ -767,7 +767,7 @@ These values come from simulation, not from the real robot — verify them on th
 - A line that jumps sideways by more than the line-lock gate in a single frame (`trackMemoryGateMult` × line width, around the line's predicted position) is treated as leaving the line — this is what makes the lock ignore reflections.
 - The heading part of the steering relies on `cameraTiltDeg` and `verticalFovDeg` matching the real camera. The Android app runs at 960 × 1280 (CameraX picks 1280 × 960, rotated to portrait).
 - Very harsh scenes can still defeat colour learning: e.g. a dark floor in deep shadow, with strong texture, where the tape is only ~10 grey-levels darker than the shadowed floor. Even lighting helps.
-- Performance (v3): {{PERF}} per frame in YUV colour mode at 960 × 1280 on a desktop CPU (v2: ≈ 0.9 ms) — v3 reads only the pixels along the path (a few thousand samples), never the whole image; all per-frame buffers are pre-allocated (no garbage per frame, in all three input formats).
+- Performance (v3): ≈ 0.4 ms (median 0.37–0.41 ms; v2 on the same frames and machine: 2.3–2.4 ms) per frame in YUV colour mode at 960 × 1280 on a desktop CPU (v2: ≈ 0.9 ms) — v3 reads only the pixels along the path (a few thousand samples), never the whole image; all per-frame buffers are pre-allocated (no garbage per frame, in all three input formats).
 - v3 needs the camera geometry only roughly (`cameraTiltDeg` within ~25°, `verticalFovDeg`): the tilt is learned at calibration and the line width per row is measured. Calibrate on a straight section, robot straight and centred.
 
 ---

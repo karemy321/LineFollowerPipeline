@@ -4287,10 +4287,12 @@ public final class LineFollowerPipeline {
         return Math.max(-2f, Math.min(2f, (far ? 1f : -1f) * k));
     }
 
+    private static final float[] CORNER_ANGLES = {25f, 40f, 55f, 70f, 85f, 100f};
+
     /** The line turns sharply: probe directions turned up to ±100° from the last point. */
     private boolean cornerSearch(boolean far, float lx, float ly, float hx, float hy) {
         final float ds = Math.max(0.02f, cfg.pathStep);
-        final float[] angles = {25f, 40f, 55f, 70f, 85f, 100f};
+        final float[] angles = CORNER_ANGLES;
         float bestQ = 0f, bx = 0f, by = 0f;
         for (float ang : angles) {
             for (int sgn = -1; sgn <= 1; sgn += 2) {

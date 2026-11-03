@@ -321,7 +321,7 @@
   <li>A line that jumps sideways by more than the line-lock gate in a single frame (<code>trackMemoryGateMult</code> × line width, around the line's predicted position) is treated as leaving the line — this is what makes the lock ignore reflections.</li>
   <li>v3 needs the camera geometry only roughly (<code>cameraTiltDeg</code> within ~25°, <code>verticalFovDeg</code>): the tilt is learned at calibration and the line width per row is measured. The Android app runs at 960 × 1280 (CameraX picks 1280 × 960, rotated to portrait).</li>
   <li>Very harsh scenes can still defeat colour learning: e.g. a dark floor in deep shadow, with strong texture, where the tape is only ~10 grey-levels darker than the shadowed floor. Even lighting helps.</li>
-  <li>Performance (v3): {{PERF}} per frame in YUV colour mode at 960 × 1280 on a desktop CPU (v2: ≈ 0.9 ms) — v3 reads only the pixels along the path, never the whole image; all per-frame buffers are pre-allocated (no garbage per frame, in all three input formats).</li>
+  <li>Performance (v3): ≈ 0.4 ms (median 0.37–0.41 ms; v2 on the same frames and machine: 2.3–2.4 ms) per frame in YUV colour mode at 960 × 1280 on a desktop CPU (v2: ≈ 0.9 ms) — v3 reads only the pixels along the path, never the whole image; all per-frame buffers are pre-allocated (no garbage per frame, in all three input formats).</li>
 </ul>
 
 <h2>RoboPhoneApp — Android Reference Integration</h2>
