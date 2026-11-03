@@ -694,6 +694,8 @@ public final class LineFollowerPipeline {
     //     f = (kR·R + kG·G + kB·B + kC) >> 10        (ARGB input, same function)
     // scaled so the floor colour maps to ~64 and the line colour to ~192.
     private static final int SAMPLES_PER_FRAME = 2048;
+    private static final int STRIPE_EXTRA = 512;
+    private static final boolean STRIPE_LINE_MODEL = false;   // line model from the stripe statistics only (measured worse; the stripe pixels join the line cluster instead)
     private boolean colorReady;
     private boolean colorPreset;        // set via setTrackColors(); survives re-init
     private int     colorFramesSampled;
@@ -1056,7 +1058,8 @@ public final class LineFollowerPipeline {
         colWeight         = new int[width];
         colLevel          = new int[width];
         work              = new byte[width * height];
-        final int maxSamples = Math.max(1, config.colorCalibFrames) * SAMPLES_PER_FRAME;
+        // (+ STRIPE_EXTRA slots for the stripe's own pixels, v3 calibration only)
+        final int maxSamples = Math.max(1, config.colorCalibFrames) * SAMPLES_PER_FRAME + STRIPE_EXTRA;
         sampY             = new short[maxSamples];
         sampU             = new short[maxSamples];
         sampV             = new short[maxSamples];
@@ -1420,7 +1423,7 @@ public final class LineFollowerPipeline {
         final int nRows = Math.min(8, rows);
         final int stepR = Math.max(1, rows / nRows);
         final int stepC = Math.max(1, (W * nRows + SAMPLES_PER_FRAME - 1) / SAMPLES_PER_FRAME);
-        final int cap   = sampY.length;
+        final int cap   = sampY.length - STRIPE_EXTRA;
 
         for (int row = hRoiTop; row < hRoiBot && sampleCount < cap; row += stepR) {
             for (int col = 0; col < W && sampleCount < cap; col += stepC) {
@@ -2879,8 +2882,7 @@ public final class LineFollowerPipeline {
     // ── Control state ───────────────────────────────────────────────────────
     private float   v3Tracking = 100f;      // rate-limited tracking output
     private int     outSteer = 0, outTrack = 100;   // last whole-number outputs (hysteresis)
-    private static final float OUT_HYST = 0.8f, TRACK_HYST = 4f;
-    private float   trackHold = 100f;       // tracking target with hysteresis
+    private static final float OUT_HYST = 0.8f;
 
     private static final float AG_RATE = 0.01f;   // steering-scale adaptation per frame
     private int     v3LostFrames, v3HoldFrames, v3BlindFrames;
@@ -3405,7 +3407,7 @@ public final class LineFollowerPipeline {
         final int nRows = Math.min(24, r1 - r0);
         final float stepR = (r1 - r0) / (float) nRows;
         final int stepC = Math.max(1, (W * nRows + SAMPLES_PER_FRAME - 1) / SAMPLES_PER_FRAME);
-        final int cap = sampY.length;
+        final int cap = sampY.length - STRIPE_EXTRA;
         for (int k = 0; k < nRows && sampleCount < cap; k++) {
             final int row = Math.min(r1 - 1, r0 + Math.round((k + 0.5f) * stepR));
             for (int col = 0; col < W && sampleCount < cap; col += stepC) {
@@ -3448,6 +3450,9 @@ public final class LineFollowerPipeline {
     private double stY, stU, stV;                     // stripe colour (U, V centred on 0)
     private final double[] stCov = new double[6];
     private float  stCol, stW;                        // centre / width (px) in the stripe's lowest row
+    // the stripe's pooled runs (pixel row, interior columns) and the sample count after adoptStripe
+    private final int[] stRunRow = new int[40], stRunX0 = new int[40], stRunX1 = new int[40];
+    private int    stRunN, adoptN;
 
     /**
      * The line at calibration, found by what makes it a line rather than by its
@@ -3510,8 +3515,8 @@ public final class LineFollowerPipeline {
         final float[] gainBuf = new float[ns];
         final int MAXR = NR * 8;
         final float[] rC = new float[MAXR], rWpx = new float[MAXR];
-        final float[] rMY = new float[MAXR], rMU = new float[MAXR], rMV = new float[MAXR];
-        final int[] rRow = new int[MAXR];
+        final float[] rMY = new float[MAXR], rMU = new float[MAXR], rMV = new float[MAXR], rCon = new float[MAXR];
+        final int[] rRow = new int[MAXR], rRowPx = new int[MAXR], rX0 = new int[MAXR], rX1 = new int[MAXR];
         final double[] rS = new double[MAXR * 10];
         int nr = 0, rows = 0;
         for (int kr = 0; kr < NR; kr++) {
@@ -3549,6 +3554,12 @@ public final class LineFollowerPipeline {
                 rRow[nr] = kr;
                 rC[nr] = cpx; rWpx[nr] = len * step;
                 rMY[nr] = (float) ty; rMU[nr] = (float) tu; rMV[nr] = (float) tv;
+                rRowPx[nr] = row; rX0[nr] = i0 * step; rX1[nr] = i1 * step;
+                {   // contrast against the floor beside it, relative to the floor's brightness
+                    final float fy = 0.5f * (sy[a - 4] + sy[b + 4]), fu = 0.5f * (su[a - 4] + su[b + 4]), fv = 0.5f * (sv[a - 4] + sv[b + 4]);
+                    final float dy = (float) ty - fy, du = (float) tu - fu, dv = (float) tv - fv;
+                    rCon[nr] = (float) Math.sqrt(dy * dy + du * du + dv * dv) / (Math.abs(fy) + 20f);
+                }
                 final int o = nr * 10;
                 for (int i = i0; i <= i1; i++) {
                     final double y = sy[i], u = su[i], v = sv[i];
@@ -3572,6 +3583,7 @@ public final class LineFollowerPipeline {
                 bestS = s; best = i; System.arraycopy(chain, 0, bestChain, 0, s);
             }
         }
+        if (System.getProperty("dbgs") != null) System.err.println("stripe: rows=" + rows + " runs=" + nr + " best=" + bestS);
         if (best < 0 || bestS < 6 || bestS * 100 < 15 * rows) return false;
         final int[] pickRow = new int[NR];
         final float[] pY = new float[NR], pU = new float[NR], pV = new float[NR];
@@ -3580,34 +3592,32 @@ public final class LineFollowerPipeline {
             final int pick = bestChain[c];
             pickRow[np] = pick; pY[np] = rMY[pick]; pU[np] = rMU[pick]; pV[np] = rMV[pick]; np++;
         }
-        // The line's colour: the most common run colour (the run with the most others
-        // close to it) and the runs near it. Where a disturbance tints part of the
-        // stripe (glare, a cast, a shadow edge) the tint changes from row to row, so
-        // those rows do not gather around one colour and are left out.
-        float medY = pY[0], medU = pU[0], medV = pV[0];
-        {
-            int bestN = -1;
-            for (int p = 0; p < np; p++) {
-                final float cY = pY[p] - fmY, cU = pU[p] - fmU, cV = pV[p] - fmV;
-                final float l = Math.max(10f, 0.15f * (float) Math.sqrt(cY * cY + cU * cU + cV * cV));
-                int c = 0;
-                for (int q = 0; q < np; q++) {
-                    final float dY = pY[q] - pY[p], dU = pU[q] - pU[p], dV = pV[q] - pV[p];
-                    if (dY * dY + dU * dU + dV * dV <= l * l) c++;
-                }
-                if (c > bestN) { bestN = c; medY = pY[p]; medU = pU[p]; medV = pV[p]; }
-            }
-        }
-        final float cY = medY - fmY, cU = medU - fmU, cV = medV - fmV;
-        final float lim = Math.max(10f, 0.15f * (float) Math.sqrt(cY * cY + cU * cU + cV * cV));
+        // The line's colour: from the runs with the HIGHEST CONTRAST against the floor
+        // beside them (the top 40 %). Glare, haze, a halo or a cast over part of the
+        // stripe always bring line and floor closer together, so those rows are left out.
         final double[] S = new double[10];
         int lowRow = Integer.MAX_VALUE;
-        for (int p = 0; p < np; p++) {
-            final float dY = pY[p] - medY, dU = pU[p] - medU, dV = pV[p] - medV;
-            if (dY * dY + dU * dU + dV * dV > lim * lim) continue;
-            final int pick = pickRow[p];
-            for (int t = 0; t < 10; t++) S[t] += rS[pick * 10 + t];
-            if (rRow[pick] < lowRow) { lowRow = rRow[pick]; stCol = rC[pick]; stW = rWpx[pick]; }
+        {
+            stRunN = 0;
+            final float[] con = new float[np];
+            for (int p = 0; p < np; p++) con[p] = rCon[pickRow[p]];
+            final float[] srt = java.util.Arrays.copyOf(con, np);
+            java.util.Arrays.sort(srt);
+            final float thr = srt[Math.min(np - 1, Math.max(0, (int) Math.floor(0.6f * np)))];
+            for (int p = 0; p < np; p++) {
+                if (con[p] < thr) continue;
+                final int pick = pickRow[p];
+                for (int t = 0; t < 10; t++) S[t] += rS[pick * 10 + t];
+                if (rRow[pick] < lowRow) { lowRow = rRow[pick]; stCol = rC[pick]; stW = rWpx[pick]; }
+                if (stRunN < stRunRow.length) {
+                    stRunRow[stRunN] = rRowPx[pick]; stRunX0[stRunN] = rX0[pick]; stRunX1[stRunN] = rX1[pick]; stRunN++;
+                }
+            }
+            // position / width for the geometry phase: the lowest run of the whole chain
+            for (int p = 0; p < np; p++) {
+                final int pick = pickRow[p];
+                if (rRow[pick] < lowRow) { lowRow = rRow[pick]; stCol = rC[pick]; stW = rWpx[pick]; }
+            }
         }
         if (S[0] < 8) return false;
         stY = S[1] / S[0]; stU = S[2] / S[0]; stV = S[3] / S[0];
@@ -3691,6 +3701,19 @@ public final class LineFollowerPipeline {
             final float d = y * (si[0] * y + 2f * (si[1] * u + si[2] * v)) + u * (si[3] * u + 2f * si[4] * v) + si[5] * v * v;
             if (d <= 16f) { sampLabel[i] = (byte) k; m++; }
         }
+        // the stripe's own pixels (they may be missing from the samples, which come from
+        // the region near the robot — a disturbance there greys the line)
+        final int cap = sampY.length;
+        // (only when the samples hold few line pixels — in a clean scene they hold plenty)
+        for (int r = 0; r < stRunN && n < cap && m < 64; r++) {
+            for (int col = stRunX0[r]; col <= stRunX1[r] && n < cap; col += 2) {
+                readPixel(col, stRunRow[r]);
+                sampY[n] = (short) Math.round(sY); sampU[n] = (short) Math.round(sU + 128f); sampV[n] = (short) Math.round(sV + 128f);
+                sampCol[n] = (short) col; sampRow[n] = (short) stRunRow[r]; sampLabel[n] = (byte) k;
+                n++; m++;
+            }
+        }
+        adoptN = n;
         if (m < 8) return -1;
         final int k2 = k + 1;
         final double[] sum = new double[k2 * 3];
@@ -3746,6 +3769,7 @@ public final class LineFollowerPipeline {
             final double[] c2 = new double[k2 * 3];
             final int[] count2 = new int[k2];
             if (adoptStripe(n, k, c2, count2, floor) < 0) { calibIssue = ISSUE_NO_LINE; return false; }
+            n = adoptN;
             final int[] left2 = new int[k2], right2 = new int[k2];
             for (int i = 0; i < n; i++) {
                 final int col = sampCol[i], lbl = sampLabel[i];
@@ -3757,6 +3781,27 @@ public final class LineFollowerPipeline {
                 colorReady = false; colorSeparation = 0f; lineColorArgb = 0; floorColorArgb = 0;
                 calibIssue = ISSUE_LOW_CONTRAST;
                 return false;
+            }
+            // The line model is the stripe's own colour (its highest-contrast rows) with a
+            // wider spread for blurred edges: the samples gathered near the robot may be
+            // greyed by a disturbance there and must not shift it.
+            {
+                final double[] cv = stCov.clone();
+                for (int j = 0; j < 6; j++) cv[j] *= 2.0;
+                cv[0] += 12.0; cv[3] += 4.0; cv[5] += 4.0;
+                final float[] keepM = cmL.clone(), keepI = ciL.clone(), keepA = caL.clone();
+                final float keepK = ckL;
+                if (STRIPE_LINE_MODEL && setModel(true, 0, stY, stU, stV, cv)) {
+                    finishModels();
+                    final float r = lightRange();
+                    boolean okM = classify(cmL[0], cmL[1], cmL[2], 1f / r, r, 1f) == CL_LINE;
+                    for (int j = 0; j < nFloorModels && okM; j++) okM = classify(cmF[j * 3], cmF[j * 3 + 1], cmF[j * 3 + 2], 1f / r, r, 1f) == CL_FLOOR;
+                    if (okM) lineColorArgb = yuvToArgb(stY, stU + 128, stV + 128);
+                    else {   // keep the cluster model
+                        System.arraycopy(keepM, 0, cmL, 0, 3); System.arraycopy(keepI, 0, ciL, 0, 6); System.arraycopy(keepA, 0, caL, 0, 3);
+                        ckL = keepK; finishModels();
+                    }
+                }
             }
             learnedLineX = stCol;
             learnedLineW = stW;
@@ -3842,7 +3887,7 @@ public final class LineFollowerPipeline {
                                   int[] left, int[] right, int leftTotal, int rightTotal) {
         modelLumaOnly = false;
         if (!modelFromCluster(n, line, true, 0)) return false;
-        if (!modelFromCluster(n, floor, false, 0)) return false;
+        if (!floorModelRobust(n, floor) && !modelFromCluster(n, floor, false, 0)) return false;
         nFloorModels = 1;
         finishModels();
         // Other clusters: a second floor colour if it also fills both edges and is
@@ -3863,6 +3908,51 @@ public final class LineFollowerPipeline {
             if (classify(cmF[j * 3], cmF[j * 3 + 1], cmF[j * 3 + 2], 1f / r, r, 1f) != CL_FLOOR) return false;
         }
         return true;
+    }
+
+    /**
+     * The main floor model, robust: the floor cluster's samples trimmed at 3σ
+     * twice. A disturbance near the robot at calibration (a glare halo: lighter,
+     * greyer floor) otherwise widens the floor colour towards the line's, and the line
+     * then fits both colours (= unreliable) everywhere. False if too few samples.
+     */
+    private boolean floorModelRobust(int n, int cl) {
+        double my = 0, mu = 0, mv = 0;
+        final double[] cov = new double[6];
+        final float[] inv = new float[6];
+        int cnt = 0, total = 0;
+        for (int it = 0; it < 3; it++) {
+            double sy = 0, su = 0, sv = 0; cnt = 0;
+            final double[] cv = new double[6];
+            for (int pass = 0; pass < 2; pass++) {
+                for (int i = 0; i < n; i++) {
+                    if (sampLabel[i] != cl) continue;
+                    final float y = sampY[i], u = sampU[i] - 128, v = sampV[i] - 128;
+                    if (it > 0) {
+                        final float dy = y - (float) my, du = u - (float) mu, dv = v - (float) mv;
+                        final float d = dy * (inv[0] * dy + 2f * (inv[1] * du + inv[2] * dv)) + du * (inv[3] * du + 2f * inv[4] * dv) + inv[5] * dv * dv;
+                        if (d > 9f) continue;
+                    }
+                    if (pass == 0) { sy += y; su += u; sv += v; cnt++; }
+                    else {
+                        final double dy = y - sy, du = u - su, dv = v - sv;
+                        cv[0] += dy * dy; cv[1] += dy * du; cv[2] += dy * dv; cv[3] += du * du; cv[4] += du * dv; cv[5] += dv * dv;
+                    }
+                }
+                if (pass == 0) { if (cnt < 32) return false; sy /= cnt; su /= cnt; sv /= cnt; }
+            }
+            if (it == 0) total = cnt;
+            for (int j = 0; j < 6; j++) cov[j] = cv[j] / cnt;
+            cov[0] += 6.0; cov[3] += 3.0; cov[5] += 3.0;
+            my = sy; mu = su; mv = sv;
+            if (!invert3(cov, inv, 0)) return false;
+        }
+        // only a cluster that really holds outliers (≥ 3 % trimmed, e.g. a glare halo)
+        // gets the trimmed model; otherwise the plain cluster model is used
+        if (cnt > 0.97 * total) return false;
+        // (the trimming cuts the tails of the distribution: widen it back a little)
+        for (int j = 0; j < 6; j++) cov[j] *= 1.5;
+        return setModel(false, 0, my, mu, mv, cov);
     }
 
     /** Mean and covariance of cluster {@code cl} → model. */
@@ -4178,7 +4268,7 @@ public final class LineFollowerPipeline {
         memN = 0; ndN = 0;
         velX = 0f; velY = 0f; velT = 0f; corrX = 0f; corrY = 0f; corrT = 0f;
         mPxx = MOTION_P0X; mPxt = 0f; mPtt = MOTION_P0T; motionMeasured = false;
-        v3Tracking = 100f; v3LostFrames = 0; v3HoldFrames = 0; v3BlindFrames = 0; v3LastSteer = 0f; outSteer = 0; outTrack = 100; trackHold = 100f;
+        v3Tracking = 100f; v3LostFrames = 0; v3HoldFrames = 0; v3BlindFrames = 0; v3LastSteer = 0f; outSteer = 0; outTrack = 100;
         prGain = 1f; lightRef = 1f; ambRef = 1f; pathEnd = END_OUT; pathExitSide = 0f;
         ctTarget = false;
         ctCurvAheadPrev = 100f; ctCurvPivot = 0f; ctCurv = 0f;
@@ -5201,10 +5291,6 @@ public final class LineFollowerPipeline {
         }
         if (ctConf < 0.5f) t = tMin + (t - tMin) * Math.max(0f, ctConf) / 0.5f;
         t = Math.max(tMin, Math.min(100f, t));
-        // small wobbles of the target (curvature noise far ahead) do not move the power:
-        // it follows only changes of more than TRACK_HYST units (the ends exactly)
-        if (Math.abs(t - trackHold) > TRACK_HYST || t >= 99.5f || t <= tMin + 0.5f) trackHold = t;
-        t = trackHold;
         // light smoothing of the target (the path is re-measured every frame)
         ctCurvAheadPrev += 0.3f * (t - ctCurvAheadPrev);
         if (t <= tMin + 0.5f && ctCurvAheadPrev < tMin + 2f) ctCurvAheadPrev = tMin;

@@ -11,7 +11,7 @@ mkdir -p $O
 T=straight,gentle,gentleR,scurve,scurveR,sharp90,sharp90L,tightL,tightR,oval,lap
 for v in "both:pathTraceDirection=2" "bottomup:pathTraceDirection=0" "topdown:pathTraceDirection=1" "image:pathFloorSpace=false" "nomemory:pathMemory=false"; do
   name=${v%%:*}; set=${v#*:}
-  X="-Xmx2g -Dlib.tag=v3 -Dlib.set=$set"
+  X="-Xmx${XMX:-2g} -Dlib.tag=v3 -Dlib.set=$set"
   "$J" $X -cp "build/$LIB;build/harness" harness.Matrix $O/matrix_$name.csv $TH > /dev/null
   "$J" $X -Dsweep.t=$T -Dsweep.s=black_on_wood,white_on_dark -Dsweep.d=0,1 -Dsweep.c=0.5,1.0 -Dsweep.x=0,1 -Dsweep.v=1.0 -Dsim.lat=0.15 -Dsim.hz=20 -Dsim.dead=2 -cp "build/$LIB;build/harness" harness.ClosedLoop $O/real_$name.csv sweep $TH > /dev/null
   "$J" $X -cp "build/$LIB;build/harness" harness.Jitter $O/jitter_$name.csv $TH > /dev/null
