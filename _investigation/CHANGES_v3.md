@@ -6,6 +6,231 @@ Baseline "v2" in every table = the library at `202e70f`, compiled from `git show
 
 ---
 
+## v3.1 — steady outputs under real glare
+
+*Added after the first test on the real robot. Sections 1–12 below describe v3 as first
+delivered ("v3 before" in the tables here); the numbers in this section are the final ones.*
+
+### The report
+
+On the real robot, with glare from the room light on the path, STEER and POWER did not stay
+steady: they kept jumping between several values. This was given top priority over every
+simulated case.
+
+### Reproducing it
+
+The first simulator drew glare as a smooth, steady whitening spot — v3 passed it, which is why
+the problem was not seen. Real glare is different, and the harness now has it
+(`Disturb` type `glareReal`, also `TrackSim.realGlare` for the unit tests):
+
+- the core **clips** to white (flat 255, no colour), with a soft halo;
+- the surface (varnish, wood grain, tape) breaks it into **streaks** that are fixed on the floor,
+  so they change as the robot moves;
+- it **flickers** every frame (mains light against the exposure, auto-exposure hunting);
+- the tape is glossier than the floor;
+- the spot moves with the camera (a lamp's reflection), so it is present **during calibration** too;
+- plus camera **vibration** (rows shift ±2 px), whole-frame exposure flicker (±3 %) and the phone's
+  **30 fps** (the closed loop ran at 60 fps before; `sim.fps`, `sim.vib`).
+
+New tools: `Jitter` (scripted drive at 30 fps, each case run with and without glare, frame-to-frame
+changes of STEER / POWER compared), `CalProbe` (calibration diagnostics row by row), steering jitter
+in `ClosedLoop` (`steerJerk`), `run_suite.sh` / `cmp_suite.py` / `report_v31.py`.
+
+### Causes (found by tracing frame by frame)
+
+1. **The motion estimate drifted.** The path memory is carried from frame to frame by the robot's
+   estimated motion. Each frame's correction was added to the speed estimate at 60 %, with nothing
+   pulling it back. With glare hiding most of the line, the correction came from 3–5 noisy points:
+   the forward speed drifted to 0.18 instead of 0.067 camera heights per frame, the turn rate to
+   4°/frame instead of 1.5°, and once to 25°/frame (a curvature prior that was not limited). The
+   remembered path bent and slid, the pursuit target jumped toward the robot, STEER jumped
+   (5 → 27 → 18 → 5, or ±50 when the bent path left the image).
+2. **Every measurement replaced the memory.** Where a glare edge flickers, a path point was measured
+   in one frame (at a slightly different place) and not in the next — the path moved back and forth
+   with the flicker.
+3. **Calibration with the glare in view learned the glare as the line**: a bright band straight
+   ahead is what the colour step looked for, and the tape — broken by the glare in several row
+   blocks — lost to it (in the jitter set, 21 of 84 calibrations with glare failed or learned the
+   glare). The ROI was also cut below the glare: rows that match neither colour ended it, as a table
+   edge does.
+4. A remembered path that had drifted into the glare was never checked against the line visible
+   right next to it.
+5. Whole-number outputs flipped between neighbours on a steady path; the "line leaves at the side"
+   boost (visibility guard) was switched off from one frame to the next.
+
+### Fixes — all generic (no glare- or tape-specific rule)
+
+| | Fix |
+|---|---|
+| Motion | A **Kalman filter** on (forward travel, turn) per frame: the prior is the predicted motion with its uncertainty; each measured point adds information in proportion to its precision (measurement + memory variance), outliers are down-weighted (Huber). Many clean points correct it fully; a few noisy ones barely; motion along a straight line (invisible in the line) stays at the prediction. The positions are corrected in full every frame; the motion for the next frame changes at most as fast as a robot accelerates (≈ 2 m/s², 20 rad/s²). The curvature prior is used only while nothing is measured. |
+| Memory | Every point carries a **variance**. A measured point is **fused** with its remembered position: the rigid part of the difference (the robot's motion) is applied in full; the rest — the shape of a line that does not change on the floor — is averaged (Kalman gain ≈ 0.4 for a clean point). If a point is far off, or its neighbours are off together in the same direction (the memory was wrong, e.g. a curve seen for the first time), the measurement is taken over at once — no lag on turns. |
+| Calibration — line colour | The line is found as a **stripe**: rows are scanned with the floor colour (from the outer 30 % of the image on each side, robustly trimmed, at each row's own light level); every non-floor run with **sharp edges against the floor on both sides** is a candidate; the line is the longest **chain** of runs that continues row by row (about the previous width, where the line leads, of its colour; gaps allowed) — in the image, so it does not depend on the configured tilt. The line colour is the most common run colour in the chain (rows tinted by a disturbance change their tint from row to row and are left out). Glare, shadows and uneven light have soft edges; blobs do not keep one width. If no stripe is found, the cluster-based choice of v3 (now: band in the most of *all* row blocks) is the fallback. |
+| Calibration — colours under a disturbance near the robot | The colour samples come from the region near the robot. When a glare is there: the **floor** model is trimmed at 3σ (if ≥ 3 % of the floor cluster are outliers — a glare halo, lighter and greyer floor — they are removed, else the plain cluster model is kept); the **line** colour is taken from the stripe rows with the **highest contrast** against the floor beside them (glare, haze and halos always lower it), and the stripe's own pixels join the line cluster when the samples hold too few line pixels. Without this the black tape fitted both colours (= unreliable) after calibrating in glare, or the line was learned too light. |
+| Calibration — ROI | The ROI top is the highest row where the **floor is there** (≥ 20 % floor-coloured samples) and the line was seen with a second line row below; a glare or a shadow over part of the rows in between does not end it, a table edge (no floor beyond) still does. |
+| Unconfirmed memory | A remembered path that no measurement confirms for 3 frames gives way to a line found by a fresh search (≥ 5 measured points, running within 45° of the memory). |
+| Outputs | Whole numbers with hysteresis 0.8 (steering and power); the visibility guard is released smoothly. (A hysteresis of 4 on the power *target* was tried and removed: it left small lasting offsets.) |
+| Steering scale | `steerAutoGain` learns from the steering **actually sent** (including held frames, the guard and short full turns) — before, it saw only the weak commands and lowered the gain of an under-steering robot. |
+| Light | The range of plausible floor light levels follows the room light slowly (×0.5 … ×2.5 around the calibration level); a profile with no floor in that range but a floor-coloured majority at one consistent level takes its light level from that majority (the line is always the minority of a profile across it). |
+
+Kept unchanged on purpose (measured worse): letting the light reference itself follow the room
+light (broke neutral colour pairs — a black line passed for white floor in deep shadow:
+84 → 69 of 100 matrix cases); a faster steering-scale adaptation (no gain); a one-sided seed for
+the fresh search (created a wrong lock on a glare edge); a stripe-only calibration without fallback
+(failed legitimate synthetic cases).
+
+### v3.1 against v2 — final numbers (success rate = completed / measured)
+
+Matrix, regimes, starts, disturbance laps, jitter and the clean-calibration glare laps were
+measured on build `v3c3`; the final code differs from it only in calibration (the colour rules
+under a disturbance near the robot) and in having no power-target hysteresis — the glare laps
+calibrated with the glare in view were measured on the final code.
+
+| | v2 | v3 before | **v3.1** |
+|---|---|---|---|
+| **STEER change per frame with realistic glare** (no-glare value in brackets; scripted drive, 30 fps, 84 cases, calibrated clean) | 2.37 (1.65) | 0.82 (0.75) | **0.59 (0.49)** |
+| … the same, calibrated with the glare in view | 2.26 (1.65) | 1.01 (0.75), 21 of 84 calibrations failed | **0.74 (0.49)**, 12 failed |
+| **POWER change per frame with glare** (no-glare) | 5.49 (2.27) | 0.74 (0.49) | **0.63 (0.40)** |
+| STEER jumps ≥ 5 in 84 glare drives (no-glare drives) | 1254 (546) | 98 (28) | **76 (28)** |
+| Glare laps at 30 fps, spot mid-view, calibrated with glare | 32/32 (100 %) | – | **32/32 (100 %)** |
+| … spot near the robot, calibrated with glare | 27/32 (84 %) | – | **29/32 (91 %)** |
+| … spot near, calibrated clean | 27/32 (84 %) | 29/32 | **32/32 (100 %)** |
+| … very large spot (hides most of the line), calibrated clean | **25/32 (78 %)** | 17/32 | 15/32 (47 %) |
+| … lamp-tube streak lying along the whole line, calibrated clean | **25/32 (78 %)** | 24/32 | 21/32 (66 %) |
+| **Disturbance matrix** (280 cases) | 172 (61 %) | 238 (85 %) | **250 (89 %)** |
+| … disturbance near the robot on a curve (40) | 20 | 18 | **22** |
+| **Laps through disturbances** (88) | 78 (89 %) | 79 | **88 (100 %)** |
+| … strong light gradient (8) | 8 | 4 | **8** |
+| Closed loop, realistic timing (176) | **173 (98 %)** | 173 | 168 (95 %) |
+| Closed loop, phone 30 fps + vibration (176) | **174 (99 %)** | – | 170 (97 %) |
+| Closed loop, camera tilt off by 10° (176) | 152 (86 %) | **166 (94 %)** | 157 (89 %) |
+| Closed loop, 3× faster robot, 200 ms delay (176) | **158 (90 %)** | 135 (77 %) | 141 (80 %) |
+| Starts turned / shifted (80) | 80 | 80 | **80 (100 %)** — 30° start settles ≈ 2 s later than v2 |
+| RMS lateral error, realistic timing | 2.22 cm | 1.07 cm | **1.26 cm** |
+| POWER steps per frame, realistic timing | **0.20** | 0.34 | 0.31 |
+| `processFrame` 960 × 1280 YUV (median) | 1.0 ms | 0.4 ms | **0.20 ms**, no allocation |
+| JUnit | 26/26 | 45/45 | **47/48** (`glareDuringCalibration`: mean POWER drop 3.3, limit 3.0) |
+
+### Still a problem (open)
+
+- **Gain 0.5 with distractors** beside the line: realistic timing 36/44 (v2 41), camera tilt off by
+  10° 30/44 (v2 44). The cause is the motion filter that makes the outputs steady under glare; at
+  gain 1.0 (recommended, what the robot uses) all 88 runs complete. Trade-off kept on purpose.
+- **Glare that hides almost the whole line** (very large spot, a lamp-tube streak exactly along the
+  line): v2 completes more laps (it jitters strongly but keeps a lock); v3.1 follows its memory and
+  slows down, then may lose the line. Calibration in such glare fails (or, for black tape on wood,
+  can learn the glare) — recalibrate a little further along.
+- **Glare right in front of the robot on an S-curve**: 4–20 STEER jumps per drive (clean ≈ 1).
+- 3× faster robot with long delay: 141 vs v2 158; POWER steps 0.31 vs v2 0.20 per frame;
+  start turned 30° settles about 2 s later.
+- The "top to bottom" experiment could not be re-run on the final code (the system stopped it for
+  low memory twice, the PC had < 2 GB free); its table (§6.6) is from the earlier v3.
+- Nothing is measured on the real robot yet beyond the report that started v3.1.
+
+### Measured tables (v3.1)
+
+#### Jitter with realistic glare (scripted drive, 30 fps, vibration)
+
+| calibration | | cases (no calibration) | STEER change / frame, glare (clean) | POWER change / frame, glare (clean) | STEER jumps ≥ 5, glare (clean) | STEER noise (RMS around 7-frame mean), glare (clean) | mean \|STEER glare − clean\| | frames lost | cases with POWER at the minimum |
+|---|---|---:|---|---|---|---|---:|---:|---:|
+| clean (glare after) | v2 | 84 (0) | 2.37 (1.65) | 5.49 (2.27) | 1254 (546) | 2.67 (1.28) | 3.47 | 683 | 39 |
+| clean (glare after) | v3 before | 84 (0) | 0.82 (0.75) | 0.74 (0.49) | 98 (28) | 0.96 (0.63) | 2.09 | 566 | 11 |
+| clean (glare after) | v3.1 | 84 (0) | 0.59 (0.49) | 0.63 (0.40) | 76 (28) | 0.84 (0.53) | 2.10 | 557 | 11 |
+| with the glare in view | v2 | 84 (1) | 2.26 (1.65) | 4.73 (2.28) | 1149 (543) | 2.73 (1.29) | 6.95 | 799 | 40 |
+| with the glare in view | v3 before | 84 (21) | 1.01 (0.75) | 0.79 (0.49) | 157 (21) | 1.31 (0.63) | 5.86 | 1092 | 10 |
+| with the glare in view | v3.1 | 84 (12) | 0.74 (0.49) | 0.65 (0.39) | 177 (25) | 1.02 (0.54) | 5.47 | 687 | 9 |
+
+STEER change per frame with glare (without) and STEER jumps, by glare variant — calibrated with the glare in view (all 4 colour pairs × straight / curve / S-curve):
+
+| glare | v2 | v3 before | v3.1 |
+|---|---|---|---|
+| near | 2.79 (1.67), jumps 188, no cal. 1 | 0.91 (0.73), jumps 13, no cal. 6 | 0.99 (0.50), jumps 57, no cal. 1 |
+| mid | 2.46 (1.65), jumps 215 | 0.85 (0.76), jumps 7, no cal. 3 | 0.55 (0.49), jumps 4 |
+| far | 1.75 (1.65), jumps 90 | 0.72 (0.75), jumps 4 | 0.47 (0.49), jumps 2 |
+| big | 3.06 (1.65), jumps 278 | 2.51 (0.76), jumps 74, no cal. 6 | 1.79 (0.51), jumps 81, no cal. 5 |
+| beside | 1.68 (1.65), jumps 81 | 0.77 (0.75), jumps 5 | 0.50 (0.49), jumps 4 |
+| streak | 1.91 (1.65), jumps 113 | 1.39 (0.76), jumps 46, no cal. 6 | 0.85 (0.49), jumps 25, no cal. 6 |
+| weak | 2.23 (1.65), jumps 184 | 0.77 (0.75), jumps 8 | 0.53 (0.49), jumps 4 |
+
+#### Closed-loop laps with realistic glare (30 fps, vibration, realistic delay)
+
+Each cell: **completed** / 32 · S = mean |ΔSTEER| per frame · P = mean |ΔPOWER| per frame · share of frames at the minimum POWER.
+
+| realistic glare, laps | calibrated | v2 | v3 before | v3.1 |
+|---|---|---|---|---|
+| no glare | – | **32**/32 · S 0.15 · P 0.35 · min 0.0 % | **31**/32 · S 0.36 · P 0.30 · min 0.1 % | **32**/32 · S 0.15 · P 0.24 · min 0.0 % |
+| spot mid-view | with the glare | **32**/32 · S 0.30 · P 1.52 · min 0.0 % | – | **32**/32 · S 0.16 · P 0.28 · min 0.1 % |
+| spot mid-view | clean | **32**/32 · S 0.31 · P 1.56 · min 0.0 % | **32**/32 · S 0.38 · P 0.33 · min 0.5 % | **32**/32 · S 0.15 · P 0.26 · min 0.2 % |
+| spot near | with the glare | **27**/32 · S 1.81 · P 5.05 · min 22.7 % | – | **29**/31 · S 0.27 · P 0.37 · min 1.4 % |
+| spot near | clean | **27**/32 · S 1.75 · P 5.18 · min 22.9 % | **29**/32 · S 0.45 · P 0.37 · min 1.2 % | **32**/32 · S 0.20 · P 0.29 · min 0.3 % |
+| large spot (hides most of the line) | with the glare | **26**/32 · S 1.35 · P 4.69 · min 12.0 % | – | **6**/17 · S 1.67 · P 1.45 · min 29.2 % |
+| large spot (hides most of the line) | clean | **25**/32 · S 1.63 · P 4.96 · min 18.2 % | **17**/32 · S 0.56 · P 0.59 · min 11.7 % | **15**/32 · S 0.33 · P 0.47 · min 14.0 % |
+| lamp-tube streak along the line | with the glare | **7**/32 · S 1.46 · P 9.55 · min 21.9 % | – | **1**/21 · S 0.23 · P 0.85 · min 1.8 % |
+| lamp-tube streak along the line | clean | **25**/32 · S 0.74 · P 3.21 · min 13.1 % | **24**/32 · S 0.49 · P 0.52 · min 19.2 % | **21**/32 · S 0.34 · P 0.45 · min 19.6 % |
+
+#### Disturbance matrix
+
+| | pass (of 280) | calibration failed | mean \|ΔSTEER\| | max \|ΔSTEER\| | mean POWER drop | max POWER drop | frames lost | straight near / mid / far / during calibration (of 40) | curve near / mid / far (of 40) |
+|---|---:|---:|---:|---:|---:|---:|---:|---|---|
+| v2 | **172** | 0 | 2.53 | 85 | 12.41 | 95 | 1727 | 16 / 16 / 38 / 17 | 20 / 27 / 38 |
+| v3 before | **238** | 1 | 0.59 | 63 | 2.93 | 81 | 129 | 39 / 40 / 39 / 38 | 18 / 28 / 36 |
+| v3.1 | **250** | 1 | 0.95 | 64 | 2.33 | 81 | 189 | 39 / 40 / 39 / 39 | 22 / 34 / 37 |
+
+#### Closed-loop regimes
+
+Each cell: **completed** · RMS lateral error · steering sign changes per second · S = mean |ΔSTEER| per frame · P = mean |ΔPOWER| per frame · share of frames at the minimum POWER.
+
+| set | v2 | v3 before | v3.1 |
+|---|---|---|---|
+| ideal (60 fps, no delay) | **172/176** · 2.25 cm · 0.079/s · S – · P 0.20 · min 4.4 % | **171/176** · 1.16 cm · 0.025/s · S – · P 0.32 · min 5.0 % | **168/176** · 1.27 cm · 0.023/s · S 0.24 · P 0.31 · min 4.5 % |
+| realistic (150 ms delay, 20 Hz loop, motor dead zone) | **173/176** · 2.22 cm · 0.067/s · S – · P 0.20 · min 4.5 % | **173/176** · 1.07 cm · 0.026/s · S – · P 0.34 · min 4.5 % | **168/176** · 1.26 cm · 0.028/s · S 0.22 · P 0.31 · min 5.4 % |
+| stress (3× speed, 200 ms, 15 Hz) | **158/176** · 2.30 cm · 0.531/s · S – · P 0.97 · min 14.1 % | **135/176** · 2.50 cm · 0.370/s · S – · P 0.75 · min 9.5 % | **141/176** · 2.39 cm · 0.416/s · S 0.75 · P 0.73 · min 11.0 % |
+| camera tilt off by 10° | **152/176** · 3.63 cm · 0.104/s · S – · P 0.21 · min 4.1 % | **166/176** · 2.18 cm · 0.075/s · S – · P 0.39 · min 5.8 % | **157/176** · 2.28 cm · 0.074/s · S 0.41 · P 0.39 · min 8.1 % |
+| phone: 30 fps + vibration | **174/176** · 2.20 cm · 0.064/s · S 0.25 · P 0.37 · min 4.4 % | – | **170/176** · 1.22 cm · 0.021/s · S 0.28 · P 0.37 · min 4.9 % |
+
+#### Starts at an angle or offset
+
+Each cell: **completed** · RMS lateral error · steering sign changes per second · S = mean |ΔSTEER| per frame · P = mean |ΔPOWER| per frame · share of frames at the minimum POWER · time to settle.
+
+| set | v2 | v3 before | v3.1 |
+|---|---|---|---|
+| turned 15° left | **16/16** · 0.78 cm · 0.065/s · S – · P 0.14 · min 0.0 % · settle 14.4 s | **16/16** · 1.24 cm · 0.057/s · S – · P 0.26 · min 0.0 % · settle 15.0 s | **16/16** · 1.19 cm · 0.057/s · S 0.03 · P 0.17 · min 0.0 % · settle 15.1 s |
+| turned 30° left | **16/16** · 1.08 cm · 0.068/s · S – · P 0.17 · min 4.6 % · settle 15.7 s | **16/16** · 1.98 cm · 0.066/s · S – · P 0.40 · min 3.2 % · settle 17.7 s | **16/16** · 2.02 cm · 0.066/s · S 0.05 · P 0.32 · min 3.2 % · settle 17.4 s |
+| turned 15° right | **16/16** · 0.78 cm · 0.026/s · S – · P 0.14 · min 0.0 % · settle 14.3 s | **16/16** · 1.07 cm · 0.029/s · S – · P 0.25 · min 0.0 % · settle 15.0 s | **16/16** · 1.15 cm · 0.029/s · S 0.03 · P 0.16 · min 0.0 % · settle 15.8 s |
+| 3 cm left | **16/16** · 1.22 cm · 0.015/s · S – · P 0.11 · min 0.0 % · settle 15.1 s | **16/16** · 1.32 cm · 0.037/s · S – · P 0.23 · min 0.0 % · settle 15.2 s | **16/16** · 1.22 cm · 0.038/s · S 0.02 · P 0.14 · min 0.0 % · settle 14.1 s |
+| 3 cm right | **16/16** · 1.21 cm · 0.039/s · S – · P 0.12 · min 0.0 % · settle 15.0 s | **16/16** · 1.09 cm · 0.063/s · S – · P 0.28 · min 0.0 % · settle 14.4 s | **16/16** · 1.11 cm · 0.064/s · S 0.03 · P 0.16 · min 0.0 % · settle 13.8 s |
+
+#### Laps through disturbances
+
+Each cell: **completed** · RMS lateral error · steering sign changes per second · S = mean |ΔSTEER| per frame · P = mean |ΔPOWER| per frame · share of frames at the minimum POWER.
+
+| set | v2 | v3 before | v3.1 |
+|---|---|---|---|
+| clean | **8/8** · 3.81 cm · 0.068/s · S – · P 0.22 · min 0.0 % | **8/8** · 0.67 cm · 0.043/s · S – · P 0.30 · min 0.0 % | **8/8** · 0.73 cm · 0.035/s · S 0.15 · P 0.26 · min 0.0 % |
+| robot shadow | **4/8** · 3.02 cm · 0.144/s · S – · P 1.36 · min 10.3 % | **4/4** · 0.83 cm · 0.058/s · S – · P 0.78 · min 1.1 % | **8/8** · 0.72 cm · 0.044/s · S 0.21 · P 0.42 · min 0.0 % |
+| glare (smooth) on the straight | **8/8** · 3.44 cm · 0.386/s · S – · P 0.77 · min 0.0 % | **7/8** · 1.18 cm · 0.079/s · S – · P 0.41 · min 3.9 % | **8/8** · 0.67 cm · 0.034/s · S 0.15 · P 0.37 · min 0.0 % |
+| glare (smooth) on the curve | **8/8** · 3.82 cm · 0.110/s · S – · P 0.30 · min 0.0 % | **8/8** · 0.67 cm · 0.034/s · S – · P 0.32 · min 0.0 % | **8/8** · 0.73 cm · 0.035/s · S 0.14 · P 0.34 · min 0.0 % |
+| room shadows | **4/8** · 4.02 cm · 0.240/s · S – · P 0.30 · min 30.3 % | **8/8** · 0.69 cm · 0.035/s · S – · P 0.28 · min 0.2 % | **8/8** · 0.77 cm · 0.037/s · S 0.12 · P 0.30 · min 0.1 % |
+| strong light gradient | **8/8** · 3.81 cm · 0.068/s · S – · P 0.25 · min 0.0 % | **4/8** · 2.31 cm · 0.340/s · S – · P 0.59 · min 16.7 % | **8/8** · 0.77 cm · 0.034/s · S 0.17 · P 0.41 · min 0.0 % |
+| colour patches | **6/8** · 4.02 cm · 0.155/s · S – · P 0.43 · min 12.2 % | **8/8** · 0.78 cm · 0.054/s · S – · P 0.29 · min 0.1 % | **8/8** · 0.72 cm · 0.035/s · S 0.16 · P 0.27 · min 0.0 % |
+| covering objects | **8/8** · 3.72 cm · 0.163/s · S – · P 0.40 · min 4.7 % | **8/8** · 0.77 cm · 0.036/s · S – · P 0.32 · min 0.0 % | **8/8** · 0.82 cm · 0.037/s · S 0.14 · P 0.31 · min 0.0 % |
+| bright stripes | **8/8** · 3.81 cm · 0.068/s · S – · P 0.25 · min 0.0 % | **8/8** · 0.70 cm · 0.044/s · S – · P 0.23 · min 0.0 % | **8/8** · 0.84 cm · 0.036/s · S 0.11 · P 0.28 · min 0.0 % |
+| colour casts | **8/8** · 3.72 cm · 0.201/s · S – · P 0.38 · min 3.6 % | **8/8** · 0.69 cm · 0.081/s · S – · P 0.28 · min 0.9 % | **8/8** · 0.96 cm · 0.053/s · S 0.15 · P 0.29 · min 0.7 % |
+| table edge | **4/4** · 3.93 cm · 0.050/s · S – · P 0.19 · min 0.0 % | **4/4** · 0.57 cm · 0.018/s · S – · P 0.30 · min 0.0 % | **4/4** · 0.68 cm · 0.000/s · S 0.13 · P 0.33 · min 0.0 % |
+| table edge — reference without | **4/4** · 3.93 cm · 0.050/s · S – · P 0.19 · min 0.0 % | **4/4** · 0.57 cm · 0.018/s · S – · P 0.30 · min 0.0 % | **4/4** · 0.68 cm · 0.000/s · S 0.13 · P 0.33 · min 0.0 % |
+
+#### "Top to bottom" on the final code
+
+| variant | matrix pass (of 280) | mean \|ΔSTEER\| | max \|ΔSTEER\| | mean POWER drop | closed loop `real`: completed | RMS lateral | glare jitter: STEER / frame (clean) | STEER jumps |
+|---|---:|---:|---:|---:|---|---:|---|---:|
+| near → far + gaps re-read from both sides (default) | 250 | 0.95 | 64 | 2.33 | 168/176 | 1.26 | 0.74 (0.49) | 177 |
+| near → far only | 245 | 0.94 | 64 | 2.50 | 168/176 | 1.22 | 0.75 (0.49) | 184 |
+| far → near only | 246 | 0.80 | 63 | 2.43 | 167/176 | 1.18 | 0.75 (0.49) | 173 |
+| image coordinates instead of the floor | 163 | 1.89 | 83 | 2.88 | 172/176 | 2.55 | 1.62 (1.43) | 791 |
+| no path memory | 186 | 1.87 | 61 | 8.09 | 152/176 | 1.38 | 3.02 (0.51) | 1053 |
+
+
+---
+
 ## 1. Results in short
 
 | | v2 (`202e70f`) | v3 |
