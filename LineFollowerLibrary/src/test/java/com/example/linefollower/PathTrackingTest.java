@@ -234,6 +234,77 @@ public class PathTrackingTest {
         }
     }
 
+    // ── realistic glare: output stability (the real-robot report) ─────────
+
+    /**
+     * Same drive with and without a realistic glare spot (clipped, streaky, flickering
+     * every frame — present during calibration too, as it moves with the camera). The
+     * outputs must stay as steady as without glare: frame-to-frame changes of STEER and
+     * POWER close to the clean run's, no jumps, and the values themselves close to the
+     * clean run's.
+     */
+    private static void assertStableUnderGlare(String what, int[] pair, TrackSim.Path path, int from, int to, Consumer<TrackSim> glare) {
+        final TrackSim clean = sim(pair, path), dirty = sim(pair, path);
+        glare.accept(dirty);
+        final LineFollowerPipeline pc = new LineFollowerPipeline(), pd = new LineFollowerPipeline();
+        pc.configure(TrackSim.appConfig()); pd.configure(TrackSim.appConfig());
+        assertTrue(what + ": clean calibration", calibrate(pc, clean, path.pose(10)));
+        assertTrue(what + ": calibration with the glare", calibrate(pd, dirty, path.pose(10)));
+        double jc = 0, jd = 0, tc = 0, td = 0, diff = 0; int jumps = 0, cJumps = 0, n = 0;
+        int[] lc = null, ld = null;
+        for (int i = from; i <= to; i += 2) {
+            final double[] pose = path.pose(i);
+            final byte[][] a = clean.toYuv420(clean.render(pose[0], pose[1], pose[2]));
+            final int[] oc = pc.processFrameYuv420(a[0], a[1], a[2], W, H).clone();
+            final byte[][] b = dirty.toYuv420(dirty.render(pose[0], pose[1], pose[2]));
+            final int[] od = pd.processFrameYuv420(b[0], b[1], b[2], W, H).clone();
+            if (lc != null) {
+                jc += Math.abs(oc[0] - lc[0]); jd += Math.abs(od[0] - ld[0]);
+                tc += Math.abs(oc[1] - lc[1]); td += Math.abs(od[1] - ld[1]);
+                if (Math.abs(od[0] - ld[0]) >= 5) jumps++;
+                if (Math.abs(oc[0] - lc[0]) >= 5) cJumps++;
+                diff += Math.abs(od[0] - oc[0]);
+                n++;
+            }
+            lc = oc; ld = od;
+        }
+        final String v = String.format(" (STEER change/frame %.2f vs clean %.2f, POWER %.2f vs %.2f, jumps %d vs %d, mean |dS| %.2f)",
+                jd / n, jc / n, td / n, tc / n, jumps, cJumps, diff / n);
+        assertTrue(what + ": STEER jitter" + v, jd / n <= jc / n + 0.4);
+        assertTrue(what + ": POWER jitter" + v, td / n <= tc / n + 0.5);
+        assertTrue(what + ": STEER jumps" + v, jumps <= cJumps);
+        assertTrue(what + ": STEER differs from the clean run" + v, diff / n <= 1.5);
+    }
+
+    @Test public void realGlare_straight_outputsStable() {
+        for (int[] pair : PAIRS)
+            assertStableUnderGlare(String.format("%06X/%06X real glare", pair[0], pair[1]), pair, straight(), 20, 300,
+                    s -> s.realGlare(0.30, 0.008, 0.07, 0.04, 1.6, 0.3, 5));
+    }
+
+    @Test public void realGlare_curve_outputsStable() {
+        final TrackSim.Path path = new TrackSim.Path(0, 0, 0).straight(0.6).arc(0.6, 90).straight(0.6);
+        for (int[] pair : PAIRS)
+            assertStableUnderGlare(String.format("%06X/%06X real glare on a curve", pair[0], pair[1]), pair, path, 20, 380,
+                    s -> s.realGlare(0.30, 0.008, 0.07, 0.04, 1.6, 0.3, 7));
+    }
+
+    /** Calibration with the glare in view learns the colour of the line, not of the glare. */
+    @Test public void realGlare_duringCalibration_learnsTheLine() {
+        for (int[] pair : PAIRS) {
+            final TrackSim.Path path = straight();
+            final TrackSim s = sim(pair, path).realGlare(0.28, 0.008, 0.08, 0.05, 1.8, 0.3, 9);
+            final LineFollowerPipeline p = new LineFollowerPipeline();
+            p.configure(TrackSim.appConfig());
+            assertTrue("calibration with glare", calibrate(p, s, path.pose(10)));
+            final int lc = p.getLineColorArgb();
+            final int dl = Math.abs(((lc >> 16) & 255) - ((pair[1] >> 16) & 255)) + Math.abs(((lc >> 8) & 255) - ((pair[1] >> 8) & 255)) + Math.abs((lc & 255) - (pair[1] & 255));
+            final int dg = Math.abs(((lc >> 16) & 255) - 255) + Math.abs(((lc >> 8) & 255) - 255) + Math.abs((lc & 255) - 255);
+            assertTrue(String.format("%06X/%06X: learned line colour %06X is the colour of the line, not of the glare", pair[0], pair[1], lc & 0xFFFFFF),
+                    dl < dg && dl < 150);
+        }
+    }
+
     // ── glare (problem 5) ─────────────────────────────────────────────────
 
     /** The real example: the tape runs straight up the image; glare over ~45–70 % of the ROI, mostly one side. */

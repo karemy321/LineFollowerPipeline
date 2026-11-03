@@ -46,6 +46,29 @@ final class TrackSim {
         });
         return this;
     }
+    /**
+     * Glare as a phone camera sees a room light on a glossy floor: the core clips to
+     * white (peak i > 1), the surface breaks it into streaks (world-fixed, so they change
+     * as the robot moves), and its strength flickers from frame to frame (mains light
+     * against the exposure, auto-exposure). The tape is glossier than the floor.
+     */
+    TrackSim realGlare(double fwd, double lat, double rf, double rl, double i, double flick, long seed) {
+        final Random fr = new Random(seed);
+        final double[] fl = new double[4096];
+        for (int k = 0; k < fl.length; k++) fl[k] = 1 + flick * (0.6 * Math.sin(k * 2.1) + 0.8 * (fr.nextDouble() - 0.5));
+        effects.add((c, wx, wy, f, l, tape) -> {
+            final double a = (f - fwd) / rf, b = (l - lat) / rl, q = a * a + b * b;
+            if (q > 9) return;
+            final double streak = 0.5 + 0.5 * Math.sin(wy * 700 + 2 * Math.sin(wx * 60));
+            final double s = i * fl[frame & 4095] * Math.exp(-q) * (0.5 + streak) * (tape ? 1.25 : 0.85);
+            final double cl = Math.min(1, s), over = Math.max(0, s - 1) * 120;
+            for (int k = 0; k < 3; k++) c[k] = c[k] + cl * (255 - c[k]) + over;
+        });
+        return this;
+    }
+    /** Frames rendered so far (drives the glare flicker). */
+    int frame;
+
     /** Darker (k < 1) or brighter ellipse on the floor (world, axis-aligned). */
     TrackSim lightSpot(double x, double y, double rx, double ry, double k) {
         effects.add((c, wx, wy, f, l, tape) -> {
@@ -152,6 +175,7 @@ final class TrackSim {
     // ── Rendering ───────────────────────────────────────────────────────────
 
     int[] render(double rx, double ry, double heading) {
+        frame++;
         final int[] px = new int[w * h];
         final double f = (h / 2.0) / Math.tan(Math.toRadians(vfovDeg / 2));
         final double st = Math.sin(Math.toRadians(tiltDeg)), ct = Math.cos(Math.toRadians(tiltDeg));

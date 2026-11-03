@@ -2826,6 +2826,7 @@ public final class LineFollowerPipeline {
     private float   prStep, prH0;
     private float   prGain = 1f;            // local light level of the last profile
     private float   lightRef = 1f;          // typical light level of the floor next to the line
+    private float   ambRef = 1f;            // room light level for the floor plausibility range
     // result of analyzeProfile()
     private byte    msStatus;
     private float   msOff, msQual;
@@ -2870,6 +2871,7 @@ public final class LineFollowerPipeline {
     private float   mPxx, mPxt, mPtt;
     private float   kPxx, kPxt, kPtt;       // posterior of this frame (committed if used)
     private boolean motionMeasured;         // corrX / corrT come from this frame's measurements
+    private boolean lastMotionMeasured;     // … and in the previous frame
     // Per-point position variance across the path (plane units²): memory, and the
     // measurement of this frame. Measured points are fused with the remembered ones.
     private final float[] memVar = new float[NODE_MAX], ndVar = new float[NODE_MAX], ndMV = new float[NODE_MAX];
@@ -2878,8 +2880,9 @@ public final class LineFollowerPipeline {
     private float   v3Tracking = 100f;      // rate-limited tracking output
     private int     outSteer = 0, outTrack = 100;   // last whole-number outputs (hysteresis)
     private static final float OUT_HYST = 0.8f;
-    private static final float LIGHT_REF_MIN = 0.25f, LIGHT_REF_MAX = 4f;
-    private int     v3LostFrames, v3HoldFrames;
+
+    private static final float AG_RATE = 0.01f;   // steering-scale adaptation per frame
+    private int     v3LostFrames, v3HoldFrames, v3BlindFrames;
     private float   v3LastSteer;
     private int     v3Rejected;
     // results of computeControl()
@@ -2982,11 +2985,11 @@ public final class LineFollowerPipeline {
         final float q1 = a[0] * y + a[1] * u + a[2] * v;
         final float g = q1 / ckF[0];
         // plausible light changes only: with two neutral colours (white / dark grey) any
-        // brightness could otherwise be "floor under some light". The range follows the
-        // light level measured along the path (lightRef), so the robot can drive from a
-        // dim into a bright part of the room (and back) — the change is followed step by step.
-        final float L = lightRef;
-        if (g < 0.2f * L || g > 2.5f * L) return -1f;
+        // brightness could otherwise be "floor under some light". The range is centred on
+        // the room's light level along the path (ambRef, which follows it slowly and only
+        // within ×0.5…×2.5), so the robot can drive from a dim into a bright part.
+        final float A = ambRef;
+        if (g < 0.2f * A || g > 2.5f * A) return -1f;
         final float d = q0 - q1 * g;
         final float tau = cfg.colorMatchSigma * cfg.colorMatchSigma;
         if (d > 2f * tau) return -1f;
@@ -2994,7 +2997,7 @@ public final class LineFollowerPipeline {
         // to measure the floor's light (with brightness only, a dark line is otherwise
         // "floor in deep shadow" and drags the estimate down).
         final float r = lightRange();
-        final float dL = rayDist(y, u, v, ciL, 0, caL, 0, ckL, L / (r * r), L * r * r);
+        final float dL = rayDist(y, u, v, ciL, 0, caL, 0, ckL, 1f / (r * r), r * r);
         return dL <= tau ? -1f : g;
     }
 
@@ -3104,15 +3107,33 @@ public final class LineFollowerPipeline {
         if (n > PROF_MAX) { n = PROF_MAX; step = 2f * half / (n - 1); }
         if (n < 5) { n = 5; step = 2f * half / 4f; }
         prN = n; prStep = step; prH0 = -(n - 1) * step * 0.5f;
-        int nG = 0;
+        int nG = 0, nR = 0, nV = 0;
+        final float tau2 = 2f * cfg.colorMatchSigma * cfg.colorMatchSigma;
         for (int j = 0; j < n; j++) {
             final float s = prH0 + j * step;
             if (!planeToImage(px + s * nx, py + s * ny)) { prCls[j] = CL_OUT; continue; }
             if (pU < 0.5f || pV < roiTop + 0.5f || pU > imgW - 1.5f || pV > roiBot - 1.5f) { prCls[j] = CL_OUT; continue; }
             readPixel((int) (pU - 0.5f), (int) (pV - 0.5f));
             prY[j] = sY; prU[j] = sU; prV[j] = sV; prCls[j] = CL_UNK;
+            nV++;
             final float g = floorGain(sY, sU, sV);
             if (g > 0f) prTmp[nG++] = g;
+            // the floor colour at any light level (for the case below)
+            final float q1 = caF[0] * sY + caF[1] * sU + caF[2] * sV, gr = q1 / ckF[0];
+            if (gr > 0.1f && gr < 10f && rayDist(sY, sU, sV, ciF, 0, caF, 0, ckF[0], gr, gr) <= tau2) prU2[nR++] = gr;
+        }
+        // No floor within the usual light range, but most of the profile has the floor's
+        // colour at one consistent light level (a part of the room much brighter or
+        // darker than at calibration): that majority is the floor — the line is always
+        // the minority of a profile across it. Its level is this profile's light level.
+        if (nG < 4 && nR >= 4 && nR * 10 >= 6 * nV) {
+            final float med = median(prU2, nR);
+            int near = 0;
+            for (int j = 0; j < nR; j++) if (prU2[j] >= med / 1.3f && prU2[j] <= med * 1.3f) near++;
+            if (near * 10 >= 6 * nV) {
+                nG = 0;
+                for (int j = 0; j < nR; j++) if (prU2[j] >= med / 1.3f && prU2[j] <= med * 1.3f) prTmp[nG++] = prU2[j];
+            }
         }
         classifyProfile(n, nG);
     }
@@ -3299,7 +3320,10 @@ public final class LineFollowerPipeline {
         if (best > 0f) {
             msStatus = ST_MEAS;
             if (msTrim) v3Rejected++;
-            else if (msQual >= 0.8f) lightRef = Math.max(LIGHT_REF_MIN, Math.min(LIGHT_REF_MAX, lightRef + 0.02f * (prGain - lightRef)));   // typical light level
+            else if (msQual >= 0.8f) {
+                lightRef += 0.02f * (prGain - lightRef);   // typical light level
+                ambRef = Math.max(0.5f, Math.min(2.5f, ambRef + 0.01f * (prGain - ambRef)));
+            }
             return;
         }
         int nW = 0, nOut = 0, nF = 0, nU = 0;
@@ -3408,7 +3432,7 @@ public final class LineFollowerPipeline {
         // First choice: the line found as a stripe (see detectStripe) with the floor of
         // a clustering; only if no clustering yields one, the line is chosen among the
         // clusters by its shape alone.
-        final int passes = Integer.getInteger("lfp.passes", 2);
+        final int passes = 2;
         for (int pass = 0; pass < passes; pass++) {
             for (int k = 2; k <= MAX_CLUSTERS; k++) {
                 if (tryColorModelV3(n, k, pass == 0)) { calibIssue = ISSUE_NONE; return; }
@@ -4153,8 +4177,8 @@ public final class LineFollowerPipeline {
         memN = 0; ndN = 0;
         velX = 0f; velY = 0f; velT = 0f; corrX = 0f; corrY = 0f; corrT = 0f;
         mPxx = MOTION_P0X; mPxt = 0f; mPtt = MOTION_P0T; motionMeasured = false;
-        v3Tracking = 100f; v3LostFrames = 0; v3HoldFrames = 0; v3LastSteer = 0f; outSteer = 0; outTrack = 100;
-        prGain = 1f; lightRef = 1f; pathEnd = END_OUT; pathExitSide = 0f;
+        v3Tracking = 100f; v3LostFrames = 0; v3HoldFrames = 0; v3BlindFrames = 0; v3LastSteer = 0f; outSteer = 0; outTrack = 100;
+        prGain = 1f; lightRef = 1f; ambRef = 1f; pathEnd = END_OUT; pathExitSide = 0f;
         ctTarget = false;
         ctCurvAheadPrev = 100f; ctCurvPivot = 0f; ctCurv = 0f;
         gainCorr = 1f; agPath = 0f; agCmd = 0f; guardU = 0f; guardSide = 0f;
@@ -4162,17 +4186,19 @@ public final class LineFollowerPipeline {
 
     /**
      * Steady curve following: the robot turns as much as the path curves (agPath),
-     * while it was asked for agCmd (pursuit curvature × the current scale). Their
-     * ratio is the robot's response; the scale converges slowly to its inverse.
+     * while it was sent agCmd — the curvature of the steering actually output
+     * (including held frames, the visibility guard and full turns, so a robot that
+     * only follows a curve with bursts of full steering is not mistaken for one that
+     * over-steers). Their ratio is the robot's response; the scale converges slowly
+     * to its inverse.
      */
-    private void updateAutoGain() {
-        final float issued = ctTarget ? ctKappa * gainCorr : 0f;
+    private void updateAutoGain(float steeringOut) {
+        final float issued = steeringOut / Math.max(1e-3f, cfg.steerPerCurvature);
         agPath += 0.08f * (ctCurvPivot - agPath);
         agCmd  += 0.08f * (issued - agCmd);
         if (Math.abs(agPath) < 0.25f || Math.abs(agCmd) < 0.15f || agPath * agCmd <= 0f) return;
-        if (Math.abs(ctSteer) >= 49f) return;                 // saturated: no information
         final float g = Math.max(0.3f, Math.min(3f, agPath / agCmd));
-        gainCorr += 0.01f * (Math.max(0.5f, Math.min(2.5f, 1f / g)) - gainCorr);
+        gainCorr += AG_RATE * (Math.max(0.5f, Math.min(2.5f, 1f / g)) - gainCorr);
     }
 
     /** During calibration the overlay shows the rows where the line was found (path arrays). */
@@ -4217,6 +4243,13 @@ public final class LineFollowerPipeline {
         System.arraycopy(svAge, 0, ndAge, 0, ndN); System.arraycopy(svVar, 0, ndVar, 0, ndN);
     }
 
+    /** True if two directions differ by less than 45° (a found line replacing an unconfirmed memory runs about the same way). */
+    private static boolean sameDirection(float ax, float ay, float bx, float by) {
+        final float la = (float) Math.sqrt(ax * ax + ay * ay), lb = (float) Math.sqrt(bx * bx + by * by);
+        if (la < 1e-6f || lb < 1e-6f) return false;
+        return (ax * bx + ay * by) / (la * lb) > 0.707f;
+    }
+
     private int countFresh() {
         int c = 0;
         for (int i = 0; i < ndN; i++) if (ndSrc[i] == PATH_SRC_FRESH) c++;
@@ -4236,11 +4269,12 @@ public final class LineFollowerPipeline {
 
     /** Move the remembered path by the predicted robot motion (constant velocity) and age it. */
     private void predictMemory() {
-        // Prior: a robot that follows the path turns at (speed × path curvature);
-        // the measurements correct this every frame.
-        // (only on a clear curve: a small curvature may be the memory's own error,
-        // and feeding it back would bend the memory further)
-        final float kp = Math.abs(ctCurvPivot) < 0.25f ? 0f : ctCurvPivot;
+        // Prior: a robot that follows the path turns at (speed × path curvature).
+        // Used only while the motion is not measured (the line hidden) — otherwise the
+        // motion filter knows the turn better, and a wrong curvature near the axle
+        // (memory points behind the camera) would only bend the memory.
+        // (only on a clear curve: a small curvature may be the memory's own error)
+        final float kp = Math.abs(ctCurvPivot) < 0.25f || Math.abs(ctCurvPivot) > 2.5f || lastMotionMeasured ? 0f : ctCurvPivot;
         if (kp != 0f) velT += Math.max(-MOTION_DT, Math.min(MOTION_DT, 0.25f * (velX * kp - velT)));
         velT = Math.max(-VEL_T_MAX, Math.min(VEL_T_MAX, velT));
         final float c = (float) Math.cos(velT), s = (float) Math.sin(velT);
@@ -5049,7 +5083,8 @@ public final class LineFollowerPipeline {
             if (xExit >= 0f && side != guardSide) { guardU = 0f; guardSide = side; }
             // slow release while the path still leaves the side, quick once it no longer does
             guardU = u > guardU ? guardU + 0.5f * (u - guardU) : guardU * (xExit >= 0f ? 0.95f : 0.75f);
-            if (xExit < 0f && Math.abs(ctTY) < 0.5f * lineW) guardU = 0f;     // path straight ahead again
+            // (path straight ahead again: released quickly but smoothly — no jump in the output)
+            if (xExit < 0f && Math.abs(ctTY) < 0.5f * lineW) guardU *= 0.6f;
             if (guardU > 0.02f && guardSide != 0f) {
                 ctGuard = guardSide * 50f * guardU;
                 if (guardSide * ctSteer < 50f * guardU) ctSteer = guardSide * 50f * guardU;
@@ -5247,6 +5282,27 @@ public final class LineFollowerPipeline {
                 else { restoreNodes(); corrX = cx; corrY = cy; corrT = ct; pathEnd = pe; }
             }
         }
+        if (ok) {
+            // The remembered path confirmed nowhere for a few frames (e.g. it drifted into
+            // a glare / shadow region): a line that is actually measured elsewhere in the
+            // view replaces it — an unconfirmed memory does not outweigh a real
+            // measurement. A line that is merely hidden finds nothing and keeps its memory.
+            int meas = 0;
+            for (int i = 0; i < ndN; i++) if (ndSt[i] == ST_MEAS) meas++;
+            if (meas > 0) v3BlindFrames = 0;
+            else if (++v3BlindFrames >= 3) {
+                saveNodes();
+                final float cx = corrX, cy = corrY, ct = corrT;
+                final int pe = pathEnd;
+                final boolean mm = motionMeasured;
+                // direction of the remembered path (its first → last point)
+                final float mdx = svX[svN - 1] - svX[0], mdy = svY[svN - 1] - svY[0];
+                if (acquire() && countFresh() >= 5 && sameDirection(mdx, mdy, ndX[ndN - 1] - ndX[0], ndY[ndN - 1] - ndY[0])) {
+                    corrX = 0f; corrY = 0f; corrT = 0f; motionMeasured = false; v3BlindFrames = 0;
+                }
+                else { restoreNodes(); corrX = cx; corrY = cy; corrT = ct; pathEnd = pe; motionMeasured = mm; }
+            }
+        }
         if (!ok) { corrX = 0f; corrY = 0f; corrT = 0f; motionMeasured = false; ok = acquire(); }
         int fresh = 0;
         if (ok) {
@@ -5314,7 +5370,9 @@ public final class LineFollowerPipeline {
             }
         }
         if (found || held || pinned) v3LastSteer = steering;
-        if (found && cfg.steerAutoGain) updateAutoGain();
+        // (a short loss of the line in a curve — a full turn toward it — counts too: the
+        // path curvature is still the last one measured)
+        if ((found || held || (pinned && v3LostFrames <= 15)) && cfg.steerAutoGain) updateAutoGain(steering);
         v3Pinned = pinned;
         // ── motion estimate and memory for the next frame ──
         if (ok && haveMem && motionMeasured) {
@@ -5340,6 +5398,7 @@ public final class LineFollowerPipeline {
             memN = 0;          // gone for good: search from scratch
         }
         v3Found = found; v3Held = held;
+        lastMotionMeasured = ok && haveMem && motionMeasured;
         // ── internal output (same holder as v2; internal steering is ±100) ──
         output.steering     = 2f * steering;
         output.intersection = 100f - tracking;

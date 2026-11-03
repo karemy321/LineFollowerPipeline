@@ -142,6 +142,7 @@ public final class ClosedLoop {
                 System.out.printf(Locale.ROOT, "t=%6.2f s=%5.2f lat=%6.2f he=%6.1f S=%4d T=%4d off=%6.1f head=%6.1f hdeg=%6.1f conf=%.2f found=%b%n",
                         frames * DT, progress * World.STEP, 100 * latT, Math.toDegrees(Scenes.angDiff(th, t.hd[idx])), S, T,
                         lib.fd("steerOffsetTerm"), lib.fd("steerHeadingTerm"), lib.fd("headingDeg"), lib.fd("headingConfidence"), lib.trackFound);
+                if (System.getProperty("trace.full") != null && lib.last != null && Lib.isV3()) { String g = ""; try { for (String fn : new String[]{"gainCorr", "ctCurvPivot", "ctGuard", "guardU", "ctKappa", "ctLook"}) { java.lang.reflect.Field fl = lib.p.getClass().getDeclaredField(fn); fl.setAccessible(true); g += fn + "=" + String.format(Locale.ROOT, "%.2f ", fl.getFloat(lib.p)); } } catch (Exception e) { } System.out.println("    " + g + Viz.line(lib, progress * World.STEP, out).substring(18, 120)); }
             }
             if (SNAP_T > 0 && Math.abs(frames * DT - SNAP_T) < DT / 2) {
                 try { Viz.save(r, lib.last, "snaps/v3/cl_snap.png"); } catch (Exception e) { throw new RuntimeException(e); }
