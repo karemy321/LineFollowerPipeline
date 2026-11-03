@@ -32,20 +32,22 @@ public final class ClosedLoop {
     static final Cam CAM = new Cam(W, H, 60, Double.parseDouble(System.getProperty("sim.tilt", "45")),
             Double.parseDouble(System.getProperty("sim.camH", "0.20")), Double.parseDouble(System.getProperty("sim.camFwd", "0.08")), 0.01);
     static final int ROW_LO = 0, ROW_HI = 970, H_ROW = 948;     // v2 reads rows 296…960, v3 its ROI (up to the top)
-    static final double DT = 1.0 / 60, WHEELBASE = 0.13, TAU = 0.08;
+    static final double FPS = Double.parseDouble(System.getProperty("sim.fps", "60"));   // camera frame rate (the phone: 30)
+    static final double DT = 1.0 / FPS, WHEELBASE = 0.13, TAU = 0.08;
     // Real-robot effects (system properties): command latency (s), Blockly loop rate (Hz),
     // motor dead zone (wheel power below which the wheel does not turn).
     static final double SIM_LAT  = Double.parseDouble(System.getProperty("sim.lat", "0.0333"));
     static final double SIM_HZ   = Double.parseDouble(System.getProperty("sim.hz", "60"));
     static final double SIM_DEAD = Double.parseDouble(System.getProperty("sim.dead", "0"));
-    static final String SIM_TAG  = String.format(Locale.ROOT, "lat%.0fms/%.0fHz/dead%.0f/fwd%s/tilt%s/yaw%s/lat0%s", SIM_LAT * 1000, SIM_HZ, SIM_DEAD,
+    static final String SIM_TAG  = String.format(Locale.ROOT, "fps%.0f/lat%.0fms/%.0fHz/dead%.0f/fwd%s/tilt%s/yaw%s/lat0%s", FPS, SIM_LAT * 1000, SIM_HZ, SIM_DEAD,
             System.getProperty("sim.camFwd", "0.08"), System.getProperty("sim.tilt", "45"), System.getProperty("sim.yaw0", "0"), System.getProperty("sim.lat0", "0"));
-    static final int LATENCY = (int) Math.round(SIM_LAT * 60);
-    static final int CTRL_EVERY = Math.max(1, (int) Math.round(60 / SIM_HZ));
+    static final int LATENCY = (int) Math.round(SIM_LAT * FPS);
+    static final int CTRL_EVERY = Math.max(1, (int) Math.round(FPS / SIM_HZ));
     static final double OFF_TRACK = 0.12;
     static final double YAW0 = Double.parseDouble(System.getProperty("sim.yaw0", "0"));
     static final double LAT0 = Double.parseDouble(System.getProperty("sim.lat0", "0"));
     static final boolean TRACE = System.getProperty("trace") != null;
+    static final boolean VIB = System.getProperty("sim.vib") != null;
     static final double SNAP_T = Double.parseDouble(System.getProperty("snap.t", "-1"));
     static final int TRACE_EVERY = Integer.getInteger("trace.every", 6);
 
@@ -94,14 +96,20 @@ public final class ClosedLoop {
         final double tMax = 2.5 * t.length / v5 + 5;
         int frames = 0, signChanges = 0, lastSign = 0, lostFrames = 0, lostEvents = 0, wrongLock = 0;
         boolean prevFound = true;
-        double sumLat2 = 0, sumDT = 0; int prevT = -1, minPw = 0, nT = 0;
+        double sumLat2 = 0, sumDT = 0, sumDS = 0; int prevT = -1, prevS = Integer.MIN_VALUE, minPw = 0, nT = 0, nS = 0;
         double sumLat = 0, maxLat = 0, sumHead2 = 0, maxHead = 0, sumS = 0, sumS2 = 0, sumAbsS = 0;
         int minS = 999, maxS = -999, minT = 999, maxT = -999;
         long libNs = 0;
         String result = "TIMEOUT";
-        final int startEval = 60;   // ignore the first second for oscillation stats
+        final int startEval = (int) FPS;   // ignore the first second for oscillation stats
 
+        final java.util.Random vib = new java.util.Random(7);
+        int shift = 0;
         while (frames * DT < tMax) {
+            if (VIB) {   // camera vibration (pitch ±2 px) and exposure flicker (±3 %)
+                shift = Math.max(-2, Math.min(2, shift + vib.nextInt(3) - 1));
+                r.rowShift = shift; r.exposure = 1 + 0.03 * vib.nextGaussian();
+            }
             r.render(px, py, th);
             final long t0 = System.nanoTime();
             final int[] out = lib.process(r);
@@ -111,6 +119,8 @@ public final class ClosedLoop {
             minS = Math.min(minS, S); maxS = Math.max(maxS, S); minT = Math.min(minT, T); maxT = Math.max(maxT, T);
             if (prevT >= 0) { sumDT += Math.abs(T - prevT); nT++; }
             prevT = T;
+            if (prevS != Integer.MIN_VALUE && frames > startEval) { sumDS += Math.abs(S - prevS); nS++; }
+            prevS = S;
             if (T <= 10) minPw++;
 
             // ── metrics on the current pose ──
@@ -188,12 +198,12 @@ public final class ClosedLoop {
                 signChanges / Math.max(1e-9, ne * DT), Math.sqrt(Math.max(0, sumS2 / ne - mean * mean)), sumAbsS / ne,
                 100.0 * lostFrames / Math.max(1, frames), lostEvents, 100.0 * wrongLock / Math.max(1, frames),
                 minS, maxS, minT, maxT, libNs / 1e6 / Math.max(1, frames), settleT)
-                + String.format(Locale.ROOT, ",%.2f,%.2f,%.1f,%s", 100 * Math.sqrt(sumLat2 / Math.max(1, frames)), sumDT / Math.max(1, nT),
-                                100.0 * minPw / Math.max(1, frames), dspec.isEmpty() ? "" : dspec.replace(',', ' '));
+                + String.format(Locale.ROOT, ",%.2f,%.2f,%.1f,%s,%.3f", 100 * Math.sqrt(sumLat2 / Math.max(1, frames)), sumDT / Math.max(1, nT),
+                                100.0 * minPw / Math.max(1, frames), dspec.isEmpty() ? "" : dspec.replace(',', ' '), sumDS / Math.max(1, nS));
     }
 
     static final String HEADER = "lib,track,scheme,distract,c,x,vmax,extra,sim,result,time_s,frames,meanLat_cm,maxLat_cm,rmsHead_deg,maxHead_deg,"
-            + "signChg_per_s,steerStd,steerMeanAbs,lost_pct,lostEvents,wrongLock_pct,minS,maxS,minT,maxT,lib_ms,settle_s,rmsLat_cm,powerJerk,lowPower_pct,disturb";
+            + "signChg_per_s,steerStd,steerMeanAbs,lost_pct,lostEvents,wrongLock_pct,minS,maxS,minT,maxT,lib_ms,settle_s,rmsLat_cm,powerJerk,lowPower_pct,disturb,steerJerk";
 
     static double dead(double p) { return Math.abs(p) < SIM_DEAD ? 0 : p; }
 

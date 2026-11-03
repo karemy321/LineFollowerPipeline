@@ -21,6 +21,10 @@ final class Render {
     private final Random rnd;
     /** Optional disturbances (null / inactive = clean). */
     Disturb disturb;
+    /** Whole-frame exposure factor (auto-exposure / light flicker), set per frame by the caller. */
+    double exposure = 1.0;
+    /** Camera pitch vibration: rows shifted by this many pixels. */
+    int rowShift = 0;
     private final int[] dyuv = new int[3];
 
     Render(Cam cam, World w, int rowLo, int rowHi, long seed, double vignette, double farDim) {
@@ -56,29 +60,33 @@ final class Render {
         final Disturb dist = disturb != null && disturb.active() ? disturb : null;
         if (dist != null) dist.frame(px, py, th);
         final int[] dy3 = dyuv;
+        final int expQ = (int) Math.round(1024 * exposure);
+        final int shift = rowShift * W;
+        final int nPix = W * H;
         for (int r = rowLo; r < rowHi; r++) {
             final int base = r * W;
             final boolean chromaRow = (r & 1) == 0;
             final int cbase = (r >> 1) * cw;
             for (int col = 0; col < W; col++) {
                 final int i = base + col;
-                final float f = F[i];
+                final int ir = shift == 0 ? i : Math.max(col, Math.min(nPix - W + col, i + shift));
+                final float f = F[ir];
                 int yy, uu, vv;
                 if (f != f) { yy = w.outY; uu = w.outU; vv = w.outV; }
                 else {
-                    final double wx = px + f * c - L[i] * s, wy = py + f * s + L[i] * c;
+                    final double wx = px + f * c - L[ir] * s, wy = py + f * s + L[ir] * c;
                     final int mi = (int) ((wx - x0) * inv), mj = (int) ((wy - y0) * inv);
                     if (mi < 0 || mj < 0 || mi >= nx || mj >= ny || wx < x0 || wy < y0) { yy = w.outY; uu = w.outU; vv = w.outV; }
                     else {
                         final int m = mj * nx + mi; yy = WY[m] & 0xFF; uu = WU[m] & 0xFF; vv = WV[m] & 0xFF;
                         if (dist != null) {
                             dy3[0] = yy; dy3[1] = uu; dy3[2] = vv;
-                            dist.apply(dy3, wx, wy, f, L[i], w.tapeIdx[m] != 0);
+                            dist.apply(dy3, wx, wy, f, L[ir], w.tapeIdx[m] != 0);
                             yy = World.Col.clamp(dy3[0]); uu = World.Col.clamp(dy3[1]); vv = World.Col.clamp(dy3[2]);
                         }
                     }
                 }
-                final int g = gain[i];
+                final int g = expQ == 1024 ? gain[i] : (gain[i] * expQ) >> 10;
                 int val = ((yy * g) >> 10) + noiseTab[noff++ & (NT - 1)];
                 y[i] = (byte) (val < 0 ? 0 : (val > 255 ? 255 : val));
                 if (chromaRow && (col & 1) == 0) {

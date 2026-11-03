@@ -13,6 +13,7 @@ import java.util.Locale;
  * toward the camera, so it moves with the camera).
  *
  * Spec: "type:key=val,key=val;type:..." — see {@link #parse}. Types:
+ *   glareReal    clipped, streaky, flickering lamp spot (see make); keys of glare + flick, tex, tape, seed
  *   glare        lamp mirror spot: fwd (m ahead of the axle at the reference pose), lat, rf, rl (spot radii, m), i (0…1)
  *   shadowRobot  ellipse in the robot frame: fwd, lat, a, b, k (brightness factor)
  *   shadowRoom   floor ellipse: s (track position m), lat, a (along), b (across), k
@@ -120,6 +121,56 @@ final class Disturb {
                         yuv[0] = (int) Math.round(yuv[0] + s * (245 - yuv[0]));
                         yuv[1] = (int) Math.round(128 + (yuv[1] - 128) * (1 - s));
                         yuv[2] = (int) Math.round(128 + (yuv[2] - 128) * (1 - s));
+                    }
+                };
+            }
+            case "glareReal": {
+                // Real room-light glare on a glossy floor / tape, as a phone camera sees it:
+                //  - the specular spot of a lamp (moves with the camera, like "glare"), but so
+                //    bright that its core CLIPS to white (flat 255, no colour) with a soft halo;
+                //  - broken up by the surface (varnish / wood grain / tape texture): streaky,
+                //    world-fixed, so it changes as the robot moves over it;
+                //  - FLICKER: mains-powered light (100 Hz) against the camera exposure, plus
+                //    auto-exposure hunting: the spot's strength changes randomly every frame;
+                //  - the tape is glossier than the floor (stronger glare on the line).
+                // fwd/lat/rf/rl as "glare"; i = peak (>1 clips), flick = per-frame strength
+                // variation, tex = texture depth, tape = glare factor on the tape, seed.
+                final double H = 2.0, h = cam.h;
+                final double fwd = g(kv, "fwd", 0.4), lat = g(kv, "lat", 0.012);
+                final double rf = g(kv, "rf", 0.07), rl = g(kv, "rl", 0.05), I = g(kv, "i", 1.6);
+                final double flick = g(kv, "flick", 0.3), tex = g(kv, "tex", 0.5), tapeK = g(kv, "tape", 1.25);
+                final long seed = (long) g(kv, "seed", 5);
+                final double[] r = at(t, g(kv, "ref", sRef));
+                final double cgx = r[0] + cam.camFwd * r[2], cgy = r[1] + cam.camFwd * r[3];
+                final double sx = r[0] + fwd * r[2] + lat * r[3], sy = r[1] + fwd * r[3] - lat * r[2];
+                final double lx = cgx + (sx - cgx) * (h + H) / h, ly = cgy + (sy - cgy) * (h + H) / h;
+                final java.util.Random rnd = new java.util.Random(seed);
+                return new Effect() {
+                    double spx, spy, ex, ey, fl = 1;
+                    int k;
+                    public void frame(double px, double py, double th) {
+                        final double gx = px + cam.camFwd * Math.cos(th) + cam.camLat * Math.sin(th);
+                        final double gy = py + cam.camFwd * Math.sin(th) - cam.camLat * Math.cos(th);
+                        spx = gx + (lx - gx) * h / (h + H); spy = gy + (ly - gy) * h / (h + H);
+                        final double dx = lx - gx, dy = ly - gy, l = Math.max(1e-6, Math.hypot(dx, dy));
+                        ex = dx / l; ey = dy / l;
+                        // beat of the mains flicker with the frame rate + random exposure hunting
+                        k++;
+                        fl = 1 + flick * (0.6 * Math.sin(k * 2.1) + 0.8 * (rnd.nextDouble() - 0.5));
+                    }
+                    public void apply(int[] yuv, double wx, double wy, double rfx, double rlx, boolean tape) {
+                        final double dx = wx - spx, dy = wy - spy;
+                        final double a = (dx * ex + dy * ey) / rf, b = (-dx * ey + dy * ex) / rl;
+                        final double q = a * a + b * b;
+                        if (q > 9) return;
+                        // streaky surface: elongated grain + fine speckle (world-fixed)
+                        final double grain = 0.65 * World.noise(wx * 0.25, wy * 4, 0.01, seed + 11) + 0.35 * World.noise(wx, wy, 0.004, seed + 12);
+                        final double s = I * fl * Math.exp(-q) * (1 - tex + tex * 2 * grain) * (tape ? tapeK : 0.85);
+                        if (s <= 0) return;
+                        final double c = Math.min(1, s);
+                        yuv[0] = (int) Math.round(yuv[0] + c * (255 - yuv[0]) + Math.max(0, s - 1) * 120);   // > 1: clipped core
+                        yuv[1] = (int) Math.round(128 + (yuv[1] - 128) * (1 - c));
+                        yuv[2] = (int) Math.round(128 + (yuv[2] - 128) * (1 - c));
                     }
                 };
             }
