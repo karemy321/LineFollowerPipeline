@@ -2879,7 +2879,8 @@ public final class LineFollowerPipeline {
     // ── Control state ───────────────────────────────────────────────────────
     private float   v3Tracking = 100f;      // rate-limited tracking output
     private int     outSteer = 0, outTrack = 100;   // last whole-number outputs (hysteresis)
-    private static final float OUT_HYST = 0.8f;
+    private static final float OUT_HYST = 0.8f, TRACK_HYST = 4f;
+    private float   trackHold = 100f;       // tracking target with hysteresis
 
     private static final float AG_RATE = 0.01f;   // steering-scale adaptation per frame
     private int     v3LostFrames, v3HoldFrames, v3BlindFrames;
@@ -4177,7 +4178,7 @@ public final class LineFollowerPipeline {
         memN = 0; ndN = 0;
         velX = 0f; velY = 0f; velT = 0f; corrX = 0f; corrY = 0f; corrT = 0f;
         mPxx = MOTION_P0X; mPxt = 0f; mPtt = MOTION_P0T; motionMeasured = false;
-        v3Tracking = 100f; v3LostFrames = 0; v3HoldFrames = 0; v3BlindFrames = 0; v3LastSteer = 0f; outSteer = 0; outTrack = 100;
+        v3Tracking = 100f; v3LostFrames = 0; v3HoldFrames = 0; v3BlindFrames = 0; v3LastSteer = 0f; outSteer = 0; outTrack = 100; trackHold = 100f;
         prGain = 1f; lightRef = 1f; ambRef = 1f; pathEnd = END_OUT; pathExitSide = 0f;
         ctTarget = false;
         ctCurvAheadPrev = 100f; ctCurvPivot = 0f; ctCurv = 0f;
@@ -5200,6 +5201,10 @@ public final class LineFollowerPipeline {
         }
         if (ctConf < 0.5f) t = tMin + (t - tMin) * Math.max(0f, ctConf) / 0.5f;
         t = Math.max(tMin, Math.min(100f, t));
+        // small wobbles of the target (curvature noise far ahead) do not move the power:
+        // it follows only changes of more than TRACK_HYST units (the ends exactly)
+        if (Math.abs(t - trackHold) > TRACK_HYST || t >= 99.5f || t <= tMin + 0.5f) trackHold = t;
+        t = trackHold;
         // light smoothing of the target (the path is re-measured every frame)
         ctCurvAheadPrev += 0.3f * (t - ctCurvAheadPrev);
         if (t <= tMin + 0.5f && ctCurvAheadPrev < tMin + 2f) ctCurvAheadPrev = tMin;
