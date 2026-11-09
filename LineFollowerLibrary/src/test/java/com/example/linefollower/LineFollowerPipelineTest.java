@@ -159,6 +159,7 @@ public class LineFollowerPipelineTest {
         final LineFollowerPipeline.Config cfg = new LineFollowerPipeline.Config();
         cfg.steerHeadingWeight = 0f;
         cfg.trackHoldFrames    = 0;
+        cfg.glareMask          = false;   // v3 glare handling off (it replaces the hold by a coast)
         return cfg;
     }
 
@@ -337,10 +338,14 @@ public class LineFollowerPipelineTest {
     }
 
     @Test public void lostLineReportsTrackLost() {
-        // The line vanishes in the middle of the image (e.g. hidden by a shadow):
-        // the last values are held for trackHoldFrames, then tracking drops to 5.
+        // v2 behaviour (glareMask = false): the line vanishes in the middle of the image
+        // (e.g. hidden by a shadow): the last values are held for trackHoldFrames, then
+        // tracking drops to 5.
         final LineFollowerPipeline p = new LineFollowerPipeline();
-        final int holdFrames = new LineFollowerPipeline.Config().trackHoldFrames;
+        final LineFollowerPipeline.Config v2 = new LineFollowerPipeline.Config();
+        v2.glareMask = false;
+        p.configure(v2);
+        final int holdFrames = v2.trackHoldFrames;
         final LineFollowerPipeline.FrameData[] last = {null};
         p.setFrameCallback(d -> last[0] = d);
         final int[] img = straight(BLACK, WHITE, W / 2, 30);
@@ -357,6 +362,74 @@ public class LineFollowerPipelineTest {
         assertFalse("hold expired", last[0].lineHeld);
         assertFalse(last[0].trackFound);
         assertEquals(5, out[1]);
+    }
+
+    // ── v3 coasting (glareMask = true, the default) ─────────────────────────
+
+    /** Frames coasted after the line vanishes mid-image; then checks the pin that follows. */
+    private static int coastFrames(float frameIntervalMs, int maxFrames) {
+        final LineFollowerPipeline p = new LineFollowerPipeline();
+        final LineFollowerPipeline.Config cfg = new LineFollowerPipeline.Config();
+        cfg.frameIntervalMs     = frameIntervalMs;
+        cfg.glareCoastMaxFrames = maxFrames;
+        p.configure(cfg);
+        final LineFollowerPipeline.FrameData[] last = {null};
+        p.setFrameCallback(d -> last[0] = d);
+        final int[] img = straight(BLACK, WHITE, W / 2, 30);
+        while (!p.calibrateArgb(img, W, H)) { /* calibrating */ }
+        final int[] before = p.processFrameArgb(img, W, H).clone();
+        final int[] empty = scene(BLACK, BLACK, r -> 0, 1, 4, 1.0, 3);
+        int n = 0, prevS = before[0], prevT = before[1];
+        for (int i = 0; i < 1000; i++) {
+            final int[] out = p.processFrameArgb(empty, W, H);
+            if (!last[0].coasting) break;
+            assertTrue("coasting is reported as held", last[0].lineHeld);
+            assertFalse(last[0].trackFound);
+            assertTrue("steering continuous while coasting", Math.abs(out[0] - prevS) <= 2);
+            assertTrue("tracking only ramps down while coasting", out[1] <= prevT);
+            prevS = out[0]; prevT = out[1];
+            n++;
+        }
+        assertFalse(last[0].lineHeld);
+        assertEquals("pinned after the coast", 50, Math.abs(p.processFrameArgb(empty, W, H)[0]));
+        assertEquals(5, p.processFrameArgb(empty, W, H)[1]);
+        return n;
+    }
+
+    @Test public void hiddenLineCoastsForGlareCoastMs() {
+        // 600 ms at 33.3 ms per frame = 18 frames.
+        assertEquals(18, coastFrames(1000f / 30f, 36));
+    }
+
+    @Test public void coastClockIsClampedPerFrame() {
+        // A 500 ms gap counts as 100 ms: a pause cannot use up the coast in one frame.
+        assertEquals(6, coastFrames(500f, 36));
+    }
+
+    @Test public void coastHasFrameLimit() {
+        // 1 ms frames would allow 600 frames by time; the frame limit ends it.
+        assertEquals(36, coastFrames(1f, 36));
+        assertEquals(10, coastFrames(1f, 10));
+    }
+
+    @Test public void glareMaskOffKeepsV2Hold() {
+        final LineFollowerPipeline.Config cfg = new LineFollowerPipeline.Config();
+        cfg.glareMask = false;
+        final LineFollowerPipeline p = new LineFollowerPipeline();
+        p.configure(cfg);
+        final LineFollowerPipeline.FrameData[] last = {null};
+        p.setFrameCallback(d -> last[0] = d);
+        final int[] img = straight(BLACK, WHITE, W / 2, 30);
+        while (!p.calibrateArgb(img, W, H)) { /* calibrating */ }
+        p.processFrameArgb(img, W, H);
+        final int[] empty = scene(BLACK, BLACK, r -> 0, 1, 4, 1.0, 3);
+        for (int i = 0; i < cfg.trackHoldFrames; i++) {
+            p.processFrameArgb(empty, W, H);
+            assertTrue(last[0].lineHeld);
+            assertFalse("no coasting with glareMask off", last[0].coasting);
+        }
+        assertEquals(5, p.processFrameArgb(empty, W, H)[1]);
+        assertEquals(0f, last[0].maskedFrac, 0f);
     }
 
     // ── v1 compatibility (steerHeadingWeight = 0, trackHoldFrames = 0) ──────

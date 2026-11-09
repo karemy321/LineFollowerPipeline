@@ -34,7 +34,7 @@ import org.junit.Test;
 public class V3ScenarioTest {
 
     /** Highest plan phase implemented in the library. Scenarios for later phases are skipped. */
-    static final int IMPLEMENTED_PHASE = 0;
+    static final int IMPLEMENTED_PHASE = 1;
 
     static final int W = 320, H = 240;
     static final double SPEED = 0.6;          // m/s, user's top speed (plan §8.4)
@@ -527,7 +527,7 @@ public class V3ScenarioTest {
      * The robot overshoots a sharp turn so the line leaves the view at the frame edge — while
      * glare covers the near strip the whole time. Reference: the same drive without glare, v2
      * flags (v2 pins at once when the line leaves at the edge). The glare run must follow the line
-     * until then (pinned early only once the line is already near the edge), pin to the same side
+     * until then (pinned early only to the exit side, once v2 also turns that way), pin to the same side
      * no later than one frame after v2, and never coast through the exit.
      */
     @Test public void edgeExitUnderGlare() {
@@ -565,8 +565,12 @@ public class V3ScenarioTest {
                 final int side = Integer.signum(ref[pinK].s);
                 for (int k = 0; k < pinK; k++) {
                     if (t[k].pinned()) {
-                        c.that(Integer.signum(t[k].s) == side && Math.abs(ref[k].s) >= 25, r.sc.name, FMT[f], k,
-                                "pinned before the line reached the edge", t[k] + " / ref " + ref[k]);
+                        // Requirement 4 pins as soon as the look-ahead shows the line leaving
+                        // through the edge — possibly before v2 (which watches the hidden base)
+                        // gets there. Allowed if it is the exit side and v2 already turns that way.
+                        c.that(Integer.signum(t[k].s) == side && Integer.signum(ref[k].s) == side
+                                && Math.abs(ref[k].s) >= 10, r.sc.name, FMT[f], k,
+                                "pinned before the line heads for the edge", t[k] + " / ref " + ref[k]);
                     } else {
                         c.that(t[k].found || t[k].coasting, r.sc.name, FMT[f], k, "line lost under the glare", t[k]);
                         c.that(Math.abs(t[k].s - ref[k].s) <= 15, r.sc.name, FMT[f], k, "not following the line",

@@ -218,6 +218,44 @@ public final class LineFollowerPipeline {
         // still pinned to that edge at once. 6 frames = 0.1 s at 60 Hz.
         public int trackHoldFrames = 6;
 
+        // ── Glare robustness (v3) ───────────────────────────────────────────
+        // Strong light (a lamp or a window reflected by glossy tape or floor) saturates pixels:
+        // they no longer show their colour, so they can be read neither as line nor as floor.
+        // With glareMask ON such pixels are MASKED ("unknown"): they are left out of every
+        // threshold histogram, and inside a band they count as part of it, so a highlight on
+        // the tape centre does not split the line and a fully saturated piece of tape of the
+        // right width is still found. In addition, with glareMask ON:
+        //   • if glare hides the line in the scan strip, the line is followed from the look-ahead
+        //     (the base of the ⊥ is reconstructed from the line ahead — FrameData.baseReconstructed);
+        //   • look-ahead rows hidden by glare are skipped, not taken for the end of the road;
+        //   • a line hidden completely in the middle of the image is coasted on for up to
+        //     glareCoastMs (instead of the trackHoldFrames hold);
+        //   • the scan strip gets one Otsu threshold per eighth of its width.
+        // OFF = exactly the v2 behaviour (including the trackHoldFrames hold).
+        public boolean glareMask = true;
+
+        // A pixel whose brightness (Y, 0–255) is at or above this is masked as glare.
+        // ARGB input: a pixel with any of R, G, B ≥ 250 is masked.
+        public int glareLumaMax = 245;
+
+        // Longest time (ms) the line is coasted on while it is hidden in the MIDDLE of the image
+        // (glareMask only). While coasting the line position continues its last motion, the
+        // heading part of the steering fades out and the tracking value ramps down toward the
+        // minimum, so the robot slows while it cannot see. A line that leaves at the frame edge,
+        // or that the look-ahead shows leaving through the edge, is pinned to that edge at once
+        // and never coasted. At 0.6 m/s, 600 ms is about 36 cm of blind driving. 0 = no coasting.
+        public float glareCoastMs = 600f;
+
+        // Backup limit for the coast: it also ends after this many frames, whatever the clock
+        // says (36 = 600 ms at 60 fps).
+        public int glareCoastMaxFrames = 36;
+
+        // Time between frames used by the coast clock, in ms. 0 (default) = measured with
+        // System.nanoTime(). Set it for repeatable results (tests, simulation, replay). Either way
+        // one frame counts at most 100 ms, so a pause or a dropped frame cannot use up the coast
+        // in one step.
+        public float frameIntervalMs = 0f;
+
         // ── Steering from the whole ⊥ (offset + heading) ─────────────────────
         // Steering = offset part + heading part:
         //   offset  = steerOffsetWeight × (line column in the H-ROI − calibrated
@@ -338,6 +376,8 @@ public final class LineFollowerPipeline {
         float   headingConf  = 0f;
         boolean held         = false;
         int     rejected     = 0;
+        boolean coasting     = false;
+        boolean reconstructed = false;
     }
 
     // =========================================================================
@@ -429,6 +469,14 @@ public final class LineFollowerPipeline {
         public boolean lineHeld;
         /** Number of candidate bands rejected or trimmed as distractors this frame (H-ROI). */
         public int rejectedBands;
+        /** True when the line was hidden in the scan strip (glare) and its position there was
+         *  reconstructed from the look-ahead; trackFound is then true. (glareMask) */
+        public boolean baseReconstructed;
+        /** True while the line is hidden mid-image and the pipeline coasts on its last motion
+         *  (glareMask; lineHeld is also true). trackFound is false. */
+        public boolean coasting;
+        /** Fraction [0 … 1] of the pixels in the scan strip + look-ahead masked as glare. */
+        public float maskedFrac;
     }
 
     // =========================================================================
@@ -609,6 +657,40 @@ public final class LineFollowerPipeline {
     private double bandMoment;
     private int    bandStart, bandEnd;   // [bandStart, bandEnd) columns; -1 if none
     private float  bandScore;
+
+    // ── Glare handling (v3, Config.glareMask) ───────────────────────────────
+    // maskActive: the glare mask is in use for the current frame (processing only, never
+    //   during calibration, which assumes a clean view).
+    // glareMap: ARGB input only — 1 = saturated pixel, on the rows prepared for the current
+    //   frame (gray / YUV input test Y directly, see setupGlareSource).
+    // colMask: per column, masked pixels in the H-ROI; colThr: per column, the local H-ROI
+    //   threshold (one Otsu per THR_SEGMENTS-th of the width, interpolated).
+    private static final int THR_SEGMENTS = 8;
+    private static final int GLARE_CHANNEL_MAX = 250;   // ARGB: any channel at/above this = glare
+    private boolean maskActive;
+    private byte[]  glareMap;
+    private int[]   colMask, colThr;
+    private byte[]  glareSrc;          // glare test source: Y plane (gray / YUV) or glareMap (ARGB)
+    private int     glareLim;          // ... a pixel is glare when (glareSrc[i] & 0xFF) >= glareLim
+    private int     maskedSamples;     // look-ahead pixels sampled for the masked fraction
+    private int     maskedSampleHits;  // ... of which masked
+    private final int[] segHist = new int[THR_SEGMENTS * 256];
+    private final int[] segThr  = new int[THR_SEGMENTS];
+    private int     maskedPixels;      // masked pixels in the H-ROI (exact)
+    // Coast clock and state: frameDtMs = time since the previous processed frame (clamped);
+    // coastMs / coastFrames = how much of the coast budget the current hidden spell has used.
+    private static final float MAX_FRAME_DT_MS = 100f;
+    private long    lastFrameNs;
+    private float   frameDtMs;
+    private float   coastMs;
+    private int     coastFrames;
+    private float   lastHeadTerm;      // heading part of the steering on the last frame with the line
+    // Extra look-ahead results (seeded trace without a base, glare rows).
+    private int     traceEdgeSide;     // -1 / +1: nearest line row runs off the left / right frame edge
+    private int     traceAccepted;     // look-ahead rows on the line
+    // Linear floor fit over the NEAREST part of the trace (for reconstructing the base).
+    private int     nfN;
+    private double  nfU, nfUU, nfX, nfUX, nfXX, nfLimit;
 
     private final ControlOutput output = new ControlOutput();
 
@@ -875,6 +957,9 @@ public final class LineFollowerPipeline {
         colWeight         = new int[width];
         colLevel          = new int[width];
         work              = new byte[width * height];
+        glareMap          = new byte[width * height];
+        colMask           = new int[width];
+        colThr            = new int[width];
         final int maxSamples = Math.max(1, config.colorCalibFrames) * SAMPLES_PER_FRAME;
         sampY             = new short[maxSamples];
         sampU             = new short[maxSamples];
@@ -1051,6 +1136,7 @@ public final class LineFollowerPipeline {
     private boolean calibrateBound() {
         if (calibrated) return true;
         laPathCount = 0;
+        maskActive  = false;            // calibration assumes a clean view (v2 code path)
 
         boolean lineFound = false;
         int     centroidX = -1;
@@ -1132,6 +1218,14 @@ public final class LineFollowerPipeline {
 
     private int[] processBound() {
         updateFps();
+        // Coast clock: time since the previous frame, clamped so a pause cannot use up the coast.
+        final long now = System.nanoTime();
+        float dt = cfg.frameIntervalMs > 0f ? cfg.frameIntervalMs
+                 : (lastFrameNs != 0L ? (now - lastFrameNs) / 1e6f : 0f);
+        frameDtMs   = Math.max(0f, Math.min(MAX_FRAME_DT_MS, dt));
+        lastFrameNs = now;
+        maskActive  = cfg.glareMask;
+        if (maskActive) setupGlareSource(vRoiTop, hRoiBot);
         final byte[] pix = prepareWorkImage(vRoiTop, hRoiBot);
         runPipeline(pix, imgW, imgH, workBright);
         // Internal steering is [-100 … +100]; the output is scaled to [-50 … +50].
@@ -1202,6 +1296,34 @@ public final class LineFollowerPipeline {
             }
         }
         return out;
+    }
+
+    /**
+     * v3 (glareMask): where the glare test reads from. A pixel is glare when its brightness Y is
+     * at least Config.glareLumaMax (gray / YUV input: read straight from the Y plane, no extra
+     * pass) or when any of R, G, B is at least 250 (ARGB input: a 0/1 map is built for rows
+     * [r0, r1)). Saturated pixels carry no colour information, so they are neither line nor
+     * floor. Test a pixel i with {@code (glareSrc[i] & 0xFF) >= glareLim}.
+     */
+    private void setupGlareSource(int r0, int r1) {
+        maskedPixels = 0;
+        maskedSamples = 0;
+        maskedSampleHits = 0;
+        if (srcFormat != FMT_ARGB) {
+            glareSrc = srcY;
+            glareLim = Math.max(1, Math.min(255, cfg.glareLumaMax));
+            return;
+        }
+        final int W = imgW;
+        final int[] s = srcArgb;
+        final byte[] m = glareMap;
+        final int lim = GLARE_CHANNEL_MAX;
+        for (int i = r0 * W, end = r1 * W; i < end; i++) {
+            final int c = s[i];
+            m[i] = (((c >> 16) & 0xFF) >= lim || ((c >> 8) & 0xFF) >= lim || (c & 0xFF) >= lim) ? (byte) 1 : (byte) 0;
+        }
+        glareSrc = m;
+        glareLim = 1;
     }
 
     private static byte clampByte(int v) {
@@ -1578,6 +1700,7 @@ public final class LineFollowerPipeline {
      * to contain a line.
      */
     private int stripThreshold(byte[] pixels, boolean bright) {
+        if (maskActive) return stripThresholdMasked(pixels, bright);
         final int W = imgW;
         final int[] hist = histogram;
         java.util.Arrays.fill(hist, 0);
@@ -1588,6 +1711,60 @@ public final class LineFollowerPipeline {
             }
         }
         return finishThreshold(otsuThreshold(hist, (long) (hRoiBot - hRoiTop) * W), bright);
+    }
+
+    /**
+     * v3 Stage 1 (glareMask): the same Otsu threshold, but saturated pixels are left out (G4),
+     * and in learned-colour mode each eighth of the strip also gets its own Otsu threshold
+     * (G3: a bright patch in one part of the strip no longer sets the threshold for the rest).
+     * A segment without enough contrast (only floor, or only line) uses the strip-wide value.
+     * The per-column result (segment values interpolated between segment centres) goes to
+     * colThr; colMask gets the masked-pixel count per column. Returns the strip-wide threshold.
+     */
+    private int stripThresholdMasked(byte[] pixels, boolean bright) {
+        final int W = imgW, S = THR_SEGMENTS;
+        final int[] hist = histogram, sh = segHist, cm = colMask;
+        final byte[] gs = glareSrc;
+        final int gl = glareLim;
+        java.util.Arrays.fill(hist, 0);
+        java.util.Arrays.fill(sh, 0);
+        java.util.Arrays.fill(cm, 0, W, 0);
+        long n = 0;
+        for (int row = hRoiTop; row < hRoiBot; row++) {
+            final int base = row * W;
+            for (int col = 0; col < W; col++) {
+                if ((gs[base + col] & 0xFF) >= gl) { cm[col]++; maskedPixels++; continue; }
+                final int v = pixels[base + col] & 0xFF;
+                hist[v]++;
+                sh[(col * S / W) * 256 + v]++;
+                n++;
+            }
+        }
+        final int global = finishThreshold(otsuThreshold(hist, n), bright);
+        final int[] st = segThr;
+        final boolean local = cfg.autoColor && colorReady;
+        for (int s = 0; s < S; s++) {
+            st[s] = global;
+            if (!local) continue;
+            long cnt = 0;
+            for (int g = 0; g < 256; g++) cnt += sh[s * 256 + g];
+            if (cnt == 0) continue;
+            // Otsu on this segment (copied into the shared histogram buffer, which is free now).
+            System.arraycopy(sh, s * 256, histogramV, 0, 256);
+            final int t = otsuThreshold(histogramV, cnt);
+            if (otsuContrast >= cfg.minContrast) st[s] = finishThreshold(t, bright);
+        }
+        final int[] ct = colThr;
+        for (int col = 0; col < W; col++) {
+            final float pos = (col + 0.5f) * S / W - 0.5f;
+            final int s0 = Math.max(0, Math.min(S - 1, (int) Math.floor(pos)));
+            final int s1 = Math.min(S - 1, s0 + 1);
+            final float t = Math.max(0f, Math.min(1f, pos - s0));
+            final int a = st[s0], b = st[s1];
+            ct[col] = a == NO_TRACK ? b : (b == NO_TRACK ? a : Math.round(a + (b - a) * t));
+        }
+        otsuContrast = 0;
+        return global;
     }
 
     /** Threshold value meaning "no line in this region" (no pixel passes it). */
@@ -1621,6 +1798,25 @@ public final class LineFollowerPipeline {
         final int[] colL = colLevel;
         java.util.Arrays.fill(colW, 0, W, 0);
         java.util.Arrays.fill(colL, 0, W, 0);
+        if (maskActive) {
+            // Per-column (local) threshold; masked pixels are neither line nor floor.
+            final int[] ct = colThr;
+            final byte[] gs = glareSrc;
+            final int gl = glareLim;
+            for (int row = hRoiTop; row < hRoiBot; row++) {
+                final int base = row * W;
+                for (int col = 0; col < W; col++) {
+                    final int t = ct[col];
+                    if (t == NO_TRACK || (gs[base + col] & 0xFF) >= gl) continue;
+                    final int px = pixels[base + col] & 0xFF;
+                    if (bright ? (px >= t) : (px <= t)) {
+                        colW[col]++;
+                        colL[col] += bright ? px : 255 - px;
+                    }
+                }
+            }
+            return;
+        }
         if (threshold == NO_TRACK) return;
         for (int row = hRoiTop; row < hRoiBot; row++) {
             final int base = row * W;
@@ -1661,14 +1857,20 @@ public final class LineFollowerPipeline {
     // and the score is weighted by how line-like the run's pixels are.
     private void findBand(int lo, int hi, double minWeight, float prefX, float scale, float expectW,
                           boolean filter, boolean trim) {
-        final int[] colW = colWeight;
+        final int[] colW = colWeight, cm = colMask;
         final int runGapTol = runGapTol();
+        // Glare (v3): a column that is at least a quarter masked is "unknown" and counts as part
+        // of a band (a highlight on the tape centre does not split it; a saturated stretch of
+        // tape of the right width is still a candidate — scored low, as it has no line-ness).
+        final boolean mask = maskActive;
+        final int maskMin = Math.max(1, (hRoiBot - hRoiTop) / 4);
         long   curSum = 0;
         double curMoment = 0;
         int    curStart = -1, curLast = -1, gapCols = 0;
         bandSum = 0; bandMoment = 0; bandStart = -1; bandEnd = -1; bandScore = -1f; bandTrimmed = false;
         for (int col = lo; col <= hi; col++) {
-            final int w = (col < hi) ? colW[col] : 0;
+            int w = (col < hi) ? colW[col] : 0;
+            if (mask && col < hi && cm[col] >= maskMin) w += cm[col];
             if (w > 0) {
                 if (curStart < 0) { curStart = col; curSum = 0; curMoment = 0; }
                 curSum += w; curMoment += (double) col * w; gapCols = 0; curLast = col;
@@ -1726,6 +1928,18 @@ public final class LineFollowerPipeline {
                              float prefX, float scale, float expectW, boolean trim) {
         boolean trimmed = false;
         final int width = end - start;
+        if (maskActive) {
+            // Glare (v3): a band made mostly of masked columns has no colour to judge it by.
+            // It may be the line (a saturated stretch of tape) only if it has the calibrated
+            // width itself — no slant allowance, no trimming (a glare patch is not cut to size).
+            long line = 0;
+            for (int c = start; c < end; c++) line += colWeight[c];
+            if (4 * line < sum) {
+                final float calW = expectedLineWidth();
+                if (calW <= 0f || width > 1.3f * calW + 4f || width < fMinW) { rejectedBands++; return; }
+                trim = false;
+            }
+        }
         if (width > fMaxW) {
             // Too wide for the line: a line merged with a blob / shadow, or a blob.
             rejectedBands++;
@@ -1991,6 +2205,10 @@ public final class LineFollowerPipeline {
         boolean held               = false;
         float   forcedIntersection = -1f;   // ≥ 0 overrides the look-ahead stage
         float   pinnedSteering     = 0f;    // ±100 while the locked line is lost
+        boolean reconstructed      = false; // v3: base hidden, rebuilt from the look-ahead
+        boolean coastingNow        = false; // v3: line hidden mid-image, coasting
+        boolean traced             = false; // look-ahead already traced this frame
+        final boolean glare        = maskActive && filter;
 
         if (bandStart >= 0) {
             // Locked onto the line this frame.
@@ -2009,6 +2227,67 @@ public final class LineFollowerPipeline {
             trackAcquired    = true;
             lostFrames       = 0;
             holdFrames       = 0;
+            coastMs          = 0f;
+            coastFrames      = 0;
+        } else if (locked && glare) {
+            // ── v3: the locked line is not visible in the strip (glare, shadow, object) ──
+            // Follow it from the look-ahead instead, starting at the predicted column. The first
+            // line row is searched across the whole width (nearest to the prediction wins), so a
+            // line already curving off toward a frame edge is seen; the base is only rebuilt if
+            // it lies within the lock gate of the prediction.
+            traceLookAhead(pixels, lookAheadThreshold(pixels, threshold, bright), bright,
+                           -1, predX, W, true);
+            traced = true;
+            final float edgeZone = Math.max(lastTrackWidthPx, 0.12f * W);
+            final float recon    = reconstructBase(predX, gateHalf);
+            // Edge exits beat coasting: the line ahead runs off a frame edge, or its
+            // reconstructed base lies in the edge zone → pin to that edge at once (as v2).
+            int exitSide = traceAccepted > 0 ? traceEdgeSide : 0;
+            if (exitSide == 0 && !Float.isNaN(recon)) {
+                if (recon < edgeZone) exitSide = -1;
+                else if (recon > W - edgeZone) exitSide = 1;
+            }
+            final boolean midImage = predX > edgeZone && predX < W - edgeZone;
+            if (exitSide == 0 && !Float.isNaN(recon)) {
+                trackFound    = true;
+                reconstructed = true;
+                centroidX     = Math.max(0, Math.min(W - 1, Math.round(recon)));
+                float d = centroidX - lastCentroidX;
+                final float lim = 0.5f * Math.max(20f, slantW > 0f ? slantW : lastTrackWidthPx);
+                d = Math.max(-lim, Math.min(lim, d));
+                centroidVel   = 0.5f * centroidVel + 0.5f * d;
+                lastCentroidX = centroidX;
+                lostFrames    = 0;
+                holdFrames    = 0;
+                coastMs       = 0f;
+                coastFrames   = 0;
+            } else {
+                trackFound = false;
+                coastMs += frameDtMs;
+                coastFrames++;
+                if (exitSide == 0 && midImage && cfg.glareCoastMs > 0f
+                        && coastMs <= cfg.glareCoastMs && coastFrames <= cfg.glareCoastMaxFrames) {
+                    // Hidden mid-image: coast on the predicted position (lock kept).
+                    coastingNow   = true;
+                    lastCentroidX = Math.round(predX);
+                    centroidVel  *= 0.9f;
+                    centroidX     = lastCentroidX;
+                } else {
+                    // Left at an edge, or the coast is used up: pin like v2.
+                    lostFrames++;
+                    final boolean onRight = exitSide != 0 ? exitSide > 0
+                                                          : lastCentroidX >= Math.round(steerRefX);
+                    centroidX     = onRight ? Math.min(W - 1, Math.round(steerRefX + halfW))
+                                            : Math.max(0,     Math.round(steerRefX - halfW));
+                    lastCentroidX = centroidX;
+                    centroidVel   = 0f;
+                    pinnedSteering     = onRight ? 100f : -100f;
+                    forcedIntersection = 100f;
+                    coastMs     = cfg.glareCoastMs;              // no new coast until the line is seen
+                    coastFrames = cfg.glareCoastMaxFrames;
+                }
+                if (lostFrames > cfg.trackLostGraceFrames) trackAcquired = false;
+            }
         } else if (locked) {
             trackFound  = false;
             lostFrames++;
@@ -2052,8 +2331,10 @@ public final class LineFollowerPipeline {
         //  position is known.)
 
         // ── Stage 3: look-ahead along the line (the vertical part of the ⊥) ────
-        final int vThreshold = lookAheadThreshold(pixels, threshold, bright);
-        traceLookAhead(pixels, vThreshold, bright, trackFound ? centroidX : -1, filter);
+        if (!traced) {
+            final int vThreshold = lookAheadThreshold(pixels, threshold, bright);
+            traceLookAhead(pixels, vThreshold, bright, trackFound ? centroidX : -1, filter);
+        }
         laPathCount = traceLaCount;   // publish the path for any external overlay
         final int    farRow = traceFarRow;
         final double slope  = traceSlope;
@@ -2120,6 +2401,16 @@ public final class LineFollowerPipeline {
         // you have moved fully off the line and a new one is being sought.
         if (forcedIntersection >= 0f) intersection = forcedIntersection;
 
+        // v3 coast: steering from the predicted position plus the last heading part, which
+        // fades out over the coast; tracking ramps from its last value toward the minimum.
+        if (coastingNow) {
+            final float used = Math.min(1f, Math.max(coastMs / Math.max(1e-3f, cfg.glareCoastMs),
+                    coastFrames / (float) Math.max(1, cfg.glareCoastMaxFrames)));
+            steering = Math.max(-100f, Math.min(100f,
+                    cfg.steerOffsetWeight * offsetTerm + (1f - used) * lastHeadTerm));
+            intersection = lastIntersection + (100f - lastIntersection) * used;
+        }
+
         // Line momentarily hidden mid-image: hold the last good outputs.
         if (held) {
             steering     = lastSteering;
@@ -2127,6 +2418,7 @@ public final class LineFollowerPipeline {
         } else if (trackFound) {
             lastSteering     = steering;
             lastIntersection = intersection;
+            lastHeadTerm     = cfg.steerHeadingWeight * conf * headingTerm;
         }
 
         // ── Write internal output ──────────────────────────────────────────────
@@ -2141,8 +2433,10 @@ public final class LineFollowerPipeline {
         output.headingTerm  = trackFound ? cfg.steerHeadingWeight * conf * headingTerm : 0f;
         output.headingDeg   = headingDeg;
         output.headingConf  = conf;
-        output.held         = held;
+        output.held         = held || coastingNow;
         output.rejected     = rejectedBands;
+        output.coasting     = coastingNow;
+        output.reconstructed = reconstructed;
     }
 
     /**
@@ -2161,9 +2455,16 @@ public final class LineFollowerPipeline {
             final int stepR = Math.max(1, (vRoiBot - vRoiTop) / 240);   // ~240 rows sampled
             final int stepC = Math.max(1, W / 240);                     // ~240 cols sampled
             long cntV = 0;
+            final byte[] gs = glareSrc;
+            final int gl = glareLim;
+            final boolean mask = maskActive;
             for (int row = vRoiTop; row < vRoiBot; row += stepR) {
                 final int base = row * W;
                 for (int col = 0; col < W; col += stepC) {
+                    if (mask) {
+                        maskedSamples++;
+                        if ((gs[base + col] & 0xFF) >= gl) { maskedSampleHits++; continue; }   // glare: neither line nor floor
+                    }
                     histV[pixels[base + col] & 0xFF]++; cntV++;
                 }
             }
@@ -2193,12 +2494,36 @@ public final class LineFollowerPipeline {
      * its local drift), which follows curves more closely.
      */
     private void traceLookAhead(byte[] pixels, int vThreshold, boolean bright, int centroidX, boolean filter) {
+        traceLookAhead(pixels, vThreshold, bright, centroidX, -1f, 0, filter);
+    }
+
+    /**
+     * As above; with {@code centroidX} = -1 and {@code seedX} ≥ 0 (v3, base hidden by glare) the
+     * trace starts without an H-ROI anchor from the predicted column {@code seedX}: until the
+     * first line row is found the window and the allowed jump are widened to {@code seedHalf}
+     * and more empty rows are tolerated. With the glare mask on, saturated pixels count as part
+     * of a run, rows where the predicted line is mostly masked are skipped (not counted as a
+     * gap, so glare is not taken for the end of the road), and traceEdgeSide records whether
+     * the nearest line row runs off the left / right frame edge.
+     */
+    private void traceLookAhead(byte[] pixels, int vThreshold, boolean bright, int centroidX,
+                                float seedX, int seedHalf, boolean filter) {
         final int     W      = imgW;
         final int     half   = cfg.vRoiHalfWidthPx;
         final float[] rowCx  = this.rowCx;
         final int     maxGap = Math.max(8, cfg.hRoiThickPx);   // stop after this many empty rows
+        final int     seekGap = Math.max(maxGap, (vRoiBot - vRoiTop) / 3);
         final int     runGapTol = runGapTol();
-        final boolean trackFound = centroidX >= 0;
+        final boolean anchored   = centroidX >= 0;
+        final boolean seeded     = !anchored && seedX >= 0f;
+        final boolean trackFound = anchored || seeded;           // trace at all
+        boolean       seeking    = seeded;                       // no line row found yet (seeded)
+        final boolean mask       = maskActive;
+        final byte[]  gs         = glareSrc;
+        final int     gl         = glareLim;
+        traceEdgeSide = 0;
+        traceAccepted = 0;
+        nfN = 0; nfU = 0; nfUU = 0; nfX = 0; nfUX = 0; nfXX = 0; nfLimit = 0;
 
         // Per-row line-lock limits (same memory idea as Stage 2, applied upward):
         //   • minRowW   — a row's run must be at least this many pixels to count,
@@ -2230,7 +2555,7 @@ public final class LineFollowerPipeline {
         final float cx0 = W * 0.5f - 0.5f;   // column whose centre is the optical axis
 
         // Anchor the fit with the H-ROI centroid (longest, most reliable baseline).
-        if (trackFound) {
+        if (anchored) {
             final double yH = (hRoiTop + hRoiBot) * 0.5;
             fitN++; sY += yH; sYY += yH * yH; sC += centroidX; sYC += yH * centroidX;
             nN++;   nY += yH; nYY += yH * yH; nC += centroidX; nYC += yH * centroidX;
@@ -2244,15 +2569,22 @@ public final class LineFollowerPipeline {
         // window — and reject any run that is too small or too far (a different
         // object). Stop once the line has been missing for maxGap rows (end /
         // off the road), so empty frame above is never mistaken for the track.
-        int    trackCenter = centroidX;
+        int    trackCenter = anchored ? centroidX : Math.round(seedX);
         float  drift       = filter ? Math.max(-2f, Math.min(2f, lastImgSlope)) : 0f;  // columns per row, upward
         // Width factor for the line's slant, from the previous frame (fixed for this
         // frame, so a distractor cannot inflate the allowed width row after row).
         final float slantK = (float) Math.sqrt(1f + drift * drift);
-        double prevC       = centroidX;
+        double prevC       = anchored ? centroidX : seedX;
         int    prevRow     = (hRoiTop + hRoiBot) / 2;
         int    gap         = 0;
         int    farRow      = -1;   // farthest (topmost) V-ROI row where the line was accepted
+        int    farRowEff   = -1;   // same, extended across glare rows right after it (road not ended)
+        int    lastGlareRow = -1;  // seeking: last row whose window touched glare
+        final int haloRows = Math.max(4, Math.round(0.03f * imgH));
+        long   runL = 0; int runN = 0;   // line-ness sum / count of the unmasked pixels of a run
+        // "Strongly line-like": past 60 % of the way from the threshold to the calibrated line.
+        final float lvlThr = vThreshold == NO_TRACK ? 0f : (bright ? vThreshold : 255 - vThreshold);
+        final float strongLevel = calibLevel - lvlThr >= 8f ? lvlThr + 0.6f * (calibLevel - lvlThr) : 0f;
         // Look-ahead position accumulators: a centroid of the band-locked line over
         // the V-ROI, weighting FARTHER-ahead rows more so the value previews the
         // road in front of the robot rather than what is right under it.
@@ -2264,7 +2596,7 @@ public final class LineFollowerPipeline {
         int laCount = 0;
         final int laStride = Math.max(1, (vRoiBot - vRoiTop) / Math.max(1, LA_MAX_PTS - 2));
         int laNext = 0;
-        if (trackFound) {
+        if (anchored) {
             laPathRowFrac[laCount] = (float) ((hRoiTop + hRoiBot) * 0.5) / imgH;
             laPathColFrac[laCount] = centroidX / (float) imgW;
             laCount++;
@@ -2286,22 +2618,42 @@ public final class LineFollowerPipeline {
                 // resolution can be wider than 2 × vRoiHalfWidthPx.
                 rowHalf = Math.max(half, (int) Math.ceil(0.5f * expRow) + 2 * runGapTol);
             }
+            if (seeking) rowHalf = Math.max(rowHalf, seedHalf);
             final int vLeft  = Math.max(0,     pc - rowHalf);
             final int vRight = Math.min(W, pc + rowHalf);
             final int base   = row * W;
+
+            // Seeking the line next to a glare patch: rows that touch the glare, and the halo just
+            // above it (brightened but not saturated), can show rims that only just pass the
+            // threshold and look like a line. There a run must be as line-like as the line
+            // itself (strongLevel) to start the trace.
+            boolean nearGlare = false;
+            if (seeking && mask) {
+                // Sparse sample of the (whole-width) window: touched by glare / nearly all glare.
+                int hits = 0, n = 0;
+                for (int col = vLeft; col < vRight; col += 8, n++) if ((gs[base + col] & 0xFF) >= gl) hits++;
+                if (hits > 0) lastGlareRow = row;
+                if (n > 0 && 10 * hits >= 9 * n) { rowCx[row] = Float.NaN; continue; }   // glare row: unknown
+                nearGlare = lastGlareRow >= 0 && lastGlareRow - row <= haloRows;
+            }
 
             // Scan the window, picking the run whose centre is nearest the
             // predicted centre. Small gaps inside a run are bridged.
             long   runW = 0;   double runM = 0;   int runStart = -1, runLast = -1, runGap = 0;
             double bestC = Double.NaN; long bestW = 0; double bestDist = Double.MAX_VALUE;
+            int    bestS = -1, bestE = -1;
             for (int col = vLeft; col <= vRight; col++) {
-                final boolean on = col < vRight && isTrack(pixels[base + col] & 0xFF, vThreshold, bright);
+                // Glare (v3): a saturated pixel is "unknown" and counts as part of a run.
+                final boolean masked = mask && col < vRight && (gs[base + col] & 0xFF) >= gl;
+                final int     px     = col < vRight ? pixels[base + col] & 0xFF : 0;
+                final boolean on = col < vRight && (masked || isTrack(px, vThreshold, bright));
                 if (on) {
-                    if (runStart < 0) { runStart = col; runW = 0; runM = 0; }
+                    if (runStart < 0) { runStart = col; runW = 0; runM = 0; runL = 0; runN = 0; }
                     runW++; runM += col; runGap = 0; runLast = col;
+                    if (!masked) { runN++; runL += bright ? px : 255 - px; }
                 } else if (runStart >= 0 && (col == vRight || ++runGap > runGapTol)) {
                     double c = runM / runW; long wCount = runW;
-                    boolean ok = true;
+                    boolean ok = !nearGlare || (strongLevel > 0f && 2 * runN >= runW && runL >= strongLevel * runN);
                     final int span = runLast + 1 - runStart;
                     // A run cut by the scan window (not the frame edge) may be much wider.
                     final boolean clipL = runStart == vLeft && vLeft > 0, clipR = runLast + 1 == vRight && vRight < W;
@@ -2321,7 +2673,7 @@ public final class LineFollowerPipeline {
                     }
                     if (ok) {
                         final double d = Math.abs(c - (filter ? pred : trackCenter));
-                        if (d < bestDist) { bestDist = d; bestC = c; bestW = wCount; }
+                        if (d < bestDist) { bestDist = d; bestC = c; bestW = wCount; bestS = runStart; bestE = runLast + 1; }
                     }
                     runStart = -1;
                 }
@@ -2329,7 +2681,14 @@ public final class LineFollowerPipeline {
 
             // Accept only a run that is big enough AND close enough to the line we
             // are following; otherwise this row has no usable track → count a gap.
-            if (bestW >= minRowW && bestDist <= vMaxDrift) {
+            if (bestW >= minRowW && bestDist <= (seeking ? Math.max(vMaxDrift, seedHalf) : vMaxDrift)) {
+                if (traceAccepted == 0) {
+                    // Nearest line row: does it run off a frame edge (line leaving the view)?
+                    traceEdgeSide = bestS <= 0 ? -1 : (bestE >= W ? 1 : 0);
+                }
+                seeking = false;
+                traceAccepted++;
+                farRowEff = row;
                 rowCx[row]  = (float) bestC;
                 if (filter) {
                     // Local drift (columns per row upward), smoothed over rows.
@@ -2359,7 +2718,12 @@ public final class LineFollowerPipeline {
                 }
             } else {
                 rowCx[row] = Float.NaN;                    // no line in this row
-                if (++gap > maxGap) break;                 // line ended → stop look-ahead
+                if (mask && predictionMasked(base, pc, widthTest ? expRow : lastTrackWidthPx)) {
+                    // Glare hides where the line should be: unknown, not a gap (G6).
+                    if (gap == 0 && farRowEff >= 0) farRowEff = row;
+                    continue;
+                }
+                if (++gap > (seeking ? seekGap : maxGap)) break;   // line ended → stop look-ahead
             }
         }
 
@@ -2379,7 +2743,7 @@ public final class LineFollowerPipeline {
             if (Math.abs(nd) > 1e-6) nearSlope = ((double) nN * nYC - nY * nC) / nd;
         }
         traceNearSlope = nearSlope;
-        traceFarRow  = farRow;
+        traceFarRow  = farRowEff;   // = farRow unless glare rows follow the last line row
         traceLaW     = laW;
         traceLaM     = laM;
         traceLaCount = laCount;
@@ -2392,12 +2756,81 @@ public final class LineFollowerPipeline {
     private void addFloorPoint(float z, float x) {
         final double u = z - floorFwdH;
         if (u > FIT_DEPTH * floorFwdH) return;
+        // Nearest part of the line (points arrive nearest first): a straight-line fit over the
+        // first NEAR_FIT_SPAN H-ROI distances, used to reconstruct the base when it is hidden.
+        if (floorN == 0) nfLimit = u + NEAR_FIT_SPAN * floorFwdH;
+        if (u <= nfLimit) {
+            nfN++; nfU += u; nfUU += u * u; nfX += x; nfUX += u * x; nfXX += (double) x * x;
+        }
         final double uu = u * u;
         floorN++;
         fU += u; fUU += uu; fUUU += uu * u; fUUUU += uu * uu;
         fX += x; fUX += u * x; fUUX += uu * x; fXX += (double) x * x;
         fUmin = (float) Math.min(fUmin, u); fUmax = (float) Math.max(fUmax, u);
         floorSpan = fUmax - fUmin;
+    }
+
+    // Forward extent (in H-ROI distances) of the near fit used to reconstruct a hidden base.
+    private static final float NEAR_FIT_SPAN = 0.6f;
+
+    /** True when most of the predicted line span on this row is masked as glare. */
+    private boolean predictionMasked(int base, int pc, float expW) {
+        final int hs = Math.max(2, Math.round(0.5f * Math.max(4f, expW)));
+        final int a = Math.max(0, pc - hs), b = Math.min(imgW, pc + hs + 1);
+        if (b <= a) return false;
+        final byte[] gs = glareSrc;
+        final int gl = glareLim;
+        int n = 0;
+        for (int c = a; c < b; c++) if ((gs[base + c] & 0xFF) >= gl) n++;
+        return 2 * n >= b - a;
+    }
+
+    /**
+     * v3: where the line crosses the H-ROI when the H-ROI itself is hidden — from a straight-line
+     * fit on the floor through the nearest part of the look-ahead trace (seeded trace), at u = 0.
+     * Returns the image column, or NaN when the trace is too short, not straight enough
+     * (RMS > a quarter line width), or too far from the prediction {@code predX}
+     * (more than {@code gateHalf}): then nothing consistent was seen ahead.
+     */
+    private float reconstructBase(float predX, int gateHalf) {
+        final int minPts = Math.max(6, cfg.steerHeadingMinRows / 3);
+        if (nfN < minPts || floorScaleH <= 0f) return Float.NaN;
+        final float lineW = expectedLineWidth() > 0f ? expectedLineWidth() : lastTrackWidthPx;
+        final double maxRms = 0.25 * lineW * floorScaleH;
+        double A;
+        if (floorN >= 2 * minPts && floorSpan >= 0.5f * floorFwdH) {
+            // Long enough: parabola through all fitted points. On a curve a straight line
+            // extrapolated back to the strip lands on the outside of the turn; the parabola
+            // follows the start of the curve. A corner (not a smooth curve) fails the RMS test.
+            final double n = floorN;
+            final double a12 = fU, a13 = fUU, a22 = fUU, a23 = fUUU, a33 = fUUUU;
+            final double det = n * (a22 * a33 - a23 * a23) - a12 * (a12 * a33 - a23 * a13) + a13 * (a12 * a23 - a22 * a13);
+            if (Math.abs(det) < 1e-12) return Float.NaN;
+            final double detA = fX * (a22 * a33 - a23 * a23) - a12 * (fUX * a33 - a23 * fUUX) + a13 * (fUX * a23 - a22 * fUUX);
+            final double detB = n * (fUX * a33 - a23 * fUUX) - fX * (a12 * a33 - a23 * a13) + a13 * (a12 * fUUX - fUX * a13);
+            final double detC = n * (a22 * fUUX - fUX * a23) - a12 * (a12 * fUUX - fUX * a13) + fX * (a12 * a23 - a22 * a13);
+            A = detA / det;
+            final double res = fXX - (A * fX + detB / det * fUX + detC / det * fUUX);
+            if (Math.sqrt(Math.max(0.0, res) / n) > maxRms) return Float.NaN;
+            // A sharp curve seen only from afar: the parabola and the straight line through the
+            // nearest part disagree about where the line meets the strip → ambiguous, no base.
+            final double nn = nfN, dl = nn * nfUU - nfU * nfU;
+            if (Math.abs(dl) > 1e-12) {
+                final double bl = (nn * nfUX - nfU * nfX) / dl, al = (nfX - bl * nfU) / nn;
+                if (Math.abs(A - al) > 0.5 * lineW * floorScaleH) return Float.NaN;
+            }
+        } else {
+            // Short trace: straight line through its nearest part.
+            final double n = nfN, d = n * nfUU - nfU * nfU;
+            if (Math.abs(d) < 1e-12) return Float.NaN;
+            final double B = (n * nfUX - nfU * nfX) / d;
+            A = (nfX - B * nfU) / n;
+            final double res = nfXX - (A * nfX + B * nfUX);
+            if (Math.sqrt(Math.max(0.0, res) / n) > maxRms) return Float.NaN;
+        }
+        final float col = (float) (imgW * 0.5f - 0.5f + A / floorScaleH);
+        if (Math.abs(col - predX) > gateHalf) return Float.NaN;
+        return col;
     }
 
     /**
@@ -2461,6 +2894,10 @@ public final class LineFollowerPipeline {
 
     /** Forget what was learned about the line beyond the colours (level, heading zero, motion). */
     private void resetLineModel() {
+        coastMs           = 0f;
+        coastFrames       = 0;
+        lastHeadTerm      = 0f;
+        lastFrameNs       = 0L;
         calibLevel        = 0f;
         headingRefDeg     = 0f;
         calibHeadingCount = 0;
@@ -2470,6 +2907,14 @@ public final class LineFollowerPipeline {
         lastSteering      = 0f;
         lastIntersection  = 0f;
         rejectedBands     = 0;
+    }
+
+    /** Fraction of the H-ROI + V-ROI masked as glare (H-ROI exact, V-ROI from the sampled histogram). */
+    private float maskedFraction() {
+        final float strip = (hRoiBot - hRoiTop) * (float) imgW, look = (vRoiBot - vRoiTop) * (float) imgW;
+        final float lookMasked = maskedSamples > 0 ? look * maskedSampleHits / maskedSamples : 0f;
+        final float total = strip + (maskedSamples > 0 ? look : 0f);
+        return total > 0f ? Math.min(1f, (maskedPixels + lookMasked) / total) : 0f;
     }
 
     /** Fill the shared FrameData and hand it to the registered callback, if any. */
@@ -2530,6 +2975,9 @@ public final class LineFollowerPipeline {
         d.headingConfidence = live ? output.headingConf : 0f;
         d.lineHeld          = live && output.held;
         d.rejectedBands     = live ? output.rejected : 0;
+        d.baseReconstructed = live && output.reconstructed;
+        d.coasting          = live && output.coasting;
+        d.maskedFrac        = live && maskActive ? maskedFraction() : 0f;
         frameCallback.onFrame(d);
     }
 

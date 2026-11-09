@@ -265,7 +265,51 @@ New FrameData fields (additive): `baseReconstructed`, `coasting`, `corridorCover
 
   - Suite: 36 tests — 31 pass, 5 skipped; v2 timing (`gradlew perf`, 960×1280 YUV, glare frames
     included): **0.99–1.04 ms/frame** mean.
-- [ ] Phase 1 — glare mask, look-ahead without base, masked rows ≠ gaps, time-based coast, local threshold
+- [x] Phase 1 — glare mask, look-ahead without base, masked rows ≠ gaps, time-based coast, local threshold
+  - All behind `glareMask` (default on). New Config: `glareMask`, `glareLumaMax` (245),
+    `glareCoastMs` (600), `glareCoastMaxFrames` (36), `frameIntervalMs` (0 = clock). New FrameData:
+    `baseReconstructed`, `coasting`, `maskedFrac`. No public signature changed.
+  - **Mask:** Y ≥ 245 (gray/YUV, tested straight from the Y plane — a separate mask image cost
+    ~0.5 ms/frame) or any channel ≥ 250 (ARGB, 0/1 map). Masked pixels are left out of the strip and
+    look-ahead histograms; inside a band / row run they count as part of it (a saturated tape centre
+    does not split the line). A band that is mostly glare is accepted only at the calibrated
+    (unslanted) width and never trimmed — otherwise a glare patch was "trimmed to tape width".
+  - **Local threshold:** one Otsu per eighth of the strip (learned-colour mode), interpolated per
+    column; a segment without contrast uses the strip-wide value.
+  - **Look-ahead without base:** when the locked line is not in the strip, the look-ahead is traced
+    from the predicted column. The first line row is searched across the full width (nearest to the
+    prediction wins) so a line curving off to an edge is seen; next to glare (rows touching it and a
+    halo of 3 % of the height above it) a run must be ≥ 50 % unmasked and strongly line-like (≥ 60 %
+    from threshold to the calibrated level) — halo rims otherwise started the trace on the wrong
+    spot. Base = parabola fit at u = 0 (straight-line fit of the nearest part if the trace is short);
+    rejected when RMS > ¼ line width, when parabola and straight line disagree by > ½ line width
+    (a sharp curve seen only from afar is ambiguous), or when > one lock gate from the prediction.
+  - **Masked rows are not gaps** (predicted span ≥ 50 % masked ⇒ row unknown); the road-length part
+    of tracking extends across glare rows that directly follow the last line row.
+  - **Coast** (req. 2): clock from `System.nanoTime()` or `frameIntervalMs`, each frame clamped to
+    100 ms, plus the `glareCoastMaxFrames` limit. While coasting: position continues the last
+    motion (velocity × 0.9 per frame), the heading part fades out, tracking ramps toward the minimum;
+    `lineHeld` is also true. When the coast is used up ⇒ v2 pin. The lock is not released while
+    coasting.
+  - **Edge exits beat coasting** (req. 4): nearest look-ahead line row runs off the frame edge, or the
+    reconstructed base is in the v2 edge zone ⇒ pin to that edge at once; after a pin no new coast
+    starts until the line is seen again.
+  - Tests: `lostLineReportsTrackLost` and the v1 config now set `glareMask = false` (they test the v2
+    hold, plan §3). New unit tests: 18-frame coast at 30 fps, 100 ms clamp (500 ms frames ⇒ 6
+    frames), frame cap (36 / 10), `glareMask = false` keeps the v2 hold.
+  - `edgeExitUnderGlare` check corrected: v3 may pin *before* v2 when the look-ahead already shows the
+    line leaving through the edge (req. 4) — allowed only to the exit side and when v2 already
+    steers that way (|s| ≥ 10). In the run v3 coasts 2 frames (same steering as v2), then pins left
+    4–5 frames before v2 does.
+  - **Results:** `glareNearStrip` 14/14 runs pass (incl. 60 fps), `glareMidLookAhead` 6/6,
+    `glareOnTapeOnly` 14/14, `edgeExitUnderGlare` 4/4; the v2-passing scenarios still pass.
+    `glareOnTapeOnlyPartial` still fails 6/10 (Phase 2, unchanged). Suite: 40 tests, 39 pass,
+    1 skipped. Zero allocations (gray / YUV / ARGB).
+  - **v2 equivalence:** v2 (`202e70f`) vs v3 with `glareMask = false`: identical output on every
+    frame (72 runs × 40 frames, 4 colour pairs × 6 scenes incl. glare × gray/YUV/ARGB, 13 fields).
+  - **Timing** (`gradlew perf`, same JVM, alternating blocks): v3 **1.30–1.33 ms** mean
+    (clean 1.25–1.28, strip glare 1.39–1.42) vs v2 flags 1.02–1.06. Budget 1.5 ms; clean frames cost
+    +0.2 ms over v2 — to recover in Phase 2.
 - [ ] Phase 2 — corridor tracker + robust fit + Kalman + fallback
 - [ ] Phase 3 — trimBand continuity, edge-pair, continuity-ranked acquisition
 - [ ] Phase 4 — AE/AWB lock in app
