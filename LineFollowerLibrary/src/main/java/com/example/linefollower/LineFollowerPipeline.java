@@ -2612,7 +2612,9 @@ public final class LineFollowerPipeline {
         final float pred = predictedSteering(pinTargetU());
         if (pred * side <= 0f) return full;
         pinCapActive = true;
-        return Math.max(-100f, Math.min(100f, pred));
+        sinceCurveFrames = 0;            // still following that curve: keep its history fresh
+        // Never the full ±50 (internal ±100): that stays the signal "the line left at the edge".
+        return Math.max(-96f, Math.min(96f, pred));
     }
 
     /**
@@ -3233,8 +3235,11 @@ public final class LineFollowerPipeline {
                     if (rowFwd[r] >= want) break;
                 }
                 if (row >= prevRow) row = Math.max(vRoiTop, prevRow - 1);
-                cR0[s] = Math.max(vRoiTop, row - 1);
-                cR1[s] = Math.min(vRoiBot, row + 2);
+                // Rows averaged per slice: a quarter of the gap to the slice below, 5 … 13 rows
+                // (near slices lie far apart in the image; more rows = a steadier heading).
+                final int hh = Math.max(2, Math.min(6, (prevRow - row) / 4));
+                cR0[s] = Math.max(vRoiTop, row - hh);
+                cR1[s] = Math.min(vRoiBot, row + hh + 1);
             }
             cRow[s] = row;
             cU[s] = Float.isNaN(rowFwd[row]) ? uMax : rowFwd[row] - floorFwdH;
@@ -3491,8 +3496,15 @@ public final class LineFollowerPipeline {
         }
         final double q = cfg.corridorProcessNoise * dt;
         // Steady sideways motion is carried by dA; A itself changes little between frames.
-        P[0] += q * sq(0.1 * wf); P[6] += q * sq(0.06); P[12] += q * sq(0.15);
-        P[18] += q * sq(0.05 * wf); P[24] += q * sq(0.03);
+        // On a straight the heading and curvature change slowly relative to the noise of a few
+        // slices (small noise: no heading wander, steady steering); on a curve (|C| >= 0.3, a
+        // radius of ~1.7 camera heights or less) they change quickly while the robot enters it.
+        final double curvy = Math.min(1.0, Math.abs(kx[2]) / 0.3);
+        P[0]  += q * sq(0.1 * wf);
+        P[6]  += q * sq(0.02 + 0.04 * curvy);
+        P[12] += q * sq(0.08 + 0.07 * curvy);
+        P[18] += q * sq(0.05 * wf);
+        P[24] += q * sq(0.005 + 0.025 * curvy);
     }
 
     /** Variance of h·x for h = (h0, h1, h2, 0, 0). */
@@ -3576,7 +3588,17 @@ public final class LineFollowerPipeline {
             half = Math.min(half, halfW);
             if (colPred + half < 0 || colPred - half > W) { cState[s] = SL_MISS; if (obs > 0 && ++misses >= 2) { chainEnded = true; break; } continue; }
             ensureRows(cR0[s], cR1[s]);
-            boolean found = detectSlice(pixels, bright, cR0[s], cR1[s], 1, colPred, expS, half, 1.5f);
+            // Slice 0: a clean band found by the strip search (whole line width, not cut) is the
+            // better measurement — its centre averages all strip rows; otherwise the edge pair.
+            boolean found;
+            final float bandW = bandEnd - bandStart, bandC = stripFound ? (float) (bandMoment / bandSum) : 0f;
+            if (s == 0 && stripFound && !bandTrimmed && Math.abs(bandW - expS) <= 0.3f * expPx
+                    && Math.abs(bandC - colPred) <= half) {
+                dCentre = bandC; dWidth = bandW; dClip = bandStart <= 0 ? -1 : (bandEnd >= W ? 1 : 0); dUnknown = false;
+                found = true;
+            } else {
+                found = detectSlice(pixels, bright, cR0[s], cR1[s], 1, colPred, expS, half, 1.5f);
+            }
             if (!found && s == 0 && !dUnknown && stripFound && Math.abs(stripCx - colPred) <= half) {
                 dCentre = stripCx; dWidth = lastTrackWidthPx; dClip = 0; found = true;   // v2 band as slice 0
             }

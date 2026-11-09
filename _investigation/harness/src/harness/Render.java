@@ -15,6 +15,11 @@ final class Render {
     final byte[] y, u, v;
     final int rowLo, rowHi;
     double noiseSigma = 4.0;        // luma sensor noise (grey levels)
+    // v3 test: image-fixed specular glare (a lamp reflected near the robot): an ellipse centred
+    // at (glareCx, glareCy) with radii (glareRx, glareRy), fractions of W / H, adding glareAmp grey
+    // levels (saturates) with a 15 % halo; chroma pulled to grey. Off unless glare = true.
+    boolean glare = false;
+    double  glareCx = 0.5, glareCy = 0.70, glareRx = 0.40, glareRy = 0.071, glareAmp = 400;
     private final short[] gain;     // image-space brightness gain ×1024 per luma pixel
     private static final int NT = 1 << 20;
     private final byte[] noiseTab = new byte[NT];
@@ -76,6 +81,27 @@ final class Render {
             }
         }
         for (World.Upright o : w.uprights) drawUpright(o, px, py, c, s);
+        if (glare) applyGlare();
+    }
+
+    private void applyGlare() {
+        final double cxp = glareCx * W, cyp = glareCy * H, rx = glareRx * W, ry = glareRy * H, halo = 0.15;
+        final int r0 = Math.max(rowLo, (int) Math.floor(cyp - ry * (1 + halo))), r1 = Math.min(rowHi, (int) Math.ceil(cyp + ry * (1 + halo)));
+        for (int r = r0; r < r1; r++) {
+            for (int col = 0; col < W; col++) {
+                final double nx = (col + 0.5 - cxp) / rx, ny = (r + 0.5 - cyp) / ry, d = Math.sqrt(nx * nx + ny * ny);
+                final double f = d <= 1 ? 1 : (d < 1 + halo ? 1 - (d - 1) / halo : 0);
+                if (f <= 0) continue;
+                final int i = r * W + col;
+                y[i] = (byte) Math.min(255, (y[i] & 0xFF) + (int) (glareAmp * f));
+                if ((r & 1) == 0 && (col & 1) == 0) {
+                    final int ci = (r >> 1) * cw + (col >> 1);
+                    final double k = Math.min(1.0, glareAmp * f / 255.0);
+                    u[ci] = (byte) Math.round(128 + ((u[ci] & 0xFF) - 128) * (1 - k));
+                    v[ci] = (byte) Math.round(128 + ((v[ci] & 0xFF) - 128) * (1 - k));
+                }
+            }
+        }
     }
 
     /** Vertical cylinder: project base and top, fill the column between them. */

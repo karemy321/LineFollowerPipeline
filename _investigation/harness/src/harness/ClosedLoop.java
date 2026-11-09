@@ -38,12 +38,15 @@ public final class ClosedLoop {
     static final double SIM_LAT  = Double.parseDouble(System.getProperty("sim.lat", "0.0333"));
     static final double SIM_HZ   = Double.parseDouble(System.getProperty("sim.hz", "60"));
     static final double SIM_DEAD = Double.parseDouble(System.getProperty("sim.dead", "0"));
-    static final String SIM_TAG  = String.format(Locale.ROOT, "lat%.0fms/%.0fHz/dead%.0f/fwd%s/tilt%s/yaw%s/lat0%s", SIM_LAT * 1000, SIM_HZ, SIM_DEAD,
-            System.getProperty("sim.camFwd", "0.08"), System.getProperty("sim.tilt", "45"), System.getProperty("sim.yaw0", "0"), System.getProperty("sim.lat0", "0"));
+    static final String SIM_TAG  = String.format(Locale.ROOT, "lat%.0fms/%.0fHz/dead%.0f/fwd%s/tilt%s/yaw%s/lat0%s%s", SIM_LAT * 1000, SIM_HZ, SIM_DEAD,
+            System.getProperty("sim.camFwd", "0.08"), System.getProperty("sim.tilt", "45"), System.getProperty("sim.yaw0", "0"), System.getProperty("sim.lat0", "0"),
+            "near".equals(System.getProperty("sim.glare", "")) ? "/glare" : "");
     static final int LATENCY = (int) Math.round(SIM_LAT * 60);
     static final int CTRL_EVERY = Math.max(1, (int) Math.round(60 / SIM_HZ));
     static final double OFF_TRACK = 0.12;
     static final double YAW0 = Double.parseDouble(System.getProperty("sim.yaw0", "0"));
+    // v3: glare over the near strip in 3 "lamp" zones, each 15 % of the track (sim.glare=near).
+    static final boolean GLARE = "near".equals(System.getProperty("sim.glare", ""));
     static final double LAT0 = Double.parseDouble(System.getProperty("sim.lat0", "0"));
     static final boolean TRACE = System.getProperty("trace") != null;
     static final int TRACE_EVERY = Integer.getInteger("trace.every", 6);
@@ -94,6 +97,10 @@ public final class ClosedLoop {
         final int startEval = 60;   // ignore the first second for oscillation stats
 
         while (frames * DT < tMax) {
+            if (GLARE) {
+                final double frac = (progress / Math.max(1, n)) % (1.0 / 3.0);
+                r.glare = frac >= 0.10 && frac < 0.25;
+            }
             r.render(px, py, th);
             final long t0 = System.nanoTime();
             final int[] out = lib.process(r);
@@ -118,9 +125,9 @@ public final class ClosedLoop {
 
             if (TRACE && frames % TRACE_EVERY == 0) {
                 final double latT = -(px - t.x[idx]) * Math.sin(t.hd[idx]) + (py - t.y[idx]) * Math.cos(t.hd[idx]);
-                System.out.printf(Locale.ROOT, "t=%6.2f s=%5.2f lat=%6.2f he=%6.1f S=%4d T=%4d off=%6.1f head=%6.1f hdeg=%6.1f conf=%.2f found=%b%n",
+                System.out.printf(Locale.ROOT, "t=%6.2f s=%5.2f lat=%6.2f he=%6.1f S=%4d T=%4d off=%6.1f head=%6.1f hdeg=%6.1f conf=%.2f found=%b corr=%.2f%n",
                         frames * DT, progress * World.STEP, 100 * latT, Math.toDegrees(Scenes.angDiff(th, t.hd[idx])), S, T,
-                        lib.fd("steerOffsetTerm"), lib.fd("steerHeadingTerm"), lib.fd("headingDeg"), lib.fd("headingConfidence"), lib.trackFound);
+                        lib.fd("steerOffsetTerm"), lib.fd("steerHeadingTerm"), lib.fd("headingDeg"), lib.fd("headingConfidence"), lib.trackFound, lib.fd("corridorCoverage"));
             }
             // ── controller (lecturer's Blockly program) ──
             final double motorSteer = (0 - S) * s.c;
