@@ -409,7 +409,25 @@ New FrameData fields (additive): `baseReconstructed`, `coasting`, `corridorCover
     CameraX is 1.4.0, so the Camera2Interop path is used. Logcat: `AE/AWB LOCKED after
     calibration`, `AE/AWB unlocked`, `EV compensation …`, plus the `PERF` line from Phase 2.
   - `assembleDebug` succeeds with the v3 library (composite build).
-- [ ] Phase 5 — README v3, CHANGES_v3.md, timings, Blockly values re-checked
+- [x] Phase 5 — README v3, CHANGES_v3.md, timings, Blockly values re-checked (simulation)
+  - Closed loop (`_investigation/run_v3_closed_loop.sh`, v2 `202e70f` vs v3, 560 runs, new harness
+    glare zones): glare **11 → 37 / 40** (realistic speed) and **7 → 32 / 40** (3× speed); no glare
+    120 → 120 and 72 → 73 / 80. Details: `_investigation/CHANGES_v3.md` §5.
+  - It showed a steering dither on straights (sign changes 0.10 → 0.51 /s); fixed by
+    curvature-dependent process noise, slice 0 from the clean strip band, 5–13 rows per near slice
+    (`4550e56`) → 0.33 /s, ≤ 0.3 cm. The capped pin stops at ±48 (±50 = edge exit) and keeps its curve
+    history while capped; `sharpCurveNearGlare` capped values now median 6 / worst 16 from v2 (check
+    ≤ 18). Scenario traces moved by ±1–2 everywhere (edge exit: same exit side, one gray frame earlier).
+  - Blockly: c = 1.0 kept; x = 0 at ~0.5–0.6 m/s (x = 1 with c = 1.0 weaves on straights at that
+    speed in simulation — the loop's latency limit, also seen for v2 in CHANGES_v2 §6.2).
+  - README v3 (What's New, Glare Robustness, Corridor Tracker, lost/hidden table, FrameData,
+    behaviour, app, tests, **Robot Results — pending**); PDF regenerated with `build_guide.py`
+    (23 pages; `check_docs.py`: no mismatches); `_investigation/CHANGES_v3.md`.
+  - Timing 0.59–0.65 ms/frame vs 1.03–1.07 (v2 settings); 0 bytes allocated; Java 8 OK; 44/44 tests.
+- [ ] **Robot test** — run `ROBOT_TEST_CHECKLIST.md` (7 tests, results table) — **pending, user**
+- [ ] **Tuning after the robot test** — defaults (`glareLumaMax`, `glareCoastMs`, `corridorWidthMult`,
+      `corridorProcessNoise`, `edgePairCheck`, Blockly c / x), AE/AWB lock / EV defaults in the app,
+      then README "Robot Results", CHANGES_v3 and PDF update
 
 ## 10. Notes from the code check before Phase 0 (2026-11-09)
 

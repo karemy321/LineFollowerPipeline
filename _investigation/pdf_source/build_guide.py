@@ -31,16 +31,20 @@ TEMPLATE = HERE / "guide_template.html"
 OUT_HTML = HERE / "guide.html"
 EDGE = Path(r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe")
 
-# Badges in the first column of tables (field names / row labels).
-NEW = {"rejectDistractors", "bandMaxWidthMult", "bandMinWidthMult", "trackHoldFrames",
-       "steerOffsetWeight", "steerHeadingWeight", "steerLookAhead", "steerHeadingMinRows",
-       "steerHeadingCalibMaxDeg", "steerOffsetTerm", "steerHeadingTerm", "headingDeg",
-       "headingConfidence", "lineHeld", "rejectedBands",
-       "Robot at an angle to a straight line", "Dark object / shadow beside or touching the line",
-       "Line hidden for a moment in the middle of the image"}
-# CHANGED = existing items whose behaviour changed in v2.
-CHANGED = {"trackMemory", "trackMemoryGateMult", "trackRelockFrames", "cameraTiltDeg",
-           "vRoiHalfWidthPx", "calibFrames", "steering", "tracking"}
+# Badges in the first column of tables (field names / row labels): NEW = added in v3.
+NEW = {"glareMask", "glareLumaMax", "glareCoastMs", "glareCoastMaxFrames", "frameIntervalMs",
+       "corridorMode", "corridorSlices", "corridorWidthMult", "minChainSlices", "corridorMinConfidence",
+       "corridorProcessNoise", "edgePairCheck",
+       "baseReconstructed", "coasting", "maskedFrac", "corridorCoverage", "corridorFitRms", "curveA",
+       "Near line hidden by glare",
+       "… the same while glare hides the strip and the filter was following a curve toward that edge",
+       "Glare (lamp reflection) over the scan strip", "Highlight on the centre of glossy tape",
+       "Glare band across the look-ahead", "Line running into a dark mat / ending beside a dark area",
+       "Blob of the line's colour touching the line"}
+# CHANGED = existing items whose behaviour changed in v3.
+CHANGED = {"trackHoldFrames", "lineHeld", "Line disappears in the middle of the image",
+           "Line leaves at the frame edge", "A new line appears after that",
+           "Line hidden for a moment in the middle of the image"}
 MAX_CODE_CHARS = 103   # A4 code block holds ~104 Consolas 8.8pt characters (503 pt / 4.84 pt)
 
 md = README.read_text(encoding="utf-8")

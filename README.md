@@ -16,6 +16,25 @@ No OpenCV. No Android APIs. No native libraries.
 
 ## What's New
 
+### v3 — November 2026 (glare robustness + corridor tracker + distractor hardening)
+
+| Change | What it means for you | Code change needed? |
+|---|---|---|
+| **Glare handling** — new `glareMask`, `glareLumaMax`, `glareCoastMs`, `glareCoastMaxFrames`, `frameIntervalMs` (on by default) | Saturated pixels (a lamp or a window reflected by glossy tape or floor) are no longer read as line or floor. If glare hides the line in the scan strip, it is followed from the line farther ahead (`baseReconstructed`); glare rows in the look-ahead no longer read as a dead end; a line hidden in the middle of the image is **coasted on for up to 600 ms** (v2: held for 6 frames) while the robot slows down. See [Glare Robustness](#glare-robustness-v3). | No |
+| **Corridor tracker** — new `corridorMode`, `corridorSlices`, `corridorWidthMult`, `minChainSlices`, `corridorMinConfidence`, `corridorProcessNoise` (on by default) | The locked line is followed as a curve on the floor: 12 thin slices along a corridor around the predicted curve, each needing **both tape edges**, update a small Kalman filter. A highlight on the tape centre no longer splits the line; when glare hides the near part, the line seen farther ahead still gives heading and curvature. Corners, dead ends, a line leaving the frame and re-acquiring use the v2 logic. About **40 % less time per frame**. See [Corridor Tracker](#corridor-tracker-v3). | No |
+| **Distractor hardening** — new `edgePairCheck` (on by default) | When the line is found again after a loss, the candidate that continues up the look-ahead wins (a short object at the straight-ahead column is no longer taken); a line running into a dark mat is not "continued" along the mat's edge (the robot slows down at the end as it should); a band without two sharp edges (soft shadow) counts less. | No |
+| **Edge exits beat coasting** | A line that leaves at the frame edge — or that the look-ahead shows leaving through the edge — is pinned to that edge at once, as in v2. Only while glare hides the strip **and** the filter was following a curve toward that edge, the pin is capped at the filter's own steering for up to ~0.17 s, then becomes ±50. | No |
+| **New `FrameData` fields** | `baseReconstructed`, `coasting`, `maskedFrac`, `corridorCoverage`, `corridorFitRms`, `curveA`, `curveB`, `curveC` — see [FrameData Fields](#framedata-fields). `lineHeld` is also `true` while coasting. | No (optional for a debug HUD) |
+
+**Do I need to change my integration code?** No. No public method, constant or field was removed or renamed — v3 only adds Config and FrameData fields. What changes is the **behaviour** under glare, around distractors and when the line is hidden (coast instead of a 6-frame hold). To get the exact v2 behaviour back (checked frame by frame against v2), set:
+
+```java
+LineFollowerPipeline.Config v2 = new LineFollowerPipeline.Config();
+v2.corridorMode = false;   // v2 tracking (also turns off the v3 distractor hardening)
+v2.glareMask    = false;   // no glare mask / look-ahead base / coast: the v2 6-frame hold
+pipeline.configure(v2);
+```
+
 ### v2 — October 2026 (distractor rejection + steering from the whole ⊥)
 
 | Change | What it means for you | Code change needed? |
@@ -27,10 +46,12 @@ No OpenCV. No Android APIs. No native libraries.
 | **Calibration learns more** | Besides the colours and the straight-ahead column, calibration now records the line **width**, how line-like its pixels are, and the **heading zero** (phone yaw on its mount). **Calibrate on a straight section, robot straight on the line.** | No |
 | **New `FrameData` fields** | `steerOffsetTerm`, `steerHeadingTerm`, `headingDeg`, `headingConfidence`, `lineHeld`, `rejectedBands` — see [FrameData Fields](#framedata-fields). | No (optional for a debug HUD) |
 
-**Do I need to change my integration code?** No. No public method, constant or field was removed or renamed — v2 only adds Config and FrameData fields, so existing code compiles and runs unchanged. What changes is the **behaviour**: steering now reacts to the robot's heading, distractors are ignored, and a line hidden mid-image is held briefly. To get the exact v1 behaviour back, set:
+In v2, steering started to react to the robot's heading, distractors were ignored, and a line hidden mid-image was held briefly. To get the exact v1 behaviour back, set:
 
 ```java
 LineFollowerPipeline.Config v1 = new LineFollowerPipeline.Config();
+v1.corridorMode       = false;   // no v3 corridor tracker
+v1.glareMask          = false;   // no v3 glare handling
 v1.rejectDistractors  = false;   // original band selection (also turns off the hold)
 v1.steerHeadingWeight = 0f;      // steering = offset only, exactly as in v1
 pipeline.configure(v1);
@@ -191,7 +212,7 @@ Objects with a colour close to the line's (a black chair leg on a black-tape tra
 - **Line-ness** — among acceptable bands, the one whose pixels are as line-like as the calibrated line wins (a shadow on wood only just passes the threshold; the tape is well past it).
 - **Continuity** — while locked, the band nearest the *predicted* position wins (on the scale of one line width), and a band that is the line **merged** with a blob or shadow is cut back to the part that continues the line (its strong core, or the edge that sits where the line's edge was).
 - **Look-ahead** — the row-by-row tracker of the V-ROI applies the same width test on every row (perspective-scaled), so it cannot step onto a nearby object; a run cut by the scan window is only used through the edge that continues the line.
-- **Hidden line** — if the locked line disappears in the middle of the image (glare, a shadow or an object over it) the last steering and tracking are held for `trackHoldFrames`; a line that leaves at the frame edge (a real turn) is still pinned to that edge at once.
+- **Hidden line** — if the locked line disappears in the middle of the image (glare, a shadow or an object over it) it is coasted on for `glareCoastMs` (v3; with `glareMask = false` the last steering and tracking are held for `trackHoldFrames`, as in v2); a line that leaves at the frame edge (a real turn) is still pinned to that edge at once.
 - **Relock** — the lock correction (`trackRelockFrames`) still exists, but a valid-looking locked line is only abandoned after three times as many frames, so a chair leg near the centre cannot steal the lock during a turn.
 
 **What you must ensure** — the rules compare everything with the line measured at calibration, so:
@@ -199,14 +220,14 @@ Objects with a colour close to the line's (a black chair leg on a black-tape tra
 - **Calibrate with the robot on the line**, straight, on a straight section, with floor visible on both sides, and **no distractor inside the scan strip** during calibration.
 - **Use one tape width for the whole track** (a reasonable width: the line should cover well under half of the scan strip). Width changes of more than about 2× (`bandMaxWidthMult`) or less than 0.3× (`bandMinWidthMult`) are treated as "not the line". **Recalibrate** when you change tape.
 - Set `cameraTiltDeg` / `verticalFovDeg` close to the real camera — the look-ahead width test uses them.
-- Remaining limit: a dark object of **exactly the tape's width**, lying where the line is predicted to be, can still be taken for the line.
+- Remaining limit: a dark object of **exactly the tape's width**, lying where the line is predicted to be, can still be taken for the line while it is in the scan strip (v3: it is no longer taken when the line is re-acquired, because the real line continues up the look-ahead and the object does not).
 
 | Field | Type | Default | Range | Description |
 |---|---|---|---|---|
 | `rejectDistractors` | `boolean` | `true` | `true` / `false` | Turn the rules above on. `false` = the original (v1) band selection (this also turns off the hold and the predicted gate). |
 | `bandMaxWidthMult` | `float` | `2.0f` | `≥ 1.3` (useful `1.5 … 3`) | Widest band accepted as the line, as a multiple of the expected (calibrated, slant-corrected) width. A real line stays within about ±30 %; a line merged with a blob is ≥ 2.5×. |
 | `bandMinWidthMult` | `float` | `0.3f` | `0 … 1` (`0` = no minimum) | Narrowest band accepted (fraction of the calibrated width); bands cut by the frame edge are exempt. |
-| `trackHoldFrames` | `int` | `6` | `0 …` `trackLostGraceFrames` | Frames the last output is held when the line vanishes mid-image (6 ≈ 0.1 s at 60 Hz). `0` = report the loss at once (v1). During the hold `trackFound` is `false` and `FrameData.lineHeld` is `true`. Only active with `rejectDistractors = true`. |
+| `trackHoldFrames` | `int` | `6` | `0 …` `trackLostGraceFrames` | Frames the last output is held when the line vanishes mid-image (6 ≈ 0.1 s at 60 Hz). `0` = report the loss at once (v1). During the hold `trackFound` is `false` and `FrameData.lineHeld` is `true`. Only active with `rejectDistractors = true` and `glareMask = false` — with the v3 default `glareMask = true` the line is coasted on for `glareCoastMs` instead. |
 
 ### Steering from the Whole ⊥ (offset + heading)
 
@@ -234,6 +255,76 @@ result[0] = round(steering / 2)                                               �
 | `steerLookAhead` | `float` | `0.5f` | `> 0` (tested `0.25 … 1.0`) | L as a multiple of the camera-to-strip floor distance. Larger = the heading counts more: a robot at an angle to the line straightens out sooner, but it runs a little more on the inside of tight curves and, with a high steering gain plus delay, can start to weave. `0.5` was the best balance in the closed-loop simulation. With the defaults, a robot at ±15° whose line crosses the strip at the calibrated column reads about ±8, at ±30° about ±17. |
 | `steerHeadingMinRows` | `int` | `24` | `≥ 1` rows | Look-ahead rows on the line needed for the heading at full weight. |
 | `steerHeadingCalibMaxDeg` | `float` | `10f` | `≥ 0` (degrees) | Largest heading accepted as the calibration zero. |
+
+### Glare Robustness (v3)
+
+Strong light — a lamp or a window reflected by glossy tape (most often) or a glossy floor — saturates
+pixels: they lose their colour and can be read neither as line nor as floor. With `glareMask` on:
+
+- **Masked pixels** (brightness `Y ≥ glareLumaMax`; ARGB: any channel ≥ 250) are left out of every
+  threshold histogram. Inside a band they count as part of it, so a highlight on the tape centre does
+  not split the line, and a fully saturated stretch of tape of the calibrated width is still found.
+- **Base hidden by glare** — if the locked line is not visible in the scan strip, it is followed from
+  the look-ahead and its position in the strip is taken from the line farther ahead
+  (`FrameData.baseReconstructed`, `trackFound = true`). A sharp curve seen only from afar is
+  ambiguous: then the pipeline coasts rather than guess.
+- **Glare rows are not the end of the road** — look-ahead rows where the line is hidden by glare are
+  skipped, so Tracking does not drop as if the line ended.
+- **Coasting** — a line hidden completely in the middle of the image is coasted on for up to
+  `glareCoastMs`: its position continues its last motion, the heading part of the steering fades out
+  and Tracking ramps down toward the minimum (never faster than before, and slower for a sharp curve
+  seen ahead). `FrameData.coasting` and `lineHeld` are `true`, `trackFound` is `false`. The time is
+  measured with `System.nanoTime()` (or `frameIntervalMs`), at most 100 ms per frame, and the coast
+  also ends after `glareCoastMaxFrames`, so a pause cannot use it up at once.
+- **Edge exits are not coasted** — see [When the Line Is Lost or Hidden](#when-the-line-is-lost-or-hidden).
+- **Local threshold** — each eighth of the scan strip gets its own Otsu threshold in learned-colour
+  mode, so a bright patch in one part does not set the threshold for the rest.
+
+| Field | Type | Default | Range | Description |
+|---|---|---|---|---|
+| `glareMask` | `boolean` | `true` | `true` / `false` | Turn the glare handling above on. `false` (with `corridorMode = false`) = exactly v2, including the `trackHoldFrames` hold. |
+| `glareLumaMax` | `int` | `245` | `1 … 255` | Brightness at or above which a pixel is masked as glare (gray / YUV input). ARGB input: any channel ≥ 250. |
+| `glareCoastMs` | `float` | `600f` | `≥ 0` ms (`0` = no coast) | Longest coast while the line is hidden mid-image. At 0.6 m/s, 600 ms ≈ 36 cm of blind driving. |
+| `glareCoastMaxFrames` | `int` | `36` | `≥ 1` frames | Backup limit: the coast also ends after this many frames (36 = 600 ms at 60 fps). |
+| `frameIntervalMs` | `float` | `0f` | `≥ 0` ms (`0` = measure) | Time between frames for the coast clock. `0` = measured with `System.nanoTime()`; set it for repeatable results (tests, simulation, replay). Each frame counts at most 100 ms. |
+
+### Corridor Tracker (v3)
+
+When the line is locked, the pipeline follows it as a curve on the floor, `x = A + B·u + C·u²`
+(`u` = distance beyond the scan strip, `x` = sideways position, camera heights):
+
+- **Slices** — `corridorSlices` thin slices, spaced evenly in floor distance from the scan strip to the
+  far end of the look-ahead, each searched only in a corridor (`corridorWidthMult` × the expected line
+  width, perspective-scaled) around the predicted curve.
+- **Edge pairs** — in each slice the line is a rising **and** a falling edge at the expected width with
+  a line-like inside. Glare columns are filled from their neighbours, so a highlight on the tape centre
+  is bridged — the inner edges of the highlight are far narrower than the tape and are never chosen.
+- **Kalman filter** — the slices within 1.5 strip distances update a small filter of the curve (position,
+  heading, curvature and their drift). Steering uses the v2 formula with `A` as the offset and `B` as
+  the heading; Tracking uses the slices' far-weighted position and the visible length. When glare hides
+  the near part, the far slices update heading and curvature only weakly tied to position, and the near
+  position comes from the filter's prediction.
+- **Hand-over to v2** — the frame uses the v2 logic when the line ends inside the corridor (corner,
+  junction, dead end, line leaving the frame), when it jumps, when too few slices see it, when the
+  confidence is below `corridorMinConfidence`, on a relock, and to (re)acquire the line. The filter then
+  restarts from the v2 result. `FrameData.corridorCoverage` is `0` on such frames.
+- **Calibration** also measures the line width in every slice; a camera tilt that is a little off is
+  corrected that way.
+- **Distractor hardening** (with `corridorMode`) — a band cut out of a wider one counts only if the line
+  continues up the look-ahead from it; a trailing stretch of the look-ahead that is only the edge of a
+  mass of the line's colour (a mat, a blob) is not counted as visible road — bounded: if the line is
+  seen continuing past the mass, Tracking stays ≥ 60; when re-acquiring, the candidate that continues
+  farthest up the look-ahead wins; with `edgePairCheck`, a band without two sharp edges counts a third.
+
+| Field | Type | Default | Range | Description |
+|---|---|---|---|---|
+| `corridorMode` | `boolean` | `true` | `true` / `false` | Turn the corridor tracker (and the v3 distractor hardening) on. `false` = v2 tracking. |
+| `corridorSlices` | `int` | `12` | `4 … 32` | Number of slices from the scan strip to the far end of the look-ahead. |
+| `corridorWidthMult` | `float` | `2.2f` | `≥ 1.2` (useful `1.8 … 3`) | Corridor width per slice as a multiple of the expected line width (never narrower than the line plus a margin). |
+| `minChainSlices` | `int` | `4` | `≥ 2` | Slices on the line needed (when the near part is visible) to use the corridor result. |
+| `corridorMinConfidence` | `float` | `0.35f` | `0 … 1` | Below this confidence (coverage × fit quality) the frame uses the v2 logic. |
+| `corridorProcessNoise` | `float` | `1.0f` | `> 0` | How fast the curve may change between frames in the filter. Larger = follows sudden changes sooner, smooths less. |
+| `edgePairCheck` | `boolean` | `true` | `true` / `false` | With `corridorMode`: a scan-strip band without both sharp edges counts only a third. |
 
 ### Sensitivity
 
@@ -331,15 +422,20 @@ pipeline.requestRecalibration();
 
 ## When the Line Is Lost or Hidden
 
+With the v3 defaults (`glareMask = true`):
+
 | Situation | Steering `result[0]` | Tracking `result[1]` | `trackFound` | `lineHeld` |
 |---|---|---|---|---|
 | Line visible | offset + heading | from the look-ahead | `true` | `false` |
-| Line disappears in the **middle** of the image (glare, shadow, object over it) — first `trackHoldFrames` frames (default 6) | **last value held** | **last value held** | `false` | `true` |
-| Still hidden after the hold | `±50` toward the side the line was last on | `trackingMinValue` (5) | `false` | `false` |
-| Line leaves at the frame **edge** (sharp turn, robot drove off) | `±50` toward that edge, at once | `trackingMinValue` (5) | `false` | `false` |
+| Near line hidden by glare, line visible farther ahead (`baseReconstructed`) | from the line ahead (its position in the strip rebuilt) | from the look-ahead; if only the far part is seen, never above the last value and lower for a sharp curve | `true` | `false` |
+| Line disappears in the **middle** of the image (glare, shadow, object over it) — up to `glareCoastMs` (600 ms) | **coasts**: the line's last motion continues, the heading part fades out | ramps down toward `trackingMinValue` | `false` | `true` (`coasting`) |
+| Still hidden after the coast | `±50` toward the side the line was last on | `trackingMinValue` (5) | `false` | `false` |
+| Line leaves at the frame **edge** (sharp turn, robot drove off), or the look-ahead shows it leaving through the edge | `±50` toward that edge, at once — never coasted | `trackingMinValue` (5) | `false` | `false` |
+| … the same while glare hides the strip **and** the filter was following a curve toward that edge | capped at the filter's own steering (same side) for up to ~0.17 s, then `±50` | `trackingMinValue` (5) | `false` | `false` |
+| With `glareMask = false`: line disappears mid-image — first `trackHoldFrames` frames (default 6) | **last value held** (v2) | **last value held** | `false` | `true` |
 | Line comes back inside the lock gate (where it left) within `trackLostGraceFrames` (default 8) | normal again — the **same** line is re-locked | normal | `true` | `false` |
 | Gone for more than `trackLostGraceFrames` | stays at the last edge value (`±50`, slightly less if the calibrated column is far off-centre) | `trackingMinValue` | `false` | `false` |
-| A new line appears after that | full-width search: the band nearest the calibrated column with the calibrated width is taken | normal | `true` | `false` |
+| A new line appears after that | full-width search: the band nearest the calibrated column with the calibrated width is taken — with `corridorMode`, the candidate that continues farthest up the look-ahead wins (also on the first frame after a coast) | normal | `true` | `false` |
 
 Use `trackFound` (not `tracking == 5`) to show "TRACK LOST" — a hard turn also reads 5. With `trackMemory = false` there is no lock, no pinning and no hold: a missing line keeps the steering of its last position and tracking drops to the minimum. If calibration has not completed, see [If calibration cannot complete](#calibration).
 
@@ -438,8 +534,14 @@ pipeline.setFrameCallback(null);
 | `steerHeadingTerm` | `float` | Heading part of the steering, in steering output units (already multiplied by `steerHeadingWeight` and `headingConfidence`). Before clamping and rounding, `steering ≈ steerOffsetTerm + steerHeadingTerm`. `0` during calibration and when the line is not found. |
 | `headingDeg` | `float` | Line heading relative to the robot on the floor, perspective-corrected, minus the calibrated zero. Degrees, positive = the line heads to the right. `0` when unknown (line not found, too little look-ahead, or `steerHeadingWeight = 0`). |
 | `headingConfidence` | `float` | Weight `0 … 1` the heading got this frame (`0` = too little / not a smooth line ahead → offset-only steering; also `0` when `steerHeadingWeight = 0`). |
-| `lineHeld` | `boolean` | `true` while the line is momentarily hidden mid-image and the last output is held (`trackHoldFrames`). |
+| `lineHeld` | `boolean` | `true` while the line is momentarily hidden mid-image: coasting (v3) or the last output held (`trackHoldFrames`, with `glareMask = false`). |
 | `rejectedBands` | `int` | Number of candidate bands in the scan strip rejected or trimmed as distractors this frame (`0` with `rejectDistractors = false` and during calibration). |
+| `baseReconstructed` | `boolean` | `true` when the line was hidden in the scan strip (glare) and its position there was taken from the line farther ahead; `trackFound` is then `true`. |
+| `coasting` | `boolean` | `true` while the line is hidden mid-image and the pipeline coasts on its last motion (`lineHeld` is also `true`, `trackFound` is `false`). |
+| `maskedFrac` | `float` | Fraction `0 … 1` of the scan strip + look-ahead masked as glare (`0` with `glareMask = false`). |
+| `corridorCoverage` | `float` | Corridor tracker: fraction `0 … 1` of the near slices on the line this frame; `0` when the frame used the v2 logic (corner, dead end, re-acquiring, `corridorMode = false`). |
+| `corridorFitRms` | `float` | Corridor tracker: RMS distance of the slices from the fitted curve, in line widths. |
+| `curveA`, `curveB`, `curveC` | `float` | Corridor curve on the floor, `x = curveA + curveB·u + curveC·u²` (camera heights; `u` = distance beyond the scan strip, `x` = sideways, + = right). `0` when not used. |
 
 ### Drawing the overlay
 
@@ -594,7 +696,12 @@ while (running) {
 | Approaching a dead end / sharp corner | `~0` | `ramps 100 → 5 with the remaining road` |
 | Robot at an angle to a straight line (line crossing the strip at the calibrated column) | `≈ ±8` at 15°, `≈ ±17` at 30° *(heading part)* | `high` |
 | Dark object / shadow beside or touching the line | unchanged *(object rejected or trimmed off)* | unchanged |
-| Line hidden for a moment in the middle of the image | last value held for `trackHoldFrames` | last value held |
+| Line hidden for a moment in the middle of the image | coasts for up to `glareCoastMs` *(v2: held `trackHoldFrames`)* | ramps down |
+| Glare (lamp reflection) over the scan strip, line visible ahead | follows the line ahead | from the look-ahead |
+| Highlight on the centre of glossy tape | unchanged *(both tape edges still seen)* | unchanged |
+| Glare band across the look-ahead | unchanged | unchanged *(not read as a dead end)* |
+| Line running into a dark mat / ending beside a dark area | `~0` | `ramps 100 → 5` *(the mat's edge is not taken for the line)* |
+| Blob of the line's colour touching the line | unchanged | dips while the blob fills the far view, `≥ 60` once the line is seen past it |
 | Hard turn | `±50` | `5–30` |
 | Line completely lost | `±50` | `5` *(the floor)* |
 | Back on a straight after a turn | `returns to 0` | `~100` |
@@ -603,14 +710,14 @@ while (running) {
 
 ## Recommended Starting Values (lecturer's test program)
 
-For the Blockly test program — **motor steering = (0 − Steering) × c** and **motor power = round(x × (Power / 8) + 5)**, where *Steering* is `result[0]` and *Power* is the Tracking value `result[1]` — the closed-loop simulation (`_investigation/CHANGES_v2.md`, §7) recommends:
+For the Blockly test program — **motor steering = (0 − Steering) × c** and **motor power = round(x × (Power / 8) + 5)**, where *Steering* is `result[0]` and *Power* is the Tracking value `result[1]` — the closed-loop simulation (re-checked for v3, `_investigation/CHANGES_v3.md` §5–6) recommends:
 
 | Setting | Start with | Notes |
 |---|---|---|
-| Steering gain **c** | **`1.0`** | Not `0.5`: the steering output was halved to ±50 (11 Oct 2026) after the program was written, so `0.5` now gives only half the steering authority. `0.5` is a gentler alternative on tracks without sharp corners. Keep `c ≤ 1.0` when power follows Tracking (`x = 1`). |
-| Power mode **x** | **`0`** first (constant power 5), then **`1`** | With `x = 1` the power is about 6 … 18 and drops before turns. If the robot weaves with `x = 1`, use a larger divisor (e.g. `Power / 12`) before lowering `c`. |
+| Steering gain **c** | **`1.0`** | Not `0.5`: the steering output was halved to ±50 (11 Oct 2026) after the program was written, so `0.5` now gives only half the steering authority. v3 simulation: `1.0` completed every run at realistic speed and every glare run; `0.5` is a gentler alternative on tracks without sharp corners. Keep `c ≤ 1.0` when power follows Tracking (`x = 1`). |
+| Power mode **x** | **`0`** first (constant power 5), then **`1`** only at low speed | With `x = 1` the power is about 6 … 18 and drops before turns. At about **0.5–0.6 m/s** the simulation weaves on straights with `x = 1` and `c = 1.0` (latency limit of the loop) — keep `x = 0` there, or use `c = 0.5` or a larger divisor (`Power / 12`) with `x = 1`. |
 | Offset **+ 5** | `5` | If the robot does not move at power 5 (motor dead zone), raise it to 6–8 rather than raising `c`. |
-| Library | defaults | `steerHeadingWeight = 1`, `steerLookAhead = 0.5`. Set `cameraTiltDeg` to the real mount angle. If the robot cuts tight curves, lower `steerLookAhead` to `0.25`; if it hesitates when crossing the line at an angle, raise it to `0.75 … 1.0`. |
+| Library | defaults | v3 defaults (`corridorMode`, `glareMask`, `edgePairCheck` on). Set `cameraTiltDeg` to the real mount angle. If the robot cuts tight curves, lower `steerLookAhead` to `0.25`; if it hesitates when crossing the line at an angle, raise it to `0.75 … 1.0`. |
 
 These values come from simulation, not from the real robot — verify them on the track (and keep `x = 0` if the measured Blockly loop rate is well below ~15 Hz).
 
@@ -624,7 +731,8 @@ These values come from simulation, not from the real robot — verify them on th
 - A line that jumps sideways by more than the line-lock gate in a single frame (`trackMemoryGateMult` × line width, around the line's predicted position) is treated as leaving the line — this is what makes the lock ignore reflections.
 - The heading part of the steering relies on `cameraTiltDeg` and `verticalFovDeg` matching the real camera. The Android app runs at 960 × 1280 (CameraX picks 1280 × 960, rotated to portrait).
 - Very harsh scenes can still defeat colour learning: e.g. a dark floor in deep shadow, with strong texture, where the tape is only ~10 grey-levels darker than the shadowed floor. Even lighting helps.
-- Performance: ≈ 0.9 ms per frame in YUV colour mode at 960 × 1280 on a desktop CPU (several times more on a phone, still far below the 16.7 ms of 60 Hz); all per-frame buffers are pre-allocated (no garbage per frame, in all three input formats).
+- Performance: ≈ 0.6 ms per frame in YUV colour mode at 960 × 1280 on a desktop CPU with the v3 defaults (v2: ≈ 1.0 ms; the corridor tracker converts only the image rows it reads). A phone is several times slower, still far below the 16.7 ms of 60 Hz. All per-frame buffers are pre-allocated (no garbage per frame, in all three input formats — checked by a unit test).
+- The coast clock uses `System.nanoTime()`; when replaying recorded frames or simulating, set `frameIntervalMs` to the real frame interval so coasting lasts the intended time.
 
 ---
 
@@ -633,8 +741,10 @@ These values come from simulation, not from the real robot — verify them on th
 `RoboPhoneApp/` is an Android app that runs the library live on the phone camera (CameraX → packed YUV 4:2:0 → `calibrateYuv420` / `processFrameYuv420`). Everything on screen comes from the library's `FrameCallback`:
 
 - **Overlay** — cyan STEER strip with the detected line, magenta look-ahead band that bends along the line, dashed calibrated straight-ahead line, red ignored robot-body band. The overlay is mapped with the preview's FILL_CENTER crop so it lines up with the camera image.
-- **HUD** — STEER bar (−50…+50), TRACK bar (min…100 %), status (calibration progress and problems / TRACKING / TRACK LOST), FPS, learned LINE and FLOOR colour swatches, threshold and colour separation. The app does not show the new v2 `FrameData` fields yet.
+- **HUD** — STEER bar (−50…+50), TRACK bar (min…100 %), status (calibration progress and problems / TRACKING / TRACK LOST), FPS with the time per frame inside the pipeline (`pipe`) and for the whole analyzer (`frame`), learned LINE and FLOOR colour swatches, threshold and colour separation.
 - **RECALIBRATE** button — re-learns the colours and the straight-ahead reference (place the robot on the line first).
+- **v3 test settings** (all off by default, remembered between runs): **AE/AWB LOCK** locks auto-exposure and white balance when calibration completes (Camera2 `CONTROL_AE_LOCK` / `CONTROL_AWB_LOCK` via Camera2Interop; RECALIBRATE unlocks first), **EV** sets exposure compensation (0, −0.5 … −2, +0.5, +1), **v3 HUD** shows corridor coverage / fit, `COAST` / `RECON`, the masked fraction, the lock state and EV. With all off the camera is set up exactly as before.
+- **Logcat** (`adb logcat -s RoboPhone`): every 30 frames `PERF fps=… pipe_ms=… pipe_max_ms=… frame_ms=…`; `AE/AWB LOCKED after calibration` / `unlocked`; `EV compensation …`. See `ROBOT_TEST_CHECKLIST.md` for the on-robot tests.
 
 ---
 
@@ -647,6 +757,19 @@ cd LineFollowerLibrary
 gradlew test
 ```
 
-All **26 tests pass** with the v2 defaults. The steering tests check the offset part (19 for a line 60 px right) and that the heading part steers the same way; `lostLineReportsTrackLost` checks the hold of `trackHoldFrames` frames before tracking drops to 5. Two tests (`v1SteeringIsOffsetOnly`, `v1LostLineDropsTrackingAtOnce`) check that `steerHeadingWeight = 0` and `trackHoldFrames = 0` give the v1 behaviour. `gradlew jar` and the app build do not run the tests.
+All **44 tests pass** with the v3 defaults (about 1 minute):
+
+- `LineFollowerPipelineTest` (24) — every input format and colour pair, calibration, the steering parts, the v2 hold (with `glareMask = false`), the v3 coast clock (600 ms, 100 ms clamp per frame, frame limit) and the v1 behaviour.
+- `TrackSimTest` (6) — rendered camera views: shadows, wood grain, turns, line loss, distractor tapes, dead ends.
+- `V3ScenarioTest` (13) — v3 scenarios driven at 0.6 m/s and 30 fps, each in gray and YUV, for black-on-white, white-on-black and a chromatic pair: glare over the near strip, a glare band across the look-ahead, saturated and partial highlights on the tape centre, a sharp curve under near glare, an edge exit under glare, objects of tape width, blobs and soft shadows beside the line, re-acquiring next to a short object, a line running into a dark mat, a 90° corner and a dead end (the last two against the v2 settings). Per-frame traces go to `C:/RoboPhoneBuild/library/v3-scenarios/`.
+- `AllocationTest` (1) — zero bytes allocated by 1000 `processFrame*` calls in each format, glare and lost-line frames included.
+
+Further tasks: `gradlew perf` (ms per frame at 960 × 1280, v3 vs the v2 settings), `gradlew checkJava8` (the library compiles as Java 8). `gradlew jar` and the app build do not run the tests. The closed-loop simulator comparing v2 and v3 is in `_investigation/` (`run_v3_closed_loop.sh`, results in `_investigation/CHANGES_v3.md`).
 
 RoboPhoneApp pulls the library in **from source** through a Gradle composite build (`includeBuild("../LineFollowerLibrary")` in `settings.gradle.kts`), so library changes show up in the app on the next build — no jar copying.
+
+---
+
+## Robot Results (v3) — pending
+
+v3 has been tested in simulation only (unit scenarios and the closed-loop simulator, see `_investigation/CHANGES_v3.md`). The on-robot tests are described in `ROBOT_TEST_CHECKLIST.md` (lock off / on, lamp glare on glossy tape, dark objects, a 90° corner, 0.6 m/s, PERF numbers). Results and any default changes they lead to will be added here.
