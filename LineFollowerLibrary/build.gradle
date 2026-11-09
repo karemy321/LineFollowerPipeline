@@ -30,3 +30,27 @@ jar {
     archiveBaseName = 'LineFollowerPipeline'
     archiveVersion  = '1.0.0'
 }
+
+// v3 scenario tests (V3ScenarioTest): -Dv3.runAll=true also runs scenarios for phases not yet
+// implemented; per-frame traces are written to <build>/v3-scenarios/.
+test {
+    systemProperty 'v3.runAll', System.getProperty('v3.runAll', 'false')
+    systemProperty 'v3.reportDir', layout.buildDirectory.dir('v3-scenarios').get().asFile.absolutePath
+    maxHeapSize = '2g'
+}
+
+// gradlew perf — ms per frame at 960 × 1280 YUV (PerfBench).
+tasks.register('perf', JavaExec) {
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'com.example.linefollower.PerfBench'
+    maxHeapSize = '2g'
+}
+
+// gradlew checkJava8 — the library itself must stay Java 8 (plan §1); the tests use Java 11.
+tasks.register('checkJava8', JavaCompile) {
+    source = sourceSets.main.java
+    classpath = files()
+    destinationDirectory = layout.buildDirectory.dir('java8-check')
+    options.release = 8
+    options.compilerArgs += ['-Xlint:-options']
+}

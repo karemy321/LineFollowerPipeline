@@ -28,6 +28,35 @@ final class TrackSim {
     double wideHalfWidth = 0.02;
     private final Random rnd = new Random(42);
 
+    /**
+     * Specular glare: an ellipse fixed in the IMAGE (a reflection of a distant light stays at the
+     * same place in the view while the robot drives). Inside it {@code amp} grey levels are added
+     * to every channel (amp of ~255 or more saturates), fading to 0 over a halo of {@code halo} x
+     * the radius. With {@code tapeOnly} only the (glossy) tape gets it, not the (matte) floor; with
+     * {@code centreFrac} > 0 the highlight is also limited to the tape centre: it falls off as
+     * 1 - (d / (centreFrac * tapeHalfWidth))^2 with the distance d from the tape's centre line, so
+     * the tape edges stay dark ("floor, edge, dark tape, bright centre, dark tape, edge, floor").
+     * Centre and radii are fractions of the image width / height.
+     */
+    static final class Glare {
+        final double cx, cy, rx, ry, amp;
+        double halo = 0.15, centreFrac = 0;
+        boolean tapeOnly;
+        Glare(double cx, double cy, double rx, double ry, double amp) {
+            this.cx = cx; this.cy = cy; this.rx = rx; this.ry = ry; this.amp = amp;
+        }
+        Glare halo(double h)          { halo = h; return this; }
+        Glare tapeCentre(double frac) { tapeOnly = true; centreFrac = frac; return this; }
+    }
+    final List<Glare> glares = new ArrayList<>();
+
+    /** A distractor drawn in the line colour: a polyline {xs, ys} with its own half-width. */
+    static final class Obj {
+        final double[][] pts; final double halfWidth;
+        Obj(double[][] pts, double halfWidth) { this.pts = pts; this.halfWidth = halfWidth; }
+    }
+    final List<Obj> objects = new ArrayList<>();
+
     /** Each track is a dense polyline {xs, ys}. */
     final List<double[][]> tracks = new ArrayList<>();
 
@@ -83,12 +112,29 @@ final class TrackSim {
                 final double xc = (u + 0.5 - w / 2.0) / f;
                 int base = floorRgb;
                 double bright = 1.0;
+                double tapeDist = -1;          // distance to the main track's centre line (-1 = not on it)
+                boolean onLine = false;
                 if (down > 1e-6) {
                     final double t = camHeight / down;
                     final double wx = camX + t * fwd * ch + t * xc * rightX;
                     final double wy = camY + t * fwd * sh + t * xc * rightY;
-                    if (onTape(tracks, tapeHalfWidth, wx, wy) || onTape(wideTracks, wideHalfWidth, wx, wy)) base = lineRgb;
+                    tapeDist = tapeDistance(tracks, tapeHalfWidth, wx, wy);
+                    onLine = tapeDist >= 0 || onTape(wideTracks, wideHalfWidth, wx, wy) || onObject(wx, wy);
+                    if (onLine) base = lineRgb;
                     else if (grain > 0) bright += grain * Math.sin(wx * 2 * Math.PI / 0.03 + 3 * Math.sin(wy * 8));
+                }
+                double add = 0;
+                for (Glare g : glares) {
+                    final double nx = (u + 0.5 - g.cx * w) / (g.rx * w), ny = (v + 0.5 - g.cy * h) / (g.ry * h);
+                    final double r = Math.sqrt(nx * nx + ny * ny);
+                    double gf = r <= 1 ? 1 : (r < 1 + g.halo ? 1 - (r - 1) / g.halo : 0);
+                    if (gf <= 0 || (g.tapeOnly && !onLine)) continue;
+                    if (g.centreFrac > 0) {
+                        if (tapeDist < 0) continue;
+                        final double q = tapeDist / (g.centreFrac * tapeHalfWidth);
+                        gf *= Math.max(0, 1 - q * q);
+                    }
+                    add += g.amp * gf;
                 }
                 if (u < shadowEdgeFrac * w) bright *= shadowGain;
                 if (vignette > 0) {
@@ -96,15 +142,49 @@ final class TrackSim {
                     bright *= 1 - vignette * (nx * nx + ny * ny) / 2;
                 }
                 px[v * w + u] = 0xFF000000
-                        | (chan(base >> 16, bright) << 16) | (chan(base >> 8, bright) << 8) | chan(base, bright);
+                        | (chan(base >> 16, bright, add) << 16) | (chan(base >> 8, bright, add) << 8)
+                        | chan(base, bright, add);
             }
         }
         return px;
     }
 
-    private int chan(int c, double bright) {
-        final double x = (c & 0xFF) * bright + rnd.nextGaussian() * noise;
+    private int chan(int c, double bright, double add) {
+        final double x = (c & 0xFF) * bright + add + rnd.nextGaussian() * noise;
         return (int) Math.max(0, Math.min(255, Math.round(x)));
+    }
+
+    private boolean onObject(double x, double y) {
+        for (Obj o : objects) {
+            if (segDistance(o.pts, o.halfWidth, x, y) >= 0) return true;
+        }
+        return false;
+    }
+
+    /** Distance from (x, y) to the nearest centre line in {@code list} if within halfWidth, else -1. */
+    private static double tapeDistance(List<double[][]> list, double halfWidth, double x, double y) {
+        double best = -1;
+        for (double[][] t : list) {
+            final double d = segDistance(t, halfWidth, x, y);
+            if (d >= 0 && (best < 0 || d < best)) best = d;
+        }
+        return best;
+    }
+
+    private static double segDistance(double[][] t, double halfWidth, double x, double y) {
+        final double reach = halfWidth + 0.01;
+        final double[] xs = t[0], ys = t[1];
+        double best = Double.MAX_VALUE;
+        for (int i = 0; i + 1 < xs.length; i++) {
+            final double ax = xs[i], ay = ys[i], bx = xs[i + 1], by = ys[i + 1];
+            if (Math.abs(x - ax) > reach || Math.abs(y - ay) > reach) continue;
+            final double dx = bx - ax, dy = by - ay, len2 = dx * dx + dy * dy;
+            double s = ((x - ax) * dx + (y - ay) * dy) / len2;
+            s = Math.max(0, Math.min(1, s));
+            final double ex = ax + s * dx - x, ey = ay + s * dy - y;
+            best = Math.min(best, ex * ex + ey * ey);
+        }
+        return best <= halfWidth * halfWidth ? Math.sqrt(best) : -1;
     }
 
     private static boolean onTape(List<double[][]> list, double halfWidth, double x, double y) {
