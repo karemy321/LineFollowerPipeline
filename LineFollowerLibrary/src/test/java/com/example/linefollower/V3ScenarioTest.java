@@ -34,7 +34,7 @@ import org.junit.Test;
 public class V3ScenarioTest {
 
     /** Highest plan phase implemented in the library. Scenarios for later phases are skipped. */
-    static final int IMPLEMENTED_PHASE = 2;
+    static final int IMPLEMENTED_PHASE = 3;
 
     static final int W = 320, H = 240;
     static final double SPEED = 0.6;          // m/s, user's top speed (plan §8.4)
@@ -523,6 +523,109 @@ public class V3ScenarioTest {
             centroidNearRef(c, r, 0.3);
         });
         c.done("blobTouchingLine");
+    }
+
+    // ── Phase 3: distractor hardening ──────────────────────────────────────
+
+    /**
+     * D1 (acquisition): the line is lost (robot lifted away), then comes back 4 cm to the
+     * robot's right while a short object of tape width lies straight ahead at the calibrated
+     * column. A full-width search that prefers the calibrated column takes the object; the
+     * object does not continue up the look-ahead, the line does. Expect: never locked on the
+     * object, and the line re-acquired within 3 frames.
+     */
+    @Test public void reacquireBesideShortObject() {
+        requirePhase(3);
+        final Check c = new Check();
+        MAIN_PAIRS.parallelStream().forEach(p -> {
+            final Scene s = new Scene();
+            s.name = "reacquireBesideShortObject_" + p;
+            s.pair = p; s.path = straightPath();
+            final double x0 = 0.6, side = 0.04;          // robot 4 cm left of the line ⇒ line on its right
+            s.world = sim -> sim.objects.add(new TrackSim.Obj(
+                    new TrackSim.Path(x0 + 0.08, side, 0).straight(0.06).points(), TAPE_W / 2));
+            for (int k = 0; k < 5; k++) s.poses.add(new double[]{0.2 + 0.02 * k, 0, 0});
+            for (int k = 5; k < 15; k++) s.poses.add(new double[]{0.3 + 0.02 * k, 5.0, 0});   // no tape in view
+            for (int k = 15; k < 35; k++) s.poses.add(new double[]{x0 + 0.02 * (k - 15), side, 0});
+            final Result r = runDistractor(s);
+            for (int f = 0; f < 2; f++) {
+                if (!r.has(f)) continue;
+                for (int k = 15; k < r.frames(); k++) {
+                    final F t = r.test[f][k], ref = r.ref[f][k];
+                    if (!ref.found) continue;
+                    final double tol = 0.5 * Math.max(4, ref.widthPx);
+                    if (t.found) c.that(Math.abs(t.cx - ref.cx) <= tol, r.sc.name, FMT[f], k, "locked on the object", t + " / line " + ref);
+                    if (k >= 18) c.that(t.found, r.sc.name, FMT[f], k, "line not re-acquired", t + " / line " + ref);
+                }
+            }
+        });
+        c.done("reacquireBesideShortObject");
+    }
+
+    /**
+     * D3 (edges): a soft-edged shadow, almost as dark as the tape, touching the line's right
+     * side for 40 cm. A band test on pixel counts alone lets the shadow pull the centre;
+     * the tape has two sharp edges, the shadow does not. Expect centre within 0.3 line width.
+     */
+    @Test public void softShadowBesideLine() {
+        requirePhase(3);
+        final Check c = new Check();
+        Arrays.asList(Pair.BLACK_ON_WHITE, Pair.BLACK_ON_BLUE).parallelStream().forEach(p -> {
+            final Scene s = new Scene();
+            s.name = "softShadowBesideLine_" + p;
+            s.pair = p; s.path = straightPath();
+            s.world = sim -> sim.objects.add(new TrackSim.Obj(
+                    new TrackSim.Path(0.5, -(TAPE_W / 2 + 0.03), 0).straight(0.4).points(), 0.03).soft(0.03, 0.85));
+            s.poses = along(s.path, 20, 32, 30);
+            final Result r = runDistractor(s);
+            centroidNearRef(c, r, 0.3);
+            for (int f = 0; f < 2; f++) {
+                if (!r.has(f)) continue;
+                for (int k = 0; k < r.frames(); k++) {
+                    c.that(Math.abs(r.test[f][k].s - r.ref[f][k].s) <= 3, r.sc.name, FMT[f], k,
+                            "steering pulled toward the shadow", r.test[f][k] + " / ref " + r.ref[f][k]);
+                }
+            }
+        });
+        c.done("softShadowBesideLine");
+    }
+
+    /**
+     * D2 (trimming): the line ends where a dark mat begins whose left edge continues the
+     * tape's left edge (e.g. tape running into a dark rug). Cutting a tape-width piece off the
+     * mat's edge "continues" a phantom line across the mat, so the robot would not slow down.
+     * Expect the dead-end behaviour of the same track without the mat: tracking within 15,
+     * minimum at the end, and no line reported where there is none.
+     */
+    @Test public void deadEndIntoMat() {
+        requirePhase(3);
+        final Check c = new Check();
+        MAIN_PAIRS.parallelStream().forEach(p -> {
+            final Scene s = new Scene();
+            s.name = "deadEndIntoMat_" + p;
+            s.pair = p; s.path = new TrackSim.Path(0, 0, 0).straight(0.8);
+            final double half = 0.07;                    // mat 14 cm wide, its left edge on the tape's left edge
+            s.world = sim -> sim.objects.add(new TrackSim.Obj(
+                    new TrackSim.Path(0.8 + half, TAPE_W / 2 - half, 0).straight(0.8).points(), half));
+            s.calibIndex = 4;
+            for (double x = 0.10; x <= 0.85 + 1e-9; x += 0.02) s.poses.add(new double[]{x, 0, 0});
+            final Result withMat = run(s);
+            final Scene clean = new Scene();
+            clean.name = s.name + "_clean"; clean.pair = p; clean.path = s.path; clean.poses = s.poses; clean.calibIndex = 4;
+            final Result r0 = run(clean);
+            for (int f = 0; f < 2; f++) {
+                if (!withMat.has(f)) continue;
+                final F[] t = withMat.test[f], ref = r0.test[f];
+                c.that(t[t.length - 1].t == 5, s.name, FMT[f], t.length - 1, "not at the minimum at the end", t[t.length - 1]);
+                for (int k = 0; k < t.length; k++) {
+                    c.that(Math.abs(t[k].t - ref[k].t) <= 15, s.name, FMT[f], k, "tracking differs from the plain dead end by > 15",
+                            t[k] + " / no mat " + ref[k]);
+                    c.that(!(t[k].found && !ref[k].found && !ref[k].held && !ref[k].coasting), s.name, FMT[f], k,
+                            "line reported on the mat after the end", t[k] + " / no mat " + ref[k]);
+                }
+            }
+        });
+        c.done("deadEndIntoMat");
     }
 
     // ── Fallback behaviour must stay v2 (plan Phase 0 #6, §8.5) ─────────────

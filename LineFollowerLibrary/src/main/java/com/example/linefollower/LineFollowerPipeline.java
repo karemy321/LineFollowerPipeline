@@ -287,6 +287,16 @@ public final class LineFollowerPipeline {
         // Larger = follows sudden changes sooner, smooths less.
         public float corridorProcessNoise = 1.0f;
 
+        // Distractor hardening (v3, active with corridorMode): a candidate band in the scan
+        // strip must show a sharp floor→line AND line→floor edge at its width — a shadow or a
+        // blob with soft edges only counts a third as much as a band with both edges (it is
+        // not rejected outright, so a blurred image still works). In addition, with
+        // corridorMode: a band cut out of a wider one is only accepted if the line continues
+        // up the look-ahead, the look-ahead does not count a trailing stretch of such cut-out
+        // rows as visible road, and when (re)acquiring the line the candidate that continues
+        // farthest up the look-ahead wins. OFF = only the edge check is skipped.
+        public boolean edgePairCheck = true;
+
         // ── Steering from the whole ⊥ (offset + heading) ─────────────────────
         // Steering = offset part + heading part:
         //   offset  = steerOffsetWeight × (line column in the H-ROI − calibrated
@@ -726,6 +736,10 @@ public final class LineFollowerPipeline {
     private int     coastFrames;
     private float   lastHeadTerm;      // heading part of the steering on the last frame with the line
     private boolean glarePinned;       // pinned while the strip was hidden (lock parked at the edge)
+    // Phase 3: the frame being processed (for continuity / edge checks inside findBand).
+    private byte[]  curPixels;
+    private boolean curBright;
+    private boolean hardening;         // distractor hardening active this frame (corridorMode, calibrated)
     // Capped edge pin (plan §12): curve history of the corridor filter and the cap's clock.
     private int     curveSide;         // side (-1 / +1) the filter's curve bends to (0 = straight)
     private int     curveFrames;       // consecutive confident corridor frames bending to curveSide
@@ -2022,12 +2036,18 @@ public final class LineFollowerPipeline {
             return;
         }
         final int w = end - start;
+        // D2 (v3): a piece cut out of a wider band is the line only if the line continues up
+        // the look-ahead from it — otherwise it is the edge of a mat or blob the line ran into.
+        if (trimmed && hardening && continuity((float) (moment / sum), lastImgSlope) < 2
+                && coveredAbove((float) (moment / sum), lastImgSlope) >= 2) { rejectedBands++; return; }
         // Pixel count, capped at what a line of the expected width can hold, so a
         // bigger object of acceptable width does not win just by being bigger.
         long s = sum;
         if (expectW > 0f) s = Math.min(s, (long) (1.2f * expectW * Math.max(1, hRoiBot - hRoiTop)));
         float score = scoreBand(s, (float) (moment / sum), w, prefX, scale, expectW);
         score *= levelFactor(bandLevel(start, end));
+        // D3 (v3): both tape edges must be sharp; a soft-edged shadow / blob counts a third.
+        if (hardening && cfg.edgePairCheck && !trimmed && start > 0 && end < imgW && !hasEdgePair(start, end)) score *= 0.3f;
         if (score > bandScore) {
             bandScore = score; bandSum = sum; bandMoment = moment;
             bandStart = start; bandEnd = end; bandTrimmed = trimmed;
@@ -2138,6 +2158,8 @@ public final class LineFollowerPipeline {
      * results into the internal {@code output} holder.
      */
     private void runPipeline(byte[] pixels, int width, int height, boolean bright) {
+        curPixels = pixels;
+        curBright = bright;
         final int   W     = width;
         final float halfW = W * 0.5f;
         final boolean filter = cfg.rejectDistractors;
@@ -2172,6 +2194,7 @@ public final class LineFollowerPipeline {
         // part that continues the predicted line.
         buildColumnProfile(pixels, threshold, bright);
         rejectedBands = 0;
+        hardening = cfg.corridorMode && filter && calibrated && expectedLineWidth() > 0f;
 
         final int    hRoiRows  = Math.max(1, hRoiBot - hRoiTop);
         final double minWeight = (double) cfg.minWeightFrac * hRoiRows * W;
@@ -2220,6 +2243,14 @@ public final class LineFollowerPipeline {
             else        findBand(searchLo, searchHi, minWeight, lastCentroidX, gateHalf, 0f, false, false);
         } else {
             findBand(0, W, minWeight, steerRefX, lineScale, expectW, filter, false);
+            // D1 (v3): (re)acquiring — the candidate that continues up the look-ahead wins.
+            if (hardening && bandStart >= 0) acquireByContinuity(minWeight, lineScale, expectW, filter);
+        }
+
+        // D1 (v3): the locked line was hidden (coast) or lost — the band now in the gate may be
+        // something else at the predicted place; rank it against the rest by continuity.
+        if (locked && hardening && bandStart >= 0 && (coastFrames > 0 || lostFrames > 0)) {
+            acquireByContinuity(minWeight, lineScale, expectW, filter);
         }
 
         // Lock correction: while locked, also look at the whole strip. If a band that
@@ -2561,7 +2592,8 @@ public final class LineFollowerPipeline {
      */
     private float glarePinSteering(int side) {
         final float full = side > 0 ? 100f : -100f;
-        if (pinCapEscalated || !corrPredValid || curveSide != side
+        final float stripPx = Math.max(1f, (hRoiBot - hRoiTop) * (float) imgW);
+        if (pinCapEscalated || !corrPredValid || curveSide != side || maskedPixels < 0.2f * stripPx
                 || curveFrames < PIN_CAP_MIN_CURVE_FRAMES || sinceCurveFrames > PIN_CAP_MAX_GAP) return full;
         pinCapMs += frameDtMs;
         pinCapFrames++;
@@ -2612,6 +2644,128 @@ public final class LineFollowerPipeline {
         if (side == 0) { curveFrames = 0; curveSide = 0; return; }
         if (side == curveSide) curveFrames++; else { curveSide = side; curveFrames = 1; }
         sinceCurveFrames = 0;
+    }
+
+    // ── Phase 3 helpers (distractor hardening) ─────────────────────────────
+
+    /**
+     * How many corridor slices (1 … cN−1) continue a line that crosses the strip at column
+     * {@code col}: each slice is searched around the continuation (direction {@code slope0},
+     * columns per row upward, refined by the slices found) with a window that grows with the
+     * distance; it needs an edge pair at the expected width. Misses do not stop the search, so
+     * a line merged with a blob over a stretch still counts once it is clean again. Glare
+     * slices count as neither.
+     */
+    private int continuity(float col, float slope0) {
+        final byte[] pix = curPixels;
+        if (pix == null || cN < 2) return 0;
+        final float expW = expectedLineWidth();
+        if (expW <= 0f) return 0;
+        final int runGap = runGapTol();
+        float lastCol = col, slope = Math.max(-2f, Math.min(2f, slope0));
+        int lastRow = cRow[0], found = 0;
+        for (int s = 1; s < cN; s++) {
+            final int row = cRow[s];
+            final float pc = lastCol + slope * (lastRow - row);
+            if (pc < -expW || pc > imgW + expW) break;
+            final float e = expW * floorScaleH / cScale[s] * cGain[s];
+            final float half = Math.max(1.1f * e, 0.5f * e + 2 * runGap) + 0.15f * (cRow[0] - row);
+            ensureRows(cR0[s], cR1[s]);
+            if (detectSlice(pix, curBright, cR0[s], cR1[s], 1, pc, e, Math.min(half, imgW * 0.5f), 1.5f)) {
+                if (Math.abs(dCentre - pc) <= Math.max(0.5f * e, half * 0.6f)) {
+                    if (found > 0 && lastRow != row) slope = Math.max(-2f, Math.min(2f, (dCentre - lastCol) / (lastRow - row)));
+                    lastCol = dCentre; lastRow = row; found++;
+                }
+            }
+        }
+        return found;
+    }
+
+    /**
+     * In how many of the 3 slices above the strip the continuation of column {@code col} is
+     * covered by line-coloured pixels (mean line-ness past the threshold over one line width)
+     * — e.g. the mat or blob a line ran into. Empty floor above (a corner) gives 0.
+     */
+    private int coveredAbove(float col, float slope0) {
+        final byte[] pix = curPixels;
+        if (pix == null) return 0;
+        final float expW = expectedLineWidth();
+        final float slope = Math.max(-2f, Math.min(2f, slope0));
+        int n = 0;
+        for (int s = 1; s < Math.min(cN, 4); s++) {
+            final float e = expW * floorScaleH / cScale[s];
+            final float pc = col + slope * (cRow[0] - cRow[s]);
+            final int a = Math.max(0, Math.round(pc - 0.5f * e)), b = Math.min(imgW, Math.round(pc + 0.5f * e) + 1);
+            if (b <= a) continue;
+            ensureRows(cR0[s], cR1[s]);
+            long sum = 0; int cnt = 0;
+            for (int r = cR0[s]; r < cR1[s]; r++) {
+                for (int c = a; c < b; c++) { final int v = pix[r * imgW + c] & 0xFF; sum += curBright ? v : 255 - v; cnt++; }
+            }
+            if (cnt > 0 && sum >= (long) (fLevelThr + 4f) * cnt) n++;
+        }
+        return n;
+    }
+
+    /**
+     * D2: is the run [a, b) on this row uniformly line-like? Compares the tape-width part at the
+     * kept edge (left if {@code keepLeft}) with the rest: a line beside a lighter shadow has a
+     * clearly more line-like core; a mat or blob of the line's colour does not.
+     */
+    private boolean uniformRun(int base, int a, int b, boolean keepLeft, float expRow, boolean bright, float lvlThr) {
+        final int k = Math.max(1, Math.round(expRow));
+        final int ka = keepLeft ? a : Math.max(a, b - k), kb = keepLeft ? Math.min(b, a + k) : b;
+        final boolean mask = maskActive;
+        final byte[] gs = glareSrc, pix = curPixels;
+        final int gl = glareLim;
+        long sk = 0, sr = 0; int nk = 0, nr = 0;
+        for (int c = a; c < b; c++) {
+            if (mask && (gs[base + c] & 0xFF) >= gl) continue;
+            final int v = pix[base + c] & 0xFF, l = bright ? v : 255 - v;
+            if (c >= ka && c < kb) { sk += l; nk++; } else { sr += l; nr++; }
+        }
+        if (nk == 0 || nr == 0) return true;
+        final float span = calibLevel - lvlThr;
+        final float margin = span >= 8f ? 0.25f * span : 12f;
+        return (float) sk / nk - (float) sr / nr < margin;
+    }
+
+    /** True when the strip rows show both edges of a band [start, end) (an edge pair at its width). */
+    private boolean hasEdgePair(int start, int end) {
+        final byte[] pix = curPixels;
+        if (pix == null) return true;
+        final float wid = end - start, c = 0.5f * (start + end);
+        final float half = 0.5f * wid + 2 * runGapTol() + 2f;
+        if (!detectSlice(pix, curBright, cR0[0], cR1[0], 1, c, wid, half, 1.5f)) return dUnknown;
+        return Math.abs(dCentre - c) <= Math.max(2f, 0.35f * wid);
+    }
+
+    /**
+     * D1: (re)acquiring the line. Besides the best band (already in band*), the best band left
+     * and right of it are candidates; the one that continues farthest up the look-ahead (at
+     * least 2 slices) wins, ties broken by the v2 score. If none continues, the v2 choice stays.
+     */
+    private void acquireByContinuity(double minWeight, float lineScale, float expectW, boolean filter) {
+        final long   s0 = bandSum;  final double m0 = bandMoment;
+        final int    a0 = bandStart, e0 = bandEnd;  final float sc0 = bandScore;  final boolean t0 = bandTrimmed;
+        long bs = s0; double bm = m0; int ba = a0, be = e0; boolean bt = t0;
+        int bestCont = continuity((float) (m0 / s0), 0f);
+        float bestScore = sc0;
+        final int savedRejected = rejectedBands;
+        for (int side = 0; side < 2; side++) {
+            if (side == 0) findBand(0, a0, minWeight, steerRefX, lineScale, expectW, filter, false);
+            else           findBand(e0, imgW, minWeight, steerRefX, lineScale, expectW, filter, false);
+            if (bandStart < 0) continue;
+            final int cont = continuity((float) (bandMoment / bandSum), 0f);
+            final boolean better = cont >= 2 && (cont > bestCont + 1 || (Math.abs(cont - bestCont) <= 1 && bandScore > bestScore && bestCont >= 2))
+                                   || (bestCont < 2 && cont >= 2);
+            if (better) {
+                bestCont = cont; bestScore = bandScore;
+                bs = bandSum; bm = bandMoment; ba = bandStart; be = bandEnd; bt = bandTrimmed;
+            }
+        }
+        rejectedBands = savedRejected;
+        bandSum = bs; bandMoment = bm; bandStart = ba; bandEnd = be; bandTrimmed = bt; bandScore = bestScore;
     }
 
     /** Curvature C of a parabola through the last trace's floor points (NaN if too few). */
@@ -2765,6 +2919,13 @@ public final class LineFollowerPipeline {
         int    farRow      = -1;   // farthest (topmost) V-ROI row where the line was accepted
         int    farRowEff   = -1;   // same, extended across glare rows right after it (road not ended)
         int    lastGlareRow = -1;  // seeking: last row whose window touched glare
+        // D2 (v3): rows kept only through one edge of a wider run ("cut"); a trailing stretch of
+        // them with no clean row after it is the edge of something the line ran into.
+        int    cutRows = 0, lastCleanRow = -1;
+        double cleanLaW = 0, cleanLaM = 0;
+        boolean inCutStretch = false;
+        float  prevSpan = 0f, prevExp = lastTrackWidthPx;
+        final boolean d2 = filter && cfg.corridorMode && calibrated;
         final int haloRows = Math.max(4, Math.round(0.03f * imgH));
         long   runL = 0; int runN = 0;   // line-ness sum / count of the unmasked pixels of a run
         // "Strongly line-like": past 60 % of the way from the threshold to the calibrated line.
@@ -2827,6 +2988,8 @@ public final class LineFollowerPipeline {
             long   runW = 0;   double runM = 0;   int runStart = -1, runLast = -1, runGap = 0;
             double bestC = Double.NaN; long bestW = 0; double bestDist = Double.MAX_VALUE;
             int    bestS = -1, bestE = -1;
+            boolean bestCut = false;
+            int     bestSpan = 0;
             for (int col = vLeft; col <= vRight; col++) {
                 // Glare (v3): a saturated pixel is "unknown" and counts as part of a run.
                 final boolean masked = mask && col < vRight && (gs[base + col] & 0xFF) >= gl;
@@ -2838,6 +3001,7 @@ public final class LineFollowerPipeline {
                     if (!masked) { runN++; runL += bright ? px : 255 - px; }
                 } else if (runStart >= 0 && (col == vRight || ++runGap > runGapTol)) {
                     double c = runM / runW; long wCount = runW;
+                    boolean cut = false;
                     boolean ok = !nearGlare || (strongLevel > 0f && 2 * runN >= runW && runL >= strongLevel * runN);
                     final int span = runLast + 1 - runStart;
                     // A run cut by the scan window (not the frame edge) may be much wider.
@@ -2852,13 +3016,18 @@ public final class LineFollowerPipeline {
                         final double tol   = Math.max(4.0, 0.3 * expRow);
                         final boolean lOk  = Math.abs(runStart - (pred - expRow * 0.5)) <= tol;
                         final boolean rOk  = Math.abs(runLast + 1 - (pred + expRow * 0.5)) <= tol;
-                        if (lOk && !rOk)      { c = runStart + expRow * 0.5;    wCount = Math.round(expRow); }
-                        else if (rOk && !lOk) { c = runLast + 1 - expRow * 0.5; wCount = Math.round(expRow); }
+                        // D2: far wider than the line and uniformly line-like (no tape-width core that
+                        // is more line-like than the rest, as a line beside a lighter shadow has).
+                        final boolean far = d2 && span > 2.5f * expRow + 4f;
+                        if (lOk && !rOk)      { c = runStart + expRow * 0.5;    wCount = Math.round(expRow);
+                                                cut = far && uniformRun(base, runStart, runLast + 1, true, expRow, bright, lvlThr); }
+                        else if (rOk && !lOk) { c = runLast + 1 - expRow * 0.5; wCount = Math.round(expRow);
+                                                cut = far && uniformRun(base, runStart, runLast + 1, false, expRow, bright, lvlThr); }
                         else if (!(lOk && rOk) && (span > maxRow || clipped)) ok = false;
                     }
                     if (ok) {
                         final double d = Math.abs(c - (filter ? pred : trackCenter));
-                        if (d < bestDist) { bestDist = d; bestC = c; bestW = wCount; bestS = runStart; bestE = runLast + 1; }
+                        if (d < bestDist) { bestDist = d; bestC = c; bestW = wCount; bestS = runStart; bestE = runLast + 1; bestCut = cut; bestSpan = span; }
                     }
                     runStart = -1;
                 }
@@ -2876,6 +3045,17 @@ public final class LineFollowerPipeline {
                 traceAccepted++;
                 farRowEff = row;
                 rowCx[row]  = (float) bestC;
+                // A cut-out stretch counts only if it starts abruptly (a mat / blob begins); a line
+                // that widens gradually (a curve, perspective) is not one.
+                boolean isCut = false;
+                if (bestCut) {
+                    if (inCutStretch || prevSpan <= 1.6f * prevExp + 4f) { inCutStretch = true; isCut = true; }
+                } else {
+                    inCutStretch = false;
+                }
+                prevSpan = bestSpan; prevExp = widthTest ? expRow : lastTrackWidthPx;
+                if (isCut) cutRows++;
+                else { cutRows = 0; lastCleanRow = row; cleanLaW = laW; cleanLaM = laM; }
                 if (filter) {
                     // Local drift (columns per row upward), smoothed over rows.
                     final int dr = prevRow - row;
@@ -2911,6 +3091,11 @@ public final class LineFollowerPipeline {
                 }
                 if (++gap > (seeking ? seekGap : maxGap)) break;   // line ended → stop look-ahead
             }
+        }
+
+        if (cutRows > 0 && d2) {
+            farRow = lastCleanRow; farRowEff = lastCleanRow;
+            laW = lastCleanRow >= 0 ? cleanLaW : 0.0; laM = lastCleanRow >= 0 ? cleanLaM : 0.0;
         }
 
         // Image-space least-squares slope  b = d(col)/d(row).
@@ -3414,6 +3599,10 @@ public final class LineFollowerPipeline {
 
         // ── Decide whether this frame is the corridor's ──
         if (obs == 0) return false;
+        // Coming back after the line was hidden / lost with the near part in view: the v2 logic
+        // re-acquires it (continuity-ranked); the filter's wide windows could join two things.
+        if (!farOnly && hardening && (coastFrames > 0 || lostFrames > 0)
+                && maskedPixels < 0.2f * (hRoiBot - hRoiTop) * imgW) return false;   // (strip not under glare)
         // Corner / junction: the near part fits, farther slices do not (all on one side).
         if (rejFit >= 2 && Math.abs(rejSign) == rejFit && obsFit >= 2) return false;
         if (farOnly) {

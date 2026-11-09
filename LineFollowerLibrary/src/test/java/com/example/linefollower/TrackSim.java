@@ -53,7 +53,11 @@ final class TrackSim {
     /** A distractor drawn in the line colour: a polyline {xs, ys} with its own half-width. */
     static final class Obj {
         final double[][] pts; final double halfWidth;
+        // soft: width (m) of a blurred edge (0 = hard); alpha: how far toward the line colour
+        // (1 = line colour, e.g. 0.85 for a shadow almost as dark as a dark tape).
+        double soft = 0, alpha = 1;
         Obj(double[][] pts, double halfWidth) { this.pts = pts; this.halfWidth = halfWidth; }
+        Obj soft(double width, double a) { soft = width; alpha = a; return this; }
     }
     final List<Obj> objects = new ArrayList<>();
 
@@ -119,9 +123,13 @@ final class TrackSim {
                     final double wx = camX + t * fwd * ch + t * xc * rightX;
                     final double wy = camY + t * fwd * sh + t * xc * rightY;
                     tapeDist = tapeDistance(tracks, tapeHalfWidth, wx, wy);
-                    onLine = tapeDist >= 0 || onTape(wideTracks, wideHalfWidth, wx, wy) || onObject(wx, wy);
+                    final double oa = objectAlpha(wx, wy);
+                    onLine = tapeDist >= 0 || onTape(wideTracks, wideHalfWidth, wx, wy) || oa >= 1;
                     if (onLine) base = lineRgb;
-                    else if (grain > 0) bright += grain * Math.sin(wx * 2 * Math.PI / 0.03 + 3 * Math.sin(wy * 8));
+                    else {
+                        if (oa > 0) base = mix(floorRgb, lineRgb, oa);
+                        if (grain > 0) bright += grain * Math.sin(wx * 2 * Math.PI / 0.03 + 3 * Math.sin(wy * 8));
+                    }
                 }
                 double add = 0;
                 for (Glare g : glares) {
@@ -154,11 +162,27 @@ final class TrackSim {
         return (int) Math.max(0, Math.min(255, Math.round(x)));
     }
 
-    private boolean onObject(double x, double y) {
+    /** How strongly (0 … 1, 1 = line colour) the objects cover (x, y). */
+    private double objectAlpha(double x, double y) {
+        double best = 0;
         for (Obj o : objects) {
-            if (segDistance(o.pts, o.halfWidth, x, y) >= 0) return true;
+            if (o.soft <= 0) {
+                if (segDistance(o.pts, o.halfWidth, x, y) >= 0) best = Math.max(best, o.alpha);
+            } else {
+                final double d = segDistance(o.pts, o.halfWidth + 0.5 * o.soft, x, y);
+                if (d >= 0) best = Math.max(best, o.alpha * Math.max(0, Math.min(1, (o.halfWidth + 0.5 * o.soft - d) / o.soft)));
+            }
         }
-        return false;
+        return best;
+    }
+
+    private static int mix(int a, int b, double t) {
+        int out = 0;
+        for (int sh = 0; sh <= 16; sh += 8) {
+            final double v = ((a >> sh) & 0xFF) * (1 - t) + ((b >> sh) & 0xFF) * t;
+            out |= ((int) Math.round(v) & 0xFF) << sh;
+        }
+        return out;
     }
 
     /** Distance from (x, y) to the nearest centre line in {@code list} if within halfWidth, else -1. */

@@ -364,7 +364,39 @@ New FrameData fields (additive): `baseReconstructed`, `coasting`, `corridorCover
   - **App:** `MainActivity` now times the pipeline call alone; every 30 frames it logs
     `PERF fps=… pipe_ms=… pipe_max_ms=… frame_ms=…` (`adb logcat -s RoboPhone | grep PERF`) and the
     HUD line shows FPS / pipe ms / frame ms. No camera code changed; `assembleDebug` builds.
-- [ ] Phase 3 — trimBand continuity, edge-pair, continuity-ranked acquisition
+- [x] Phase 3 — trimBand continuity, edge-pair, continuity-ranked acquisition
+  - **Gating:** all of it runs only with `corridorMode` (so `corridorMode = false, glareMask = false`
+    stays exact v2 — re-checked, identical on every frame); the strip edge test also needs the new
+    `edgePairCheck` (default true).
+  - **New scenarios first** (`TrackSim` objects can now be soft-edged and partly dark): on Phase 2b
+    `reacquireBesideShortObject` (D1) and `deadEndIntoMat` (D2) **failed** in all 6 runs;
+    `softShadowBesideLine` (D3) already **passed** (v2 line-ness weighting + strong-core trim) and is
+    kept as a guard.
+  - **Continuity** helper: follows a strip column up the corridor slices (edge pair at the expected
+    width, window growing with distance, misses allowed), counts the slices that continue it.
+  - **D2 strip:** a trimmed band is rejected when < 2 slices continue it **and** ≥ 2 of the 3 slices
+    above show line-coloured pixels on its continuation (a mat / blob the line ran into). Empty floor
+    above (a 90° corner) does not reject — the first version did and broke `ninetyDegreeCorner`.
+  - **D2 look-ahead:** a row kept only through one edge of a run > 2.5 × the line width counts as
+    "cut" if the run is uniformly line-like (no tape-width core clearly more line-like than the rest —
+    a line beside a lighter shadow has one) and the stretch starts abruptly (a curve or perspective
+    widens gradually). A trailing cut stretch is not visible road. The first, blunter version dropped
+    tracking to 25 beside a long shadow and changed the edge-exit tracking; both fixed.
+  - **D1:** when not locked, and right after a coast / loss with the strip clear of glare, the best
+    band and the best band on each side of it are ranked by continuity (≥ 2 slices) before the v2
+    score; the corridor steps aside on that frame (its wide post-coast windows joined the object and
+    the line).
+  - **D3:** a strip band (not cut, not at the frame edge) without an edge pair at its width scores ×0.3.
+  - The capped pin of §12 now needs ≥ 20 % of the strip masked (it had fired without glare in
+    `lostLineReadsExactlyFullSteering`).
+  - **Results:** 44 tests, all pass, none skipped; zero allocations. Compared with Phase 2b, scenario
+    traces changed only in `reacquireBesideShortObject` (fixed), `deadEndIntoMat` (fixed) and
+    `blobTouchingLine`; edge exit, sharp curve, glare, corner, dead end and soft shadow are
+    byte-identical. **Behaviour change:** beside a hard blob of the line's own colour merged with the
+    line (`blobTouchingLine`), tracking dips while the blob fills the far view (100 → 37 in the gray
+    run), steering unchanged — locally this is the same picture as a line running into a mat.
+  - **Timing:** v3 0.56–0.60 ms mean vs v2 flags 1.03–1.11 (the checks convert only the rows they
+    read; a first version converting the whole look-ahead cost 1.1 ms).
 - [ ] Phase 4 — AE/AWB lock in app
 - [ ] Phase 5 — README v3, CHANGES_v3.md, timings, Blockly values re-checked
 
