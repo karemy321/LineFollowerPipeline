@@ -505,3 +505,15 @@ The requested "within ~10" is met in 12 of 23 frames; the test checks ≤ 15. Ca
 the line's base moves sideways along the curve, which the far point does not show. Two alternatives
 were measured and not used: the observed edge-contact point (12–16 *above* v2: a run cut by the
 frame edge) and a "robot on the line" parabola through the far point (also 10–16 below).
+
+## 13. Decision — bounded slowdown beside a blob of the line's colour (user, 2026-11-10)
+
+Keep the cautious D2 slowdown (Phase 3), but bound it: if corridor slices **beyond** the dropped
+stretch still show the line's edge pair on its continuation (≥ 2 slices, chain-followed, at the
+expected width), tracking does not go below 60 (internal intersection ≤ 40). When the edges really
+disappear — a mat, a line ending — nothing is seen beyond and the full slowdown stays.
+
+Measured: in `blobTouchingLine` (12 cm blob) the dip ramps 98 → 47 while nothing past the blob is in
+view, then the frame where the line past the blob first shows reads **60 (was 37)**, then 99–100.
+With a 4 cm blob the dip is 98 → 76 for 2 frames. `deadEndIntoMat` still ramps to 5. Test added to
+`blobTouchingLine` (12 cm and 4 cm): once ≥ 4 cm of line past the blob is within the view, tracking ≥ 60.

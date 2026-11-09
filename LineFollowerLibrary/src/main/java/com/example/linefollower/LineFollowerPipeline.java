@@ -750,6 +750,7 @@ public final class LineFollowerPipeline {
     private boolean pinCapActive;      // this frame's pin was capped
     private int     glarePinSide;      // ... to this side (-1 / +1)
     private int     traceFirstRow;     // nearest look-ahead row on the line in the last trace
+    private int     traceCutRow = -1;  // D2: first row of a dropped trailing cut stretch (-1 = none)
     // Extra look-ahead results (seeded trace without a base, glare rows).
     private int     traceEdgeSide;     // -1 / +1: nearest line row runs off the left / right frame edge
     private int     traceAccepted;     // look-ahead rows on the line
@@ -2519,6 +2520,15 @@ public final class LineFollowerPipeline {
             }
         }
 
+        // D2 bound (user decision, plan §13): the look-ahead dropped a stretch cut from a mass of
+        // the line's colour, but corridor slices beyond it still show the line's two edges on its
+        // continuation — a blob beside a line that goes on, not a line ending: slow down, but
+        // not below tracking 60.
+        if (trackFound && hardening && traceCutRow >= 0 && intersection > 40f
+                && continuity(centroidX, lastImgSlope, traceCutRow) >= 2) {
+            intersection = 40f;
+        }
+
         // Track-memory override: once the locked line has left the gate we report a
         // hard turn (100 %) regardless of the look-ahead geometry, signalling that
         // you have moved fully off the line and a new one is being sought.
@@ -2657,13 +2667,18 @@ public final class LineFollowerPipeline {
      * slices count as neither.
      */
     private int continuity(float col, float slope0) {
+        return continuity(col, slope0, Integer.MAX_VALUE);
+    }
+
+    /** As above, counting only slices farther than image row {@code beyondRow} (rows above it). */
+    private int continuity(float col, float slope0, int beyondRow) {
         final byte[] pix = curPixels;
         if (pix == null || cN < 2) return 0;
         final float expW = expectedLineWidth();
         if (expW <= 0f) return 0;
         final int runGap = runGapTol();
         float lastCol = col, slope = Math.max(-2f, Math.min(2f, slope0));
-        int lastRow = cRow[0], found = 0;
+        int lastRow = cRow[0], found = 0, seen = 0;
         for (int s = 1; s < cN; s++) {
             final int row = cRow[s];
             final float pc = lastCol + slope * (lastRow - row);
@@ -2673,8 +2688,9 @@ public final class LineFollowerPipeline {
             ensureRows(cR0[s], cR1[s]);
             if (detectSlice(pix, curBright, cR0[s], cR1[s], 1, pc, e, Math.min(half, imgW * 0.5f), 1.5f)) {
                 if (Math.abs(dCentre - pc) <= Math.max(0.5f * e, half * 0.6f)) {
-                    if (found > 0 && lastRow != row) slope = Math.max(-2f, Math.min(2f, (dCentre - lastCol) / (lastRow - row)));
-                    lastCol = dCentre; lastRow = row; found++;
+                    if (seen > 0 && lastRow != row) slope = Math.max(-2f, Math.min(2f, (dCentre - lastCol) / (lastRow - row)));
+                    lastCol = dCentre; lastRow = row; seen++;
+                    if (row < beyondRow) found++;
                 }
             }
         }
@@ -2924,6 +2940,7 @@ public final class LineFollowerPipeline {
         int    cutRows = 0, lastCleanRow = -1;
         double cleanLaW = 0, cleanLaM = 0;
         boolean inCutStretch = false;
+        int    cutStartRow = -1;
         float  prevSpan = 0f, prevExp = lastTrackWidthPx;
         final boolean d2 = filter && cfg.corridorMode && calibrated;
         final int haloRows = Math.max(4, Math.round(0.03f * imgH));
@@ -3049,6 +3066,7 @@ public final class LineFollowerPipeline {
                 // that widens gradually (a curve, perspective) is not one.
                 boolean isCut = false;
                 if (bestCut) {
+                    if (!inCutStretch && prevSpan <= 1.6f * prevExp + 4f) cutStartRow = row;
                     if (inCutStretch || prevSpan <= 1.6f * prevExp + 4f) { inCutStretch = true; isCut = true; }
                 } else {
                     inCutStretch = false;
@@ -3093,7 +3111,9 @@ public final class LineFollowerPipeline {
             }
         }
 
+        traceCutRow = -1;
         if (cutRows > 0 && d2) {
+            traceCutRow = cutStartRow;
             farRow = lastCleanRow; farRowEff = lastCleanRow;
             laW = lastCleanRow >= 0 ? cleanLaW : 0.0; laM = lastCleanRow >= 0 ? cleanLaM : 0.0;
         }

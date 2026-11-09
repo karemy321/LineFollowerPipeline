@@ -519,8 +519,25 @@ public class V3ScenarioTest {
         final Check c = new Check();
         MAIN_PAIRS.parallelStream().forEach(p -> {
             final double blobHalf = 0.04;
-            final Result r = runDistractor(objectDrive("blobTouchingLine", p, TAPE_W / 2 + blobHalf, 0.12, blobHalf));
-            centroidNearRef(c, r, 0.3);
+            for (double len : new double[]{0.12, 0.04}) {
+                final Result r = runDistractor(objectDrive("blobTouchingLine_" + Math.round(len * 100) + "cm", p,
+                        TAPE_W / 2 + blobHalf, len, blobHalf));
+                centroidNearRef(c, r, 0.3);
+                // User decision (plan §13): the cautious slowdown beside a blob of the line's colour
+                // is bounded — once the line is seen continuing clearly past the blob (≥ 4 cm of it
+                // within the view, which reaches ~30 cm ahead), tracking stays ≥ 60.
+                final double blobEnd = 0.55 + len;
+                for (int f = 0; f < 2; f++) {
+                    if (!r.has(f)) continue;
+                    for (int k = 0; k < r.frames(); k++) {
+                        final double x = r.sc.poses.get(k)[0];
+                        if (x + 0.30 >= blobEnd + 0.04 && r.ref[f][k].t >= 90) {
+                            c.that(r.test[f][k].t >= 60, r.sc.name, FMT[f], k,
+                                    "slowed below 60 although the line continues past the blob", r.test[f][k] + " / no blob " + r.ref[f][k]);
+                        }
+                    }
+                }
+            }
         });
         c.done("blobTouchingLine");
     }
