@@ -397,7 +397,18 @@ New FrameData fields (additive): `baseReconstructed`, `coasting`, `corridorCover
     run), steering unchanged — locally this is the same picture as a line running into a mat.
   - **Timing:** v3 0.56–0.60 ms mean vs v2 flags 1.03–1.11 (the checks convert only the rows they
     read; a first version converting the whole look-ahead cost 1.1 ms).
-- [ ] Phase 4 — AE/AWB lock in app
+- [x] Phase 4 — AE/AWB lock in app (built, **not yet tested on the robot**)
+  - Three settings in a new HUD row, all **OFF by default** and kept in SharedPreferences
+    (`robophone_v3`): **AE/AWB LOCK** (after calibration completes, `CONTROL_AE_LOCK` +
+    `CONTROL_AWB_LOCK` via `Camera2CameraControl.setCaptureRequestOptions`; unlocked on RECALIBRATE
+    and when unticked; a new camera session starts unlocked and is re-locked if calibrated),
+    **EV** button (0, −0.5, −1, −1.5, −2, +0.5, +1 → CameraX `setExposureCompensationIndex`, index
+    = EV / device step, clamped; nothing sent while EV = 0), **v3 HUD** (extra line: corridor
+    coverage, fit RMS, COAST / RECON / HOLD, masked %, AE state, EV).
+  - Defaults: no new camera call is made — the capture setup is exactly the previous one.
+    CameraX is 1.4.0, so the Camera2Interop path is used. Logcat: `AE/AWB LOCKED after
+    calibration`, `AE/AWB unlocked`, `EV compensation …`, plus the `PERF` line from Phase 2.
+  - `assembleDebug` succeeds with the v3 library (composite build).
 - [ ] Phase 5 — README v3, CHANGES_v3.md, timings, Blockly values re-checked
 
 ## 10. Notes from the code check before Phase 0 (2026-11-09)

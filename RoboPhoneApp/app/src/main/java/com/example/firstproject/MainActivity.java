@@ -1,6 +1,7 @@
 package com.example.firstproject;
 
 import android.Manifest;
+import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
 import android.graphics.Color;
 import android.graphics.ImageFormat;
@@ -15,6 +16,7 @@ import android.util.Size;
 import android.view.View;
 import android.view.WindowManager;
 import android.widget.Button;
+import android.widget.CheckBox;
 import android.widget.ProgressBar;
 import android.widget.SeekBar;
 import android.widget.TextView;
@@ -22,9 +24,13 @@ import android.widget.TextView;
 import androidx.annotation.NonNull;
 import androidx.annotation.OptIn;
 import androidx.appcompat.app.AppCompatActivity;
+import androidx.camera.camera2.interop.Camera2CameraControl;
 import androidx.camera.camera2.interop.Camera2Interop;
+import androidx.camera.camera2.interop.CaptureRequestOptions;
 import androidx.camera.camera2.interop.ExperimentalCamera2Interop;
+import androidx.camera.core.Camera;
 import androidx.camera.core.CameraSelector;
+import androidx.camera.core.ExposureState;
 import androidx.camera.core.ImageAnalysis;
 import androidx.camera.core.ImageProxy;
 import androidx.camera.core.Preview;
@@ -90,6 +96,26 @@ public class MainActivity extends AppCompatActivity {
 
     // ── CameraX ───────────────────────────────────────────────────────────────
     private PreviewView        previewView;
+    private Camera             camera;          // bound camera (null until bound)
+
+    // ── v3 test settings (all OFF by default, remembered in SharedPreferences) ──
+    // AE/AWB lock: after calibration completes, auto-exposure and auto-white-balance are locked
+    // (Camera2 CONTROL_AE_LOCK / CONTROL_AWB_LOCK through Camera2Interop), so a bright patch
+    // cannot make the camera darken the whole image; unlocked again on RECALIBRATE.
+    // EV: exposure compensation in EV (e.g. -1 keeps glossy tape from saturating).
+    // v3 HUD: an extra HUD line with corridor coverage / fit, coasting, rebuilt base, glare.
+    private static final String PREFS = "robophone_v3";
+    private static final float[] EV_STEPS = {0f, -0.5f, -1f, -1.5f, -2f, 0.5f, 1f};
+    private SharedPreferences prefs;
+    private volatile boolean aeLockEnabled = false;
+    private volatile boolean hudV3Enabled  = false;
+    private float            evSetting     = 0f;
+    private volatile boolean aeLocked      = false;   // lock currently applied to the camera
+    private boolean          wasCalibrated = false;   // camera thread: calibration edge detection
+    private CheckBox         cbAeLock, cbHudV3;
+    private Button           btnEv;
+    private TextView         tvV3;
+    private final Runnable   lockRunnable = () -> setAeAwbLock(true);
     private ExecutorService    cameraExecutor;
 
     // ── Vision pipeline ───────────────────────────────────────────────────────
@@ -129,6 +155,13 @@ public class MainActivity extends AppCompatActivity {
     private volatile float   hudPipeMs       = 0f;    // avg ms per frame inside the pipeline (last window)
     private volatile float   hudFrameMs      = 0f;    // avg ms per frame for the whole analyzer (last window)
     private volatile boolean hudPending      = false;
+    // v3 FrameData fields for the optional HUD line.
+    private volatile float   hudCorrCoverage = 0f;
+    private volatile float   hudCorrRms      = 0f;
+    private volatile boolean hudCoasting     = false;
+    private volatile boolean hudRecon        = false;
+    private volatile boolean hudHeld         = false;
+    private volatile float   hudMasked       = 0f;
 
     // Set by the RECALIBRATE button (UI thread), consumed on the camera thread so
     // the pipeline is only ever touched from one thread.
@@ -172,7 +205,43 @@ public class MainActivity extends AppCompatActivity {
         swatchLine     = findViewById(R.id.swatch_line);
         swatchFloor    = findViewById(R.id.swatch_floor);
         Button btnRecalibrate = findViewById(R.id.btn_recalibrate);
-        btnRecalibrate.setOnClickListener(v -> recalibrateRequested = true);
+        btnRecalibrate.setOnClickListener(v -> {
+            if (aeLocked) setAeAwbLock(false);       // re-learn with live exposure / white balance
+            recalibrateRequested = true;
+        });
+
+        // v3 test settings (defaults OFF → behaviour unchanged).
+        prefs         = getSharedPreferences(PREFS, MODE_PRIVATE);
+        aeLockEnabled = prefs.getBoolean("ae_lock", false);
+        hudV3Enabled  = prefs.getBoolean("hud_v3", false);
+        evSetting     = prefs.getFloat("ev", 0f);
+        cbAeLock = findViewById(R.id.cb_ae_lock);
+        cbHudV3  = findViewById(R.id.cb_hud_v3);
+        btnEv    = findViewById(R.id.btn_ev);
+        tvV3     = findViewById(R.id.tv_v3);
+        cbAeLock.setChecked(aeLockEnabled);
+        cbHudV3.setChecked(hudV3Enabled);
+        tvV3.setVisibility(hudV3Enabled ? View.VISIBLE : View.GONE);
+        btnEv.setText(evLabel());
+        cbAeLock.setOnCheckedChangeListener((b, on) -> {
+            aeLockEnabled = on;
+            prefs.edit().putBoolean("ae_lock", on).apply();
+            if (on && hudCalibrated) setAeAwbLock(true);
+            else if (!on && aeLocked) setAeAwbLock(false);
+        });
+        cbHudV3.setOnCheckedChangeListener((b, on) -> {
+            hudV3Enabled = on;
+            prefs.edit().putBoolean("hud_v3", on).apply();
+            tvV3.setVisibility(on ? View.VISIBLE : View.GONE);
+        });
+        btnEv.setOnClickListener(v -> {
+            int i = 0;
+            for (int k = 0; k < EV_STEPS.length; k++) if (EV_STEPS[k] == evSetting) i = k;
+            evSetting = EV_STEPS[(i + 1) % EV_STEPS.length];
+            prefs.edit().putFloat("ev", evSetting).apply();
+            btnEv.setText(evLabel());
+            applyExposureCompensation(true);
+        });
 
         // Every calibration and processing frame reports here (camera thread).
         pipeline.setFrameCallback(this::onPipelineFrame);
@@ -273,11 +342,14 @@ public class MainActivity extends AppCompatActivity {
         analysis.setAnalyzer(cameraExecutor, this::analyzeFrame);
 
         try {
-            provider.bindToLifecycle(
+            camera = provider.bindToLifecycle(
                     this,
                     CameraSelector.DEFAULT_BACK_CAMERA,
                     preview,
                     analysis);
+            aeLocked = false;                                   // a new session starts unlocked
+            applyExposureCompensation(false);                   // no call at all while EV = 0
+            if (aeLockEnabled && pipeline.isCalibrated()) setAeAwbLock(true);
             Log.i(TAG, "Camera bound successfully");
             runOnUiThread(() -> tvStatus.setText("Camera ready"));
         } catch (Exception e) {
@@ -461,6 +533,15 @@ public class MainActivity extends AppCompatActivity {
         hudFloorColor    = d.floorColorArgb;
         hudSeparation    = d.colorSeparation;
         hudThreshold     = d.threshold;
+        hudCorrCoverage  = d.corridorCoverage;
+        hudCorrRms       = d.corridorFitRms;
+        hudCoasting      = d.coasting;
+        hudRecon         = d.baseReconstructed;
+        hudHeld          = d.lineHeld;
+        hudMasked        = d.maskedFrac;
+        // Calibration just finished: lock exposure / white balance if enabled (UI thread).
+        if (d.isCalibrated && !wasCalibrated && aeLockEnabled) runOnUiThread(lockRunnable);
+        wasCalibrated = d.isCalibrated;
         hudFps           = pipeline.getFramesPerSecond();
         hudTotalFrames   = pipeline.getTotalFrames();
         hudElapsedSec    = pipeline.getElapsedSeconds();
@@ -602,7 +683,65 @@ public class MainActivity extends AppCompatActivity {
                 ? String.format(Locale.US, "thr: %s  sep: %.1fσ", thr, hudSeparation)
                 : String.format(Locale.US, "thr: %s  sep: --", thr));
 
+        if (hudV3Enabled) {
+            tvV3.setText(String.format(Locale.US,
+                    "corr %.2f  rms %.2f  %s%s%s mask %.0f%%  AE %s  EV %+.1f",
+                    hudCorrCoverage, hudCorrRms,
+                    hudCoasting ? "COAST " : "", hudRecon ? "RECON " : "",
+                    (hudHeld && !hudCoasting) ? "HOLD " : "",
+                    hudMasked * 100f, aeLocked ? "LOCKED" : "auto", evSetting));
+        }
+
         hudPending = false;
+    }
+
+    // =========================================================================
+    //  v3 camera settings (only used when enabled; defaults leave the camera untouched)
+    // =========================================================================
+
+    private String evLabel() {
+        return evSetting == 0f ? "EV 0" : String.format(Locale.US, "EV %+.1f", evSetting);
+    }
+
+    /**
+     * Lock (or unlock) auto-exposure and auto-white-balance through Camera2Interop. Called on
+     * the UI thread: after calibration completes (if the setting is on), and unlock on
+     * RECALIBRATE or when the setting is switched off.
+     */
+    @OptIn(markerClass = ExperimentalCamera2Interop.class)
+    private void setAeAwbLock(boolean lock) {
+        if (camera == null) return;
+        try {
+            final CaptureRequestOptions opts = new CaptureRequestOptions.Builder()
+                    .setCaptureRequestOption(CaptureRequest.CONTROL_AE_LOCK, lock)
+                    .setCaptureRequestOption(CaptureRequest.CONTROL_AWB_LOCK, lock)
+                    .build();
+            Camera2CameraControl.from(camera.getCameraControl()).setCaptureRequestOptions(opts);
+            aeLocked = lock;
+            Log.i(TAG, "AE/AWB " + (lock ? "LOCKED after calibration" : "unlocked"));
+        } catch (Exception e) {
+            Log.w(TAG, "AE/AWB lock failed: " + e.getMessage());
+        }
+    }
+
+    /**
+     * Apply the EV setting as CameraX exposure compensation (index = EV / step, clamped to the
+     * device range). With EV 0 nothing is sent unless {@code force} (the user changed it back).
+     */
+    private void applyExposureCompensation(boolean force) {
+        if (camera == null || (evSetting == 0f && !force)) return;
+        try {
+            final ExposureState es = camera.getCameraInfo().getExposureState();
+            if (!es.isExposureCompensationSupported()) { Log.w(TAG, "EV compensation not supported"); return; }
+            final float step = es.getExposureCompensationStep().floatValue();
+            final Range<Integer> range = es.getExposureCompensationRange();
+            int idx = step > 0f ? Math.round(evSetting / step) : 0;
+            idx = Math.max(range.getLower(), Math.min(range.getUpper(), idx));
+            camera.getCameraControl().setExposureCompensationIndex(idx);
+            Log.i(TAG, String.format(Locale.US, "EV compensation %+.1f -> index %d (step %.2f)", evSetting, idx, step));
+        } catch (Exception e) {
+            Log.w(TAG, "EV compensation failed: " + e.getMessage());
+        }
     }
 
     /** Status text while calibrating: phase, progress, and any problem detected. */

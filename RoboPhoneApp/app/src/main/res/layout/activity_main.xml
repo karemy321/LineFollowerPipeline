@@ -138,6 +138,54 @@
             android:gravity="center"
             android:paddingTop="2dp" />
 
+        <!-- Row 4b: v3 HUD line (shown only when "v3 HUD" is ticked) -->
+        <TextView
+            android:id="@+id/tv_v3"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text=""
+            android:textColor="#80D8FF"
+            android:textSize="11sp"
+            android:fontFamily="monospace"
+            android:gravity="center"
+            android:visibility="gone"
+            android:paddingTop="2dp" />
+
+        <!-- Row 4c: v3 test settings (all OFF by default; remembered between runs) -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:gravity="center_vertical"
+            android:orientation="horizontal"
+            android:paddingTop="2dp">
+
+            <CheckBox
+                android:id="@+id/cb_ae_lock"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="AE/AWB LOCK"
+                android:textColor="#AAAAAA"
+                android:textSize="11sp" />
+
+            <Button
+                android:id="@+id/btn_ev"
+                style="?android:attr/buttonBarButtonStyle"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:minHeight="32dp"
+                android:text="EV 0"
+                android:textColor="#AAAAAA"
+                android:textSize="11sp" />
+
+            <CheckBox
+                android:id="@+id/cb_hud_v3"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="v3 HUD"
+                android:textColor="#AAAAAA"
+                android:textSize="11sp" />
+        </LinearLayout>
+
         <!-- Row 5: learned colours + vision debug + recalibrate -->
         <LinearLayout
             android:layout_width="match_parent"
