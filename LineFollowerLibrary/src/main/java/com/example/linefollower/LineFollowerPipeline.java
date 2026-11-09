@@ -256,6 +256,37 @@ public final class LineFollowerPipeline {
         // in one step.
         public float frameIntervalMs = 0f;
 
+        // ── Corridor tracker (v3) ───────────────────────────────────────────
+        // When ON, a locked line is followed by a curve on the FLOOR, x = A + B·u + C·u²
+        // (u = distance beyond the scan strip, x = sideways position): every frame the line is
+        // looked for in corridorSlices thin slices along a corridor around the predicted curve,
+        // from the scan strip up to the far end of the look-ahead. Each slice needs both edges
+        // of the tape (floor→line and line→floor) at the expected width, so a highlight on the
+        // tape centre does not split it and a shadow without sharp edges is not taken for it.
+        // The slices update a small Kalman filter of the curve: the steering offset comes from
+        // A, the heading from B. If glare hides the near part, the line seen farther ahead
+        // still updates the heading and curvature while the near position comes from the
+        // filter's prediction. Acquisition, sharp corners, junctions, a line leaving the
+        // frame and frames with too little evidence use the v2 logic. OFF = v2 tracking.
+        public boolean corridorMode = true;
+
+        // Number of slices from the scan strip to the far end of the look-ahead (4 … 32).
+        public int corridorSlices = 12;
+
+        // Corridor width per slice, as a multiple of the expected (perspective-scaled) line
+        // width. It is never narrower than the line plus a margin, so both tape edges are seen.
+        public float corridorWidthMult = 2.2f;
+
+        // Slices on the line needed (when the near part is visible) to use the corridor result.
+        public int minChainSlices = 4;
+
+        // Below this confidence (coverage × fit quality, 0 … 1) the frame uses the v2 logic.
+        public float corridorMinConfidence = 0.35f;
+
+        // Scale of the Kalman process noise (how fast the curve may change between frames).
+        // Larger = follows sudden changes sooner, smooths less.
+        public float corridorProcessNoise = 1.0f;
+
         // ── Steering from the whole ⊥ (offset + heading) ─────────────────────
         // Steering = offset part + heading part:
         //   offset  = steerOffsetWeight × (line column in the H-ROI − calibrated
@@ -477,6 +508,14 @@ public final class LineFollowerPipeline {
         public boolean coasting;
         /** Fraction [0 … 1] of the pixels in the scan strip + look-ahead masked as glare. */
         public float maskedFrac;
+        /** Corridor tracker: fraction [0 … 1] of the near slices on the line this frame
+         *  (0 when the frame used the v2 logic). */
+        public float corridorCoverage;
+        /** Corridor tracker: RMS distance of the slices from the fitted curve, in line widths. */
+        public float corridorFitRms;
+        /** Corridor curve on the floor, x = curveA + curveB·u + curveC·u² (camera heights; u =
+         *  forward distance beyond the scan strip, x = sideways, + = right). 0 when not used. */
+        public float curveA, curveB, curveC;
     }
 
     // =========================================================================
@@ -636,6 +675,7 @@ public final class LineFollowerPipeline {
     private float   floorSpan;     // forward extent of the fitted points (camera heights)
     // Heading of the last trace (deg, before the calibrated zero) and its weight [0 … 1].
     private float   fitHeadingDeg, fitConfidence;
+    private double  fitC;          // curvature term C of the last heading fit (0 = straight fit)
     // Only the line up to this many H-ROI distances beyond the H-ROI is fitted: the
     // heading is wanted near the robot, and far rows may already be in the next turn.
     private static final float FIT_DEPTH = 1.5f;
@@ -685,6 +725,9 @@ public final class LineFollowerPipeline {
     private float   coastMs;
     private int     coastFrames;
     private float   lastHeadTerm;      // heading part of the steering on the last frame with the line
+    private boolean glarePinned;       // pinned while the strip was hidden (lock parked at the edge)
+    private int     glarePinSide;      // ... to this side (-1 / +1)
+    private int     traceFirstRow;     // nearest look-ahead row on the line in the last trace
     // Extra look-ahead results (seeded trace without a base, glare rows).
     private int     traceEdgeSide;     // -1 / +1: nearest line row runs off the left / right frame edge
     private int     traceAccepted;     // look-ahead rows on the line
@@ -954,6 +997,7 @@ public final class LineFollowerPipeline {
         }
 
         rowCx             = new float[height];
+        initCorridor(config, width, height);
         colWeight         = new int[width];
         colLevel          = new int[width];
         work              = new byte[width * height];
@@ -1181,6 +1225,7 @@ public final class LineFollowerPipeline {
                 if (wantHeading) {
                     final int vThr = lookAheadThreshold(pix, threshold, workBright);
                     traceLookAhead(pix, vThr, workBright, centroidX, false);
+                    if (cfg.corridorMode) calibrateCorridorWidths(pix, workBright, calibCount);
                     laPathCount = 0;   // calibration draws no look-ahead path
                     computeHeading();
                     if (fitConfidence >= 0.999f && calibHeadingCount < calibHeadingSamples.length) {
@@ -1204,6 +1249,7 @@ public final class LineFollowerPipeline {
                         final float h = calibHeadingSamples[calibHeadingCount / 2];
                         if (Math.abs(h) <= cfg.steerHeadingCalibMaxDeg) headingRefDeg = h;
                     }
+                    if (cfg.corridorMode) finishCorridorWidths(n);
                     calibrated   = true;
                 }
             } else {
@@ -1226,7 +1272,13 @@ public final class LineFollowerPipeline {
         lastFrameNs = now;
         maskActive  = cfg.glareMask;
         if (maskActive) setupGlareSource(vRoiTop, hRoiBot);
-        final byte[] pix = prepareWorkImage(vRoiTop, hRoiBot);
+        corrUsed = false;
+        relockedThisFrame = false;
+        corrPredValid = false;
+        // Corridor frames convert only the rows they read (lazy); v2 frames the whole look-ahead.
+        lazyRows = false;
+        final byte[] pix = (cfg.corridorMode && kfReady && trackAcquired && calibrated)
+                ? prepareLazy() : prepareWorkImage(vRoiTop, hRoiBot);
         runPipeline(pix, imgW, imgH, workBright);
         // Internal steering is [-100 … +100]; the output is scaled to [-50 … +50].
         result[0] = Math.round(output.steering * 0.5f);
@@ -2190,6 +2242,7 @@ public final class LineFollowerPipeline {
             final int need = doubtful ? cfg.trackRelockFrames : 3 * cfg.trackRelockFrames;
             if (better && ++relockCount >= need) {
                 relockCount = 0;                          // adopt the candidate (already in band*)
+                relockedThisFrame = true;
                 centroidVel = 0f;
             } else {
                 if (!better) relockCount = 0;
@@ -2199,6 +2252,16 @@ public final class LineFollowerPipeline {
         } else {
             relockCount = 0;
         }
+
+        // ── v3 corridor tracker (locked line, filter running) ──────────────────
+        if (cfg.corridorMode && kfReady && locked && filter && calibrated) {
+            final boolean sf = bandStart >= 0;
+            if (corridorFrame(pixels, bright, threshold, sf, sf ? (int) (bandMoment / bandSum) : -1)) {
+                output.threshold = threshold;
+                return;
+            }
+        }
+        ensureRows(vRoiTop, vRoiBot);              // v2 logic reads the whole look-ahead
 
         boolean trackFound;
         int     centroidX;
@@ -2229,6 +2292,7 @@ public final class LineFollowerPipeline {
             holdFrames       = 0;
             coastMs          = 0f;
             coastFrames      = 0;
+            glarePinned      = false;
         } else if (locked && glare) {
             // ── v3: the locked line is not visible in the strip (glare, shadow, object) ──
             // Follow it from the look-ahead instead, starting at the predicted column. The first
@@ -2239,10 +2303,21 @@ public final class LineFollowerPipeline {
                            -1, predX, W, true);
             traced = true;
             final float edgeZone = Math.max(lastTrackWidthPx, 0.12f * W);
-            final float recon    = reconstructBase(predX, gateHalf);
+            // After a pin under glare the lock gate is parked at the frame edge; with the strip
+            // blind, a consistent line ahead anywhere mid-image may be taken back.
+            float recon = reconstructBase(predX, glarePinned ? W : gateHalf);
+            // The corridor filter was tracking: a rebuilt base far from its prediction is a
+            // guess (sharp curve seen from afar) — coast instead.
+            if (!Float.isNaN(recon) && corrPredValid
+                    && Math.abs(recon - corrPredCol) > Math.max(lastTrackWidthPx, 3f * corrPredSd)) recon = Float.NaN;
+            // Taking the line back after a pin: only on the side it was pinned to.
+            if (!Float.isNaN(recon) && glarePinned && (recon - steerRefX) * glarePinSide < 0f) recon = Float.NaN;
             // Edge exits beat coasting: the line ahead runs off a frame edge, or its
             // reconstructed base lies in the edge zone → pin to that edge at once (as v2).
             int exitSide = traceAccepted > 0 ? traceEdgeSide : 0;
+            // The corridor filter was following a curve that itself reaches this frame edge at
+            // the row where the line touches it: the curve explains it, not an exit → no pin.
+            if (exitSide != 0 && corrPredValid && curveReachesEdge(traceFirstRow, exitSide, edgeZone)) exitSide = 0;
             if (exitSide == 0 && !Float.isNaN(recon)) {
                 if (recon < edgeZone) exitSide = -1;
                 else if (recon > W - edgeZone) exitSide = 1;
@@ -2251,6 +2326,7 @@ public final class LineFollowerPipeline {
             if (exitSide == 0 && !Float.isNaN(recon)) {
                 trackFound    = true;
                 reconstructed = true;
+                glarePinned   = false;
                 centroidX     = Math.max(0, Math.min(W - 1, Math.round(recon)));
                 float d = centroidX - lastCentroidX;
                 final float lim = 0.5f * Math.max(20f, slantW > 0f ? slantW : lastTrackWidthPx);
@@ -2285,6 +2361,8 @@ public final class LineFollowerPipeline {
                     forcedIntersection = 100f;
                     coastMs     = cfg.glareCoastMs;              // no new coast until the line is seen
                     coastFrames = cfg.glareCoastMaxFrames;
+                    glarePinned = true;
+                    glarePinSide = onRight ? 1 : -1;
                 }
                 if (lostFrames > cfg.trackLostGraceFrames) trackAcquired = false;
             }
@@ -2409,6 +2487,12 @@ public final class LineFollowerPipeline {
             steering = Math.max(-100f, Math.min(100f,
                     cfg.steerOffsetWeight * offsetTerm + (1f - used) * lastHeadTerm));
             intersection = lastIntersection + (100f - lastIntersection) * used;
+            // Line still seen farther ahead (ambiguous sharp curve): never faster than that
+            // observation allows (its lean, visible length and curvature).
+            if (traceAccepted > 0) {
+                intersection = Math.max(intersection, farIntersection(
+                        lookAheadValid ? lookAheadX : Float.NaN, farRow, floorFitC()));
+            }
         }
 
         // Line momentarily hidden mid-image: hold the last good outputs.
@@ -2437,6 +2521,26 @@ public final class LineFollowerPipeline {
         output.rejected     = rejectedBands;
         output.coasting     = coastingNow;
         output.reconstructed = reconstructed;
+        if (cfg.corridorMode) corridorSync(trackFound, centroidX, coastingNow || held, conf);
+    }
+
+    /** True when the filter's curve (as predicted this frame) is in the edge zone of that side at that row. */
+    private boolean curveReachesEdge(int row, int side, float edgeZone) {
+        if (row < vRoiTop || row >= vRoiBot || Float.isNaN(rowFwd[row])) return false;
+        final double u = rowFwd[row] - floorFwdH;
+        final double x = kxPred[0] + kxPred[1] * u + kxPred[2] * u * u;
+        final float col = (float) (imgW * 0.5f - 0.5f + x / rowScale[row]);
+        return side < 0 ? col <= edgeZone : col >= imgW - edgeZone;
+    }
+
+    /** Curvature C of a parabola through the last trace's floor points (NaN if too few). */
+    private float floorFitC() {
+        if (floorN < 6 || floorSpan < 0.3f * floorFwdH) return Float.NaN;
+        final double n = floorN, a12 = fU, a13 = fUU, a22 = fUU, a23 = fUUU, a33 = fUUUU;
+        final double det = n * (a22 * a33 - a23 * a23) - a12 * (a12 * a33 - a23 * a13) + a13 * (a12 * a23 - a22 * a13);
+        if (Math.abs(det) < 1e-12) return Float.NaN;
+        final double detC = n * (a22 * fUUX - fUX * a23) - a12 * (a12 * fUUX - fUX * a13) + fX * (a12 * a23 - a22 * a13);
+        return (float) (detC / det);
     }
 
     /**
@@ -2683,6 +2787,7 @@ public final class LineFollowerPipeline {
             // are following; otherwise this row has no usable track → count a gap.
             if (bestW >= minRowW && bestDist <= (seeking ? Math.max(vMaxDrift, seedHalf) : vMaxDrift)) {
                 if (traceAccepted == 0) {
+                    traceFirstRow = row;
                     // Nearest line row: does it run off a frame edge (line leaving the view)?
                     traceEdgeSide = bestS <= 0 ? -1 : (bestE >= W ? 1 : 0);
                 }
@@ -2747,6 +2852,781 @@ public final class LineFollowerPipeline {
         traceLaW     = laW;
         traceLaM     = laM;
         traceLaCount = laCount;
+    }
+
+    // =========================================================================
+    //  Corridor tracker (v3, Config.corridorMode)
+    // =========================================================================
+    //
+    // The locked line is a curve on the floor, x(u) = A + B·u + C·u² (camera heights; u =
+    // forward distance beyond the H-ROI row, x = sideways, + = right), with the state
+    // [A, B, C, dA, dB] in a small Kalman filter. Each frame:
+    //   1. predict the curve (constant drift of A and B, process noise per frame);
+    //   2. look for the line in cN slices, nearest first, each in a corridor around the
+    //      predicted position (re-centred on the curve as it is updated slice by slice; beyond
+    //      the fitted depth on the last two slices' direction); a slice needs a rising and a
+    //      falling edge at the expected width (detectSlice) — glare-masked columns are
+    //      interpolated, so a highlight on the tape centre is bridged;
+    //   3. update the filter with each slice within FIT_DEPTH (gated by the innovation; a far
+    //      slice that does not fit the near ones is a corner → v2). When the near part is
+    //      hidden, the far slices count as weak position measurements plus heading and
+    //      curvature measurements, and A comes from the prediction;
+    //   4. offset / heading / tracking from the curve with the v2 formulas.
+    // Anything it cannot handle returns false and the frame goes through the v2 logic, which
+    // then re-initialises the filter.
+
+    // Slice geometry (init): centre row, row range [r0, r1), forward distance u, floor scale.
+    private int     cN, cFitSlices;
+    private int[]   cRow, cR0, cR1;
+    private float[] cU, cScale, cLaW, cGain;
+    // Per-frame slice results.
+    private static final byte SL_MISS = 0, SL_OBS = 1, SL_UNKNOWN = 2, SL_REJ = 3, SL_SKIP = 4;
+    private byte[]  cState;
+    private float[] cCol, cWid;
+    private int[]   cClip;
+    // Calibration samples of measured / expected slice width (for cGain).
+    private float[] cGainSamples;
+    private int[]   cGainCount;
+    // Profile buffers for detectSlice (frame width).
+    private float[] prof, profS, profPf, profG;
+    private final float[] riseP = new float[32], riseG = new float[32], fallP = new float[32], fallG = new float[32];
+    // detectSlice results.
+    private float   dCentre, dWidth;
+    private boolean dUnknown;
+    private int     dClip;
+    // Kalman filter (state x, covariance P row-major 5×5) and scratch.
+    private final double[] kx = new double[5], kP = new double[25], kF = new double[25], kT = new double[25];
+    private final double[] kPh = new double[5];
+    private boolean kfReady;
+    private double  kfLastNu2S;
+    // Lazy line-ness rows: a row is converted at most once per frame (rowStamp == frameStamp).
+    private int[]   rowStamp;
+    private int     frameStamp;
+    private boolean lazyRows;
+    // Corridor outputs of the current frame.
+    private boolean corrUsed;
+    private float   corrCoverage, corrRms;
+    private boolean relockedThisFrame;
+    // The filter's predicted near column this frame (set when the corridor ran), for the v2
+    // fallback: a base rebuilt by the v2 logic must agree with it.
+    private boolean corrPredValid;
+    private float   corrPredCol, corrPredSd;
+    private final double[] kxPred = new double[5];
+
+    /** Slice geometry from the floor model; called from init(). */
+    private void initCorridor(Config config, int width, int height) {
+        cN = Math.max(4, Math.min(32, config.corridorSlices));
+        cRow = new int[cN]; cR0 = new int[cN]; cR1 = new int[cN];
+        cU = new float[cN]; cScale = new float[cN]; cLaW = new float[cN]; cGain = new float[cN];
+        cState = new byte[cN]; cCol = new float[cN]; cWid = new float[cN]; cClip = new int[cN];
+        cGainSamples = new float[cN * Math.max(1, config.calibFrames)];
+        cGainCount = new int[cN];
+        prof = new float[width]; profS = new float[width]; profPf = new float[width + 1]; profG = new float[width];
+        rowStamp = new int[height];
+        frameStamp = 0;
+        java.util.Arrays.fill(cGain, 1f);
+        final int hc = Math.min(height - 1, (hRoiTop + hRoiBot) / 2);
+        float uMax = 0f;
+        for (int r = vRoiTop; r < vRoiBot && r < height; r++) {
+            if (!Float.isNaN(rowFwd[r])) { uMax = rowFwd[r] - floorFwdH; break; }
+        }
+        int prevRow = hc;
+        int fit = 0;
+        for (int s = 0; s < cN; s++) {
+            int row;
+            if (s == 0) {
+                row = hc;
+                cR0[s] = Math.max(hRoiTop, hc - 3);
+                cR1[s] = Math.min(hRoiBot, hc + 3);
+            } else {
+                final float want = floorFwdH + uMax * s / (cN - 1);
+                row = vRoiBot - 1;
+                for (int r = vRoiBot - 1; r >= vRoiTop; r--) {
+                    if (Float.isNaN(rowFwd[r])) break;
+                    row = r;
+                    if (rowFwd[r] >= want) break;
+                }
+                if (row >= prevRow) row = Math.max(vRoiTop, prevRow - 1);
+                cR0[s] = Math.max(vRoiTop, row - 1);
+                cR1[s] = Math.min(vRoiBot, row + 2);
+            }
+            cRow[s] = row;
+            cU[s] = Float.isNaN(rowFwd[row]) ? uMax : rowFwd[row] - floorFwdH;
+            cScale[s] = Float.isNaN(rowScale[row]) ? floorScaleH : rowScale[row];
+            if (cU[s] <= FIT_DEPTH * floorFwdH) fit = s + 1;
+            prevRow = row;
+        }
+        cFitSlices = Math.max(2, fit);
+        // Look-ahead weight of the V-ROI rows each slice stands for (rows halfway to its
+        // neighbours), the same far-weighting as the v2 look-ahead value.
+        for (int s = 1; s < cN; s++) {
+            final int lo = s + 1 < cN ? (cRow[s] + cRow[s + 1] + 1) / 2 : vRoiTop;
+            final int hi = (cRow[s] + cRow[s - 1] + 1) / 2;
+            double w = 0;
+            for (int r = Math.max(vRoiTop, lo); r < Math.min(vRoiBot, hi); r++) w += vRoiBot - r;
+            cLaW[s] = (float) Math.max(1.0, w);
+        }
+        kfReady = false;
+    }
+
+    // ── Lazy line-ness image ────────────────────────────────────────────────
+
+    /**
+     * Corridor frames read only the strip and the slice rows, so the line-ness image is
+     * converted per row on demand. Returns the work image (rows not converted yet are filled by
+     * {@link #ensureRows}); same polarity rules as {@link #prepareWorkImage}.
+     */
+    private byte[] prepareLazy() {
+        lazyRows = true;
+        frameStamp++;
+        final boolean project = cfg.autoColor && colorReady;
+        if (!project) {
+            workBright = cfg.trackIsBright;
+            if (srcFormat != FMT_ARGB) { lazyRows = false; return srcY; }   // luma needs no conversion
+        } else {
+            workBright = true;
+        }
+        ensureRows(hRoiTop, hRoiBot);
+        return work;
+    }
+
+    /** Convert rows [r0, r1) of the work image if not done yet this frame (lazy mode only). */
+    private void ensureRows(int r0, int r1) {
+        if (!lazyRows) return;
+        final int[] st = rowStamp;
+        final int stamp = frameStamp;
+        int a = r0;
+        while (a < r1) {
+            if (st[a] == stamp) { a++; continue; }
+            int b = a;
+            while (b < r1 && st[b] != stamp) { st[b] = stamp; b++; }
+            convertRows(a, b);
+            a = b;
+        }
+    }
+
+    /** prepareWorkImage's conversion for rows [r0, r1) into {@link #work}. */
+    private void convertRows(int r0, int r1) {
+        final int W = imgW;
+        final byte[] out = work;
+        final boolean project = cfg.autoColor && colorReady;
+        if (!project) {                                    // ARGB luma (gray luma is the Y plane)
+            final int[] src = srcArgb;
+            for (int i = r0 * W, end = r1 * W; i < end; i++) {
+                final int c = src[i];
+                out[i] = (byte) ((77 * ((c >> 16) & 0xFF) + 150 * ((c >> 8) & 0xFF) + 29 * (c & 0xFF)) >> 8);
+            }
+        } else if (srcFormat == FMT_GRAY) {
+            final byte[] ys = srcY;
+            final int ky = kY, off = kGrayOff;
+            for (int i = r0 * W, end = r1 * W; i < end; i++) out[i] = clampByte((ky * (ys[i] & 0xFF) + off) >> 10);
+        } else if (srcFormat == FMT_YUV420) {
+            final byte[] ys = srcY, us = srcU, vs = srcV;
+            final int ky = kY, ku = kU, kv = kV, off = k0, cw = uvW;
+            for (int row = r0; row < r1; row++) {
+                final int base = row * W, uvBase = (row >> 1) * cw;
+                for (int col = 0; col < W; col++) {
+                    final int uvi = uvBase + (col >> 1);
+                    out[base + col] = clampByte((ky * (ys[base + col] & 0xFF)
+                            + ku * (us[uvi] & 0xFF) + kv * (vs[uvi] & 0xFF) + off) >> 10);
+                }
+            }
+        } else {
+            final int[] src = srcArgb;
+            final int kr = kR, kg = kG, kb = kB, off = kC;
+            for (int i = r0 * W, end = r1 * W; i < end; i++) {
+                final int c = src[i];
+                out[i] = clampByte((kr * ((c >> 16) & 0xFF) + kg * ((c >> 8) & 0xFF) + kb * (c & 0xFF) + off) >> 10);
+            }
+        }
+    }
+
+    // ── Slice detector: edge pair at the expected width ─────────────────────
+
+    /**
+     * Look for the line in rows [r0, r1) (every rStep-th) within predCol ± half: the rows are
+     * averaged into a line-ness profile (line = high), glare-masked columns are filled by
+     * interpolation from their neighbours (a saturated tape centre is bridged), the profile is
+     * smoothed and its rising and falling edges found. The line is the rise / fall PAIR whose
+     * distance matches expPx (0.6 … maxWidMult ×) with a line-like inside, scored by edge
+     * strength, width match and distance from predCol. Inner edges of a highlight on the tape
+     * centre give pairs far narrower than the tape and are not chosen. A line cut by the frame
+     * edge is accepted with one edge (dClip = −1 / +1). Writes dCentre / dWidth; sets dUnknown
+     * when most of the predicted span is glare.
+     */
+    private boolean detectSlice(byte[] pix, boolean bright, int r0, int r1, int rStep,
+                                float predCol, float expPx, float half, float maxWidMult) {
+        dUnknown = false;
+        dClip = 0;
+        final int W = imgW;
+        final int lo = Math.max(0, (int) Math.floor(predCol - half));
+        final int hi = Math.min(W, (int) Math.ceil(predCol + half) + 1);
+        if (hi - lo < 6 || r1 <= r0) return false;
+        final float[] p = prof, ps = profS, pf = profPf, g = profG;
+        final boolean mask = maskActive;
+        final byte[] gs = glareSrc;
+        final int gl = glareLim;
+        int known = 0;
+        for (int c = lo; c < hi; c++) {
+            int s = 0, n = 0;
+            for (int r = r0; r < r1; r += rStep) {
+                final int i = r * W + c;
+                if (mask && (gs[i] & 0xFF) >= gl) continue;
+                final int v = pix[i] & 0xFF;
+                s += bright ? v : 255 - v;
+                n++;
+            }
+            if (n > 0) { p[c] = (float) s / n; known++; } else p[c] = Float.NaN;
+        }
+        // Unknown when the predicted line span (or most of the corridor) is glare.
+        {
+            final int a = Math.max(lo, Math.round(predCol - 0.5f * expPx)), b = Math.min(hi, Math.round(predCol + 0.5f * expPx) + 1);
+            int k = 0;
+            for (int c = a; c < b; c++) if (!Float.isNaN(p[c])) k++;
+            if ((b > a && 2 * k < b - a) || 3 * known < hi - lo) { dUnknown = true; return false; }
+        }
+        // Fill glare columns by interpolation.
+        int last = -1;
+        for (int c = lo; c < hi; c++) {
+            if (Float.isNaN(p[c])) continue;
+            if (last < 0) { for (int q = lo; q < c; q++) p[q] = p[c]; }
+            else if (c - last > 1) {
+                final float a = p[last], d = (p[c] - a) / (c - last);
+                for (int q = last + 1; q < c; q++) p[q] = a + d * (q - last);
+            }
+            last = c;
+        }
+        for (int q = last + 1; q < hi; q++) p[q] = p[last];
+        // Box smoothing (radius rs) via prefix sums.
+        final int rs = Math.max(1, Math.round(expPx / 8f));
+        pf[lo] = 0f;
+        for (int c = lo; c < hi; c++) pf[c + 1] = pf[c] + p[c];
+        float pmin = Float.MAX_VALUE, pmax = -Float.MAX_VALUE;
+        for (int c = lo; c < hi; c++) {
+            final int a = Math.max(lo, c - rs), b = Math.min(hi, c + rs + 1);
+            final float v = (pf[b] - pf[a]) / (b - a);
+            ps[c] = v;
+            if (v < pmin) pmin = v;
+            if (v > pmax) pmax = v;
+        }
+        final float contrast = pmax - pmin;
+        if (contrast < Math.max(8f, 0.75f * cfg.minContrast)) return false;
+        // Edges: central difference of the smoothed profile; a clean step of contrast K gives
+        // a peak of about 2K / (2·rs + 1). Rises and falls at ≥ half of that for this contrast.
+        final float thrG = contrast / (2 * rs + 1);
+        int nr = 0, nf = 0;
+        g[lo] = 0f; g[hi - 1] = 0f;
+        for (int c = lo + 1; c < hi - 1; c++) g[c] = ps[c + 1] - ps[c - 1];
+        for (int c = lo + 2; c < hi - 2; c++) {
+            final float v = g[c];
+            if (v >= thrG && v >= g[c - 1] && v > g[c + 1] && nr < riseP.length) {
+                riseP[nr] = c + subPeak(g[c - 1], v, g[c + 1]); riseG[nr++] = v;
+            } else if (v <= -thrG && v <= g[c - 1] && v < g[c + 1] && nf < fallP.length) {
+                fallP[nf] = c + subPeak(-g[c - 1], -v, -g[c + 1]); fallG[nf++] = -v;
+            }
+        }
+        final float sig = Math.max(expPx, 0.5f * half);
+        final float minW = 0.6f * expPx, maxW = maxWidMult * expPx;
+        final float inner = pmin + 0.35f * contrast;
+        final float norm = 2f * contrast / (2 * rs + 1);
+        float best = 0f;
+        for (int i = 0; i < nr; i++) {
+            for (int j = 0; j < nf; j++) {
+                final float wid = fallP[j] - riseP[i];
+                if (wid < minW || wid > maxW) continue;
+                if (meanRaw(riseP[i], fallP[j], lo, hi) < inner) continue;
+                final float c = 0.5f * (riseP[i] + fallP[j]);
+                final float dz = (c - predCol) / sig;
+                final float sc = (riseG[i] + fallG[j]) / (2f * norm)
+                        * (float) Math.sqrt(Math.min(wid, expPx) / Math.max(wid, expPx))
+                        * (float) Math.exp(-0.5 * dz * dz);
+                if (sc > best) { best = sc; dCentre = c; dWidth = wid; dClip = 0; }
+            }
+        }
+        // Line cut by the frame edge: one edge, line-like up to the edge.
+        if (lo == 0 && ps[0] >= pmin + 0.6f * contrast) {
+            for (int j = 0; j < nf; j++) {
+                final float wid = fallP[j] + 0.5f;
+                if (wid < 0.25f * expPx || wid > maxW) continue;
+                final float c = 0.5f * (fallP[j] - 0.5f);
+                final float dz = (c - predCol) / sig;
+                final float sc = 0.8f * fallG[j] / norm * (float) Math.exp(-0.5 * dz * dz);
+                if (sc > best) { best = sc; dCentre = c; dWidth = wid; dClip = -1; }
+            }
+        }
+        if (hi == W && ps[W - 1] >= pmin + 0.6f * contrast) {
+            for (int i = 0; i < nr; i++) {
+                final float wid = W - 0.5f - riseP[i];
+                if (wid < 0.25f * expPx || wid > maxW) continue;
+                final float c = 0.5f * (riseP[i] + W - 0.5f);
+                final float dz = (c - predCol) / sig;
+                final float sc = 0.8f * riseG[i] / norm * (float) Math.exp(-0.5 * dz * dz);
+                if (sc > best) { best = sc; dCentre = c; dWidth = wid; dClip = 1; }
+            }
+        }
+        return best > 0.25f;
+    }
+
+    private static float subPeak(float a, float b, float c) {
+        final float d = a - 2f * b + c;
+        return Math.abs(d) < 1e-6f ? 0f : Math.max(-0.5f, Math.min(0.5f, 0.5f * (a - c) / d));
+    }
+
+    /** Mean of the raw (filled) profile between two sub-pixel positions. */
+    private float meanRaw(float a, float b, int lo, int hi) {
+        final int i0 = Math.max(lo, (int) Math.ceil(a)), i1 = Math.min(hi, (int) Math.floor(b) + 1);
+        if (i1 <= i0) return Float.MAX_VALUE;
+        float s = 0f;
+        for (int c = i0; c < i1; c++) s += prof[c];
+        return s / (i1 - i0);
+    }
+
+    // ── Kalman filter on [A, B, C, dA, dB] ──────────────────────────────────
+
+    private void kfInit(double a, double b, double c, double wf) {
+        java.util.Arrays.fill(kP, 0.0);
+        kx[0] = a; kx[1] = b; kx[2] = c; kx[3] = 0; kx[4] = 0;
+        kP[0] = sq(0.3 * wf); kP[6] = sq(0.15); kP[12] = sq(0.4); kP[18] = sq(0.1 * wf); kP[24] = sq(0.03);
+        kfReady = true;
+    }
+
+    /** x ← F x, P ← F P Fᵀ + Q; dt in frames (30 fps = 1). */
+    private void kfPredict(double dt, double wf) {
+        final double damp = 0.9;
+        kx[0] += kx[3] * dt; kx[1] += kx[4] * dt; kx[3] *= damp; kx[4] *= damp;
+        final double[] F = kF, P = kP, T = kT;
+        java.util.Arrays.fill(F, 0.0);
+        F[0] = 1; F[3] = dt; F[6] = 1; F[9] = dt; F[12] = 1; F[18] = damp; F[24] = damp;
+        for (int i = 0; i < 5; i++) for (int j = 0; j < 5; j++) {
+            double s = 0; for (int k = 0; k < 5; k++) s += F[i * 5 + k] * P[k * 5 + j]; T[i * 5 + j] = s;
+        }
+        for (int i = 0; i < 5; i++) for (int j = 0; j < 5; j++) {
+            double s = 0; for (int k = 0; k < 5; k++) s += T[i * 5 + k] * F[j * 5 + k]; P[i * 5 + j] = s;
+        }
+        final double q = cfg.corridorProcessNoise * dt;
+        // Steady sideways motion is carried by dA; A itself changes little between frames.
+        P[0] += q * sq(0.1 * wf); P[6] += q * sq(0.06); P[12] += q * sq(0.15);
+        P[18] += q * sq(0.05 * wf); P[24] += q * sq(0.03);
+    }
+
+    /** Variance of h·x for h = (h0, h1, h2, 0, 0). */
+    private double kfVar(double h0, double h1, double h2) {
+        final double[] P = kP;
+        return h0 * (P[0] * h0 + P[1] * h1 + P[2] * h2)
+             + h1 * (P[5] * h0 + P[6] * h1 + P[7] * h2)
+             + h2 * (P[10] * h0 + P[11] * h1 + P[12] * h2);
+    }
+
+    /**
+     * Scalar update with z = h·x + noise(R), h = (h0, h1, h2, 0, 0). Rejected when the innovation
+     * is beyond gate² (in units of its variance); between 2² and gate² the noise is inflated
+     * (Huber). Returns true if used; kfLastNu2S = normalised innovation².
+     */
+    private boolean kfUpdate(double h0, double h1, double h2, double z, double R, double gate2) {
+        final double[] P = kP, Ph = kPh, x = kx;
+        for (int i = 0; i < 5; i++) Ph[i] = P[i * 5] * h0 + P[i * 5 + 1] * h1 + P[i * 5 + 2] * h2;
+        final double nu = z - (h0 * x[0] + h1 * x[1] + h2 * x[2]);
+        double S = h0 * Ph[0] + h1 * Ph[1] + h2 * Ph[2] + R;
+        final double n2 = nu * nu / S;
+        kfLastNu2S = n2;
+        if (n2 > gate2) return false;
+        if (n2 > 4.0) S = h0 * Ph[0] + h1 * Ph[1] + h2 * Ph[2] + R * n2 / 4.0;
+        for (int i = 0; i < 5; i++) x[i] += Ph[i] / S * nu;
+        for (int i = 0; i < 5; i++) for (int j = 0; j < 5; j++) P[i * 5 + j] -= Ph[i] * Ph[j] / S;
+        return true;
+    }
+
+    // ── One corridor frame ──────────────────────────────────────────────────
+
+    /**
+     * Track the locked line with the corridor. Returns false (nothing written) when the frame
+     * must use the v2 logic: no line in any slice, a corner, too little evidence, or a relock.
+     */
+    private boolean corridorFrame(byte[] pixels, boolean bright, int threshold, boolean stripFound, int stripCx) {
+        final int W = imgW;
+        final float halfW = W * 0.5f, cx0 = W * 0.5f - 0.5f;
+        final float expW = expectedLineWidth();
+        if (expW <= 0f || floorScaleH <= 0f || relockedThisFrame) return false;
+        final double wf = expW * floorScaleH;
+        final double dt = frameDtMs > 0f ? Math.max(0.3, Math.min(3.0, frameDtMs / 33.333)) : 1.0;
+        kfPredict(dt, wf);
+        corrPredCol = (float) (W * 0.5f - 0.5f + kx[0] / floorScaleH);
+        corrPredSd  = (float) (Math.sqrt(Math.max(0.0, kP[0])) / floorScaleH);
+        corrPredValid = true;
+        System.arraycopy(kx, 0, kxPred, 0, 5);
+        final int runGap = runGapTol();
+        final float nearU = 0.35f * FIT_DEPTH * floorFwdH;
+        final float slantPrev = Math.max(-3f, Math.min(3f, lastImgSlope));
+
+        int obs = 0, obsFit = 0, rejFit = 0, rejSign = 0, misses = 0, firstObs = -1, lastObs = -1, prevObs = -1;
+        boolean chainEnded = false;
+        int nearObs = 0, expectFit = 0;
+        boolean farOnly = false;
+        double rss = 0;
+        int rssN = 0;
+        for (int s = 0; s < cN; s++) {
+            cState[s] = SL_SKIP;
+            if (s < cFitSlices) expectFit++;
+            final double u = cU[s];
+            // Predicted floor position: the filter (updated by the slices below) within the
+            // fitted depth; farther out, the direction of the last two line slices.
+            double xp = kx[0] + kx[1] * u + kx[2] * u * u;
+            double sd = Math.sqrt(Math.max(0.0, kfVar(1, u, u * u)));
+            if (s >= cFitSlices && prevObs >= 0 && lastObs > prevObs) {
+                final double x1 = (cCol[prevObs] - cx0) * cScale[prevObs], x2 = (cCol[lastObs] - cx0) * cScale[lastObs];
+                final double du = cU[lastObs] - cU[prevObs];
+                if (du > 1e-6) { xp = x2 + (x2 - x1) / du * (u - cU[lastObs]); sd = 0.5 * wf; }
+            }
+            final float colPred = (float) (cx0 + xp / cScale[s]);
+            // Expected width here (perspective, calibrated gain) and slant in the image.
+            final float expPx = expW * floorScaleH / cScale[s] * cGain[s];
+            float sl = slantPrev;
+            if (s > 0 && lastObs >= 0 && cRow[lastObs] != cRow[s]) sl = (colPred - cCol[lastObs]) / (cRow[lastObs] - cRow[s]);
+            sl = Math.max(-3f, Math.min(3f, sl));
+            final float slK = (float) Math.sqrt(1f + sl * sl);
+            final float expS = expPx * slK + (cR1[s] - cR0[s] - 1) * Math.abs(sl);
+            float half = Math.max(cfg.corridorWidthMult * 0.5f * expS, 0.5f * expS + 2 * runGap)
+                       + (float) (3.0 * sd / cScale[s]);
+            half = Math.min(half, halfW);
+            if (colPred + half < 0 || colPred - half > W) { cState[s] = SL_MISS; if (obs > 0 && ++misses >= 2) { chainEnded = true; break; } continue; }
+            ensureRows(cR0[s], cR1[s]);
+            boolean found = detectSlice(pixels, bright, cR0[s], cR1[s], 1, colPred, expS, half, 1.5f);
+            if (!found && s == 0 && !dUnknown && stripFound && Math.abs(stripCx - colPred) <= half) {
+                dCentre = stripCx; dWidth = lastTrackWidthPx; dClip = 0; found = true;   // v2 band as slice 0
+            }
+            if (dUnknown) { cState[s] = SL_UNKNOWN; continue; }
+            if (!found) { cState[s] = SL_MISS; if (obs > 0 && ++misses >= 2) { chainEnded = true; break; } continue; }
+            misses = 0;
+            cCol[s] = dCentre; cWid[s] = dWidth / slK; cClip[s] = dClip;
+            if (firstObs < 0) { firstObs = s; farOnly = u > nearU; }
+            if (s < cFitSlices) {
+                final double xm = (dCentre - cx0) * cScale[s];
+                final double sp = Math.max(s == 0 ? 0.5 : 0.7, (s == 0 ? 0.04 : 0.08) * expPx) * cScale[s];
+                double R = sp * sp;
+                if (farOnly) {
+                    // Near part hidden: the position of a far slice says little about where the
+                    // line meets the strip (a curve) — weak, growing with the distance.
+                    final double weak = Math.max(5.0 * sp, 0.5 * wf * u / Math.max(1e-3, floorFwdH));
+                    R = weak * weak;
+                }
+                final boolean ok = kfUpdate(1, u, u * u, xm, R, 16.0);
+                // The near line where the filter did not expect it (a jump, a new lock): the
+                // v2 logic decides (gate, line left), then the filter restarts from it.
+                if (!farOnly && u <= nearU && kfLastNu2S > 4.0) return false;
+                if (ok) {
+                    final double res = xm - (kx[0] + kx[1] * u + kx[2] * u * u);
+                    rss += res * res; rssN++;
+                    obsFit++;
+                    if (u <= nearU) nearObs++;
+                } else {
+                    cState[s] = SL_REJ;
+                    rejFit++;
+                    rejSign += xm > xp ? 1 : -1;
+                    continue;
+                }
+            }
+            cState[s] = SL_OBS;
+            obs++;
+            prevObs = lastObs;
+            lastObs = s;
+        }
+
+        // ── Decide whether this frame is the corridor's ──
+        if (obs == 0) return false;
+        // Corner / junction: the near part fits, farther slices do not (all on one side).
+        if (rejFit >= 2 && Math.abs(rejSign) == rejFit && obsFit >= 2) return false;
+        if (farOnly) {
+            if (obsFit < 1) return false;           // one far slice + the prediction is enough
+            // Heading and curvature of the far part, measured where it is seen.
+            corridorFarMeasurements(cx0, wf);
+            if (Math.sqrt(Math.max(0.0, kP[0])) > 1.0 * wf) return false;    // near position too uncertain
+        } else {
+            // The line ends inside the corridor (corner, junction, dead end, line leaving the
+            // frame) or too few slices: the v2 logic handles it.
+            if (chainEnded || obs < Math.max(2, cfg.minChainSlices)) return false;
+        }
+        final int unknownFit = countState(SL_UNKNOWN, cFitSlices);
+        final float coverage = Math.min(1f, obsFit / (float) Math.max(1, expectFit - unknownFit));
+        final double rms = rssN > 0 ? Math.sqrt(rss / rssN) : 0.0;
+        final float fitQ = (float) Math.max(0.0, Math.min(1.0, 1.5 - 2.0 * rms / Math.max(1e-6, 0.5 * wf)));
+        if (!farOnly && coverage * fitQ < cfg.corridorMinConfidence) return false;
+
+        // ── Outputs from the curve (v2 formulas) ──
+        final float colA = (float) (cx0 + kx[0] / floorScaleH);
+        final float edgeZone = Math.max(lastTrackWidthPx, 0.12f * W);
+        boolean pin = false;
+        int pinSide = 0;
+        if (farOnly) {
+            // Edge exits beat the prediction: the near position in the edge zone, or the nearest
+            // line slice cut by the frame edge.
+            if (colA < edgeZone) { pin = true; pinSide = -1; }
+            else if (colA > W - edgeZone) { pin = true; pinSide = 1; }
+            else if (cClip[firstObs] != 0) { pin = true; pinSide = cClip[firstObs]; }
+        }
+        if (pin) {
+            kfReady = false;
+            final boolean onRight = pinSide > 0;
+            final int cxp = onRight ? Math.min(W - 1, Math.round(steerRefX + halfW)) : Math.max(0, Math.round(steerRefX - halfW));
+            lastCentroidX = cxp; centroidVel = 0f; lostFrames++;
+            coastMs = cfg.glareCoastMs; coastFrames = cfg.glareCoastMaxFrames;
+            if (lostFrames > cfg.trackLostGraceFrames) trackAcquired = false;
+            publishCorridorPath(false, cx0);
+            writeOutput(onRight ? 100f : -100f, 100f, -1, false, 0f, 0f, 0f, 0f, 0f, false, false, false, coverage, (float) (rms / wf));
+            return true;
+        }
+        final int centroidX = Math.max(0, Math.min(W - 1, Math.round(colA)));
+        // Lock state, as when the strip finds the line.
+        float d = centroidX - lastCentroidX;
+        final float lim = 0.5f * Math.max(20f, lastTrackWidthPx);
+        d = Math.max(-lim, Math.min(lim, d));
+        centroidVel = 0.5f * centroidVel + 0.5f * d;
+        lastCentroidX = centroidX;
+        if (cState[0] == SL_OBS && cClip[0] == 0) lastTrackWidthPx = Math.max(1f, cWid[0]);
+        trackAcquired = true; lostFrames = 0; holdFrames = 0; coastMs = 0f; coastFrames = 0;
+        // Near image slope (columns per row upward) for the next frame's width test.
+        if (lastObs > firstObs) {
+            final int a = firstObs, b = nextObs(firstObs);
+            if (b > a && cRow[a] != cRow[b]) lastImgSlope = (cCol[b] - cCol[a]) / (cRow[a] - cRow[b]);
+        }
+
+        final float offsetTerm = (centroidX - steerRefX) / halfW * 100f;
+        float headingTerm = 0f, headingDeg = 0f, conf = 0f;
+        if (cfg.steerHeadingWeight != 0f) {
+            final float rowsK = Math.min(1f, (obsFit - 1) / 3f);
+            float uMaxObs = 0f;
+            for (int s = 0; s < cFitSlices; s++) if (cState[s] == SL_OBS) uMaxObs = cU[s];
+            final float span = Math.min(1f, uMaxObs / Math.max(1e-3f, 0.5f * floorFwdH));
+            conf = Math.max(0f, rowsK) * span * fitQ;
+            if (conf > 0f) {
+                headingDeg = (float) Math.toDegrees(Math.atan(kx[1])) - headingRefDeg;
+                final double psi = Math.toRadians(Math.max(-75f, Math.min(75f, headingDeg)));
+                headingTerm = (float) (100.0 * cfg.steerLookAhead * floorFwdH * Math.tan(psi) / Math.max(1e-6, floorScaleH * halfW));
+            }
+        }
+        final float steering = Math.max(-100f, Math.min(100f,
+                cfg.steerOffsetWeight * offsetTerm + cfg.steerHeadingWeight * conf * headingTerm));
+
+        // Tracking: far-weighted look-ahead position + visible road length (v2), the far row
+        // refined between the last line slice and the next one.
+        double laW = 0, laM = 0;
+        for (int s = 1; s < cN; s++) if (cState[s] == SL_OBS) { laW += cLaW[s]; laM += cLaW[s] * cCol[s]; }
+        final int farRow = refineFarRow(pixels, bright, lastObs, cx0, expW);
+        float intersection = farIntersection(laW > 0 ? (float) (laM / laW) : Float.NaN, farRow, Float.NaN);
+        if (farOnly) {
+            // Unsure of the near part: never faster than before, and slower for a sharp curve.
+            intersection = Math.max(Math.max(intersection, lastIntersection),
+                                    farIntersection(Float.NaN, -1, (float) kx[2]));
+        }
+        publishCorridorPath(true, cx0);
+        lastSteering = steering;
+        lastIntersection = intersection;
+        lastHeadTerm = cfg.steerHeadingWeight * conf * headingTerm;
+        // Image tilt from the line slices (overlay only).
+        final float tilt = imageTilt();
+        writeOutput(steering, intersection, centroidX, true,
+                cfg.steerOffsetWeight * offsetTerm, cfg.steerHeadingWeight * conf * headingTerm,
+                headingDeg, conf, tilt, false, false, farOnly, coverage, (float) (rms / wf));
+        return true;
+    }
+
+    private int countState(byte st, int n) {
+        int k = 0;
+        for (int s = 0; s < n && s < cN; s++) if (cState[s] == st) k++;
+        return k;
+    }
+
+    private int nextObs(int s) {
+        for (int t = s + 1; t < cN; t++) if (cState[t] == SL_OBS) return t;
+        return -1;
+    }
+
+    /**
+     * Near part hidden: the observed far slices give the line's direction (slope at their mean
+     * distance) and, with enough of them, its curvature — measurements of B + 2Cu and C, which
+     * do not depend on A.
+     */
+    private void corridorFarMeasurements(float cx0, double wf) {
+        int n = 0;
+        double su = 0, sx = 0, suu = 0, sux = 0, suuu = 0, suuuu = 0, suux = 0;
+        for (int s = 0; s < cFitSlices; s++) {
+            if (cState[s] != SL_OBS) continue;
+            final double u = cU[s], x = (cCol[s] - cx0) * cScale[s];
+            n++; su += u; sx += x; suu += u * u; sux += u * x;
+            suuu += u * u * u; suuuu += u * u * u * u; suux += u * u * x;
+        }
+        if (n < 2) return;
+        final double um = su / n;
+        final double d = n * suu - su * su;
+        if (Math.abs(d) < 1e-9) return;
+        final double slope = (n * sux - su * sx) / d;
+        final double spanU = Math.sqrt(Math.max(1e-9, suu / n - um * um));
+        final double sdSlope = Math.max(0.05, 0.3 * wf / Math.max(1e-3, spanU * Math.sqrt(n)));
+        kfUpdate(0, 1, 2 * um, slope, sdSlope * sdSlope, 25.0);
+        if (n >= 4 && spanU > 0.15 * floorFwdH) {
+            final double a12 = su, a13 = suu, a22 = suu, a23 = suuu, a33 = suuuu;
+            final double det = n * (a22 * a33 - a23 * a23) - a12 * (a12 * a33 - a23 * a13) + a13 * (a12 * a23 - a22 * a13);
+            if (Math.abs(det) > 1e-12) {
+                final double detC = n * (a22 * suux - sux * a23) - a12 * (a12 * suux - sux * a13) + sx * (a12 * a23 - a22 * a13);
+                final double c = detC / det;
+                final double sdC = Math.max(0.1, 0.6 * wf / Math.max(1e-3, spanU * spanU * Math.sqrt(n)));
+                kfUpdate(0, 0, 1, c, sdC * sdC, 25.0);
+            }
+        }
+    }
+
+    /**
+     * Farthest image row on the line: between the last line slice and the next slice, rows are
+     * checked (every 2nd) on the line's continued direction until it is missed twice.
+     */
+    private int refineFarRow(byte[] pixels, boolean bright, int lastObs, float cx0, float expW) {
+        if (lastObs < 0) return -1;
+        int far = cRow[lastObs];
+        if (lastObs == 0 || lastObs >= cN - 1) return lastObs >= cN - 1 ? Math.min(far, vRoiTop) : far;
+        final int prev = lastObs > 0 ? lastObsBefore(lastObs) : -1;
+        final float colL = cCol[lastObs];
+        final float slope = prev >= 0 && cRow[prev] != cRow[lastObs]
+                ? (cCol[lastObs] - cCol[prev]) / (cRow[prev] - cRow[lastObs]) : 0f;
+        final int stop = cRow[lastObs + 1];
+        int miss = 0;
+        for (int r = cRow[lastObs] - 2; r > stop && r >= vRoiTop; r -= 2) {
+            final float pc = colL + slope * (cRow[lastObs] - r);
+            final float e = expW * floorScaleH / rowScale[r];
+            ensureRows(r, r + 1);
+            if (detectSlice(pixels, bright, r, r + 1, 1, pc, e * (float) Math.sqrt(1 + slope * slope),
+                            Math.max(cfg.corridorWidthMult * 0.5f * e, 0.5f * e + 2 * runGapTol()), 1.5f)) {
+                far = r; miss = 0;
+            } else if (!dUnknown && ++miss >= 2) break;
+        }
+        return far;
+    }
+
+    private int lastObsBefore(int s) {
+        for (int t = s - 1; t >= 0; t--) if (cState[t] == SL_OBS) return t;
+        return -1;
+    }
+
+    /**
+     * Internal intersection (0 = straight … 100 = hard turn / end) from the far-weighted
+     * look-ahead column (NaN = none), the farthest line row (-1 = none) and, when given, the
+     * curve's C (sharpness: 100 at a radius of about one H-ROI distance).
+     */
+    private float farIntersection(float lookAheadX, int farRow, float curveC) {
+        float it = 0f;
+        if (!Float.isNaN(lookAheadX)) {
+            final float span = Math.max(1f, imgW * 0.5f * cfg.trackOffsetFullFrac);
+            it = Math.min(100f, Math.abs(lookAheadX - trackRefX) / span * 100f);
+        }
+        if (cfg.trackLengthSlowdown && farRow >= 0) {
+            final float full = Math.max(1e-3f, cfg.trackLengthFullFrac);
+            final float length = Math.min(1f, visibleRoadFrac(farRow) / full);
+            it = Math.max(it, 100f * (1f - length));
+        }
+        if (!Float.isNaN(curveC)) {
+            final float kappa = 2f * Math.abs(curveC);                    // 1 / radius, camera heights
+            it = Math.max(it, Math.min(100f, 100f * kappa * floorFwdH));
+        }
+        return Math.max(0f, Math.min(100f, it));
+    }
+
+    /** Overlay path: the strip point and every line slice (nearest first). */
+    private void publishCorridorPath(boolean withBase, float cx0) {
+        int n = 0;
+        if (withBase) {
+            laPathRowFrac[n] = (hRoiTop + hRoiBot) * 0.5f / imgH;
+            laPathColFrac[n] = (float) (cx0 + kx[0] / floorScaleH) / imgW;
+            n++;
+        }
+        for (int s = 1; s < cN && n < LA_MAX_PTS; s++) {
+            if (cState[s] != SL_OBS) continue;
+            laPathRowFrac[n] = cRow[s] / (float) imgH;
+            laPathColFrac[n] = cCol[s] / imgW;
+            n++;
+        }
+        laPathCount = n;
+    }
+
+    /** Lean of the line slices in the image, degrees from vertical (+ = leans right). */
+    private float imageTilt() {
+        int n = 0;
+        double sy = 0, syy = 0, sc = 0, syc = 0;
+        for (int s = 0; s < cN; s++) {
+            if (cState[s] != SL_OBS) continue;
+            final double y = cRow[s], c = cCol[s];
+            n++; sy += y; syy += y * y; sc += c; syc += y * c;
+        }
+        if (n < 2) return 0f;
+        final double den = n * syy - sy * sy;
+        if (Math.abs(den) < 1e-6) return 0f;
+        return (float) Math.toDegrees(Math.atan(-(n * syc - sy * sc) / den));
+    }
+
+    /** After a v2 frame: (re)start the filter from the v2 result, or drop it. */
+    private void corridorSync(boolean trackFound, int centroidX, boolean coasting, float conf) {
+        final float expW = expectedLineWidth();
+        if (!trackFound || expW <= 0f || floorScaleH <= 0f) {
+            if (!coasting) kfReady = false;
+            return;
+        }
+        final double wf = expW * floorScaleH;
+        final double a = (centroidX - (imgW * 0.5f - 0.5f)) * floorScaleH;
+        final double b = conf > 0f ? Math.tan(Math.toRadians(fitHeadingDeg)) : 0.0;
+        kfInit(a, b, conf > 0f ? fitC : 0.0, wf);
+    }
+
+    /** Write the internal output holder (corridor frames). */
+    private void writeOutput(float steering, float intersection, int centroidX, boolean trackFound,
+                             float offset, float heading, float headingDeg, float conf, float tilt,
+                             boolean held, boolean coasting, boolean reconstructed,
+                             float coverage, float rmsLines) {
+        output.steering      = steering;
+        output.intersection  = intersection;
+        output.centroidX     = trackFound ? centroidX : -1;
+        output.tiltDeg       = trackFound ? tilt : 0f;
+        output.trackWidthPx  = lastTrackWidthPx;
+        output.trackFound    = trackFound;
+        output.offsetTerm    = trackFound ? offset : 0f;
+        output.headingTerm   = trackFound ? heading : 0f;
+        output.headingDeg    = headingDeg;
+        output.headingConf   = conf;
+        output.held          = held || coasting;
+        output.rejected      = rejectedBands;
+        output.coasting      = coasting;
+        output.reconstructed = reconstructed;
+        corrUsed     = true;
+        corrCoverage = coverage;
+        corrRms      = rmsLines;
+    }
+
+    /**
+     * Calibration (phase 2, look-ahead traced): measure the line width in every slice on the
+     * v2 trace and keep measured / expected; the median per slice becomes cGain, which
+     * corrects the perspective width for a camera tilt that is not exactly cameraTiltDeg.
+     */
+    private void calibrateCorridorWidths(byte[] pix, boolean bright, int sample) {
+        final float expW = expectedLineWidth() > 0f ? expectedLineWidth() : lastTrackWidthPx;
+        if (expW <= 0f || sample >= Math.max(1, cfg.calibFrames)) return;
+        for (int s = 1; s < cN; s++) {
+            final float c = rowCx[cRow[s]];
+            if (Float.isNaN(c)) continue;
+            final float e = expW * floorScaleH / cScale[s];
+            if (cGainCount[s] < Math.max(1, cfg.calibFrames)
+                    && detectSlice(pix, bright, cR0[s], cR1[s], 1, c, e, Math.max(1.5f * e, 0.5f * e + 3 * runGapTol()), 2.0f)) {
+                cGainSamples[s * Math.max(1, cfg.calibFrames) + cGainCount[s]++] = dWidth / e;
+            }
+        }
+    }
+
+    private void finishCorridorWidths(int frames) {
+        final int stride = Math.max(1, cfg.calibFrames);
+        for (int s = 0; s < cN; s++) {
+            cGain[s] = 1f;
+            final int n = cGainCount[s];
+            if (n * 2 >= frames && n > 0) {
+                java.util.Arrays.sort(cGainSamples, s * stride, s * stride + n);
+                cGain[s] = Math.max(0.6f, Math.min(1.6f, cGainSamples[s * stride + n / 2]));
+            }
+            cGainCount[s] = 0;
+        }
     }
 
     /**
@@ -2855,6 +3735,7 @@ public final class LineFollowerPipeline {
     private void computeHeading() {
         fitHeadingDeg = 0f;
         fitConfidence = 0f;
+        fitC          = 0.0;
         if (floorN < 3) return;
         final double n = floorN;
         final double d2 = n * fUU - fU * fU;
@@ -2878,6 +3759,7 @@ public final class LineFollowerPipeline {
                 final double C = detC / det;
                 res   = fXX - (A * fX + B * fUX + C * fUUX);
                 slope = B;                                              // tangent where the line crosses the H-ROI (u = 0)
+                fitC  = C;
             }
         }
         fitHeadingDeg = (float) Math.toDegrees(Math.atan(slope));
@@ -2894,6 +3776,10 @@ public final class LineFollowerPipeline {
 
     /** Forget what was learned about the line beyond the colours (level, heading zero, motion). */
     private void resetLineModel() {
+        kfReady           = false;
+        glarePinned       = false;
+        if (cGain != null) java.util.Arrays.fill(cGain, 1f);
+        if (cGainCount != null) java.util.Arrays.fill(cGainCount, 0);
         coastMs           = 0f;
         coastFrames       = 0;
         lastHeadTerm      = 0f;
@@ -2978,6 +3864,12 @@ public final class LineFollowerPipeline {
         d.baseReconstructed = live && output.reconstructed;
         d.coasting          = live && output.coasting;
         d.maskedFrac        = live && maskActive ? maskedFraction() : 0f;
+        final boolean corr  = live && corrUsed;
+        d.corridorCoverage  = corr ? corrCoverage : 0f;
+        d.corridorFitRms    = corr ? corrRms : 0f;
+        d.curveA            = corr ? (float) kx[0] : 0f;
+        d.curveB            = corr ? (float) kx[1] : 0f;
+        d.curveC            = corr ? (float) kx[2] : 0f;
         frameCallback.onFrame(d);
     }
 

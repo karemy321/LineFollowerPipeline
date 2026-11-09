@@ -34,7 +34,7 @@ import org.junit.Test;
 public class V3ScenarioTest {
 
     /** Highest plan phase implemented in the library. Scenarios for later phases are skipped. */
-    static final int IMPLEMENTED_PHASE = 1;
+    static final int IMPLEMENTED_PHASE = 2;
 
     static final int W = 320, H = 240;
     static final double SPEED = 0.6;          // m/s, user's top speed (plan §8.4)
@@ -98,14 +98,24 @@ public class V3ScenarioTest {
         }
     }
 
+    private static float number(LineFollowerPipeline.FrameData d, String name) {
+        try {
+            return d.getClass().getField(name).getFloat(d);
+        } catch (NoSuchFieldException e) {
+            return 0f;
+        } catch (IllegalAccessException e) {
+            throw new IllegalStateException(e);
+        }
+    }
+
     // ── One frame's output ──────────────────────────────────────────────────
 
     static final class F {
-        int s, t; boolean found, held, coasting, recon; float cx = -1, widthPx;
+        int s, t; boolean found, held, coasting, recon, corridor; float cx = -1, widthPx;
         boolean pinned() { return Math.abs(s) == 50 && !found && !coasting; }
         @Override public String toString() {
-            return String.format(Locale.ROOT, "s=%3d t=%3d %s%s%s%s cx=%6.1f", s, t, found ? "F" : "-",
-                    held ? "H" : "-", coasting ? "C" : "-", recon ? "R" : "-", cx);
+            return String.format(Locale.ROOT, "s=%3d t=%3d %s%s%s%s%s cx=%6.1f", s, t, found ? "F" : "-",
+                    held ? "H" : "-", coasting ? "C" : "-", recon ? "R" : "-", corridor ? "K" : "-", cx);
         }
     }
 
@@ -204,6 +214,7 @@ public class V3ScenarioTest {
     private static void capture(LineFollowerPipeline.FrameData d, F out) {
         out.s = d.steering; out.t = d.tracking; out.found = d.trackFound; out.held = d.lineHeld;
         out.coasting = flag(d, "coasting"); out.recon = flag(d, "baseReconstructed");
+        out.corridor = number(d, "corridorCoverage") > 0f;
         out.cx = d.centroidXFrac >= 0 ? d.centroidXFrac * d.imgW : -1;
         out.widthPx = d.trackWidthFrac * d.imgW;
     }
@@ -394,6 +405,60 @@ public class V3ScenarioTest {
             scenes.add(glareDrive("glareOnTapeOnlyPartial_curve", p, gentleCurve(), tapeGlare(170), 40, 30));
         }
         runAll("glareOnTapeOnlyPartial", scenes, (c, r) -> { glareRide(c, r, true); centroidNearRef(c, r, 0.3); });
+    }
+
+    /**
+     * User request (Phase 2): a sharp curve (R = 15 cm, 90°, left and right) driven on the line
+     * at 0.6 m/s, 30 fps, with glare over the near strip from just before the curve to after it.
+     * The near part is hidden, so the line is seen only farther ahead. Expect: no steering in
+     * the wrong direction (v2 on the clean frames says which way) and the line followed,
+     * coasted on or pinned to the turn side on every frame.
+     *
+     * OPEN (see plan §11): the requested "never pinned to ±50" is not fully met. When the line
+     * seen above the glare runs off the frame edge, requirement 4 pins to that edge — the
+     * camera cannot tell this from an overshoot while the base is hidden. Such pins are
+     * allowed here only to the turn side and for at most 4 frames in a row.
+     */
+    @Test public void sharpCurveNearGlare() {
+        requirePhase(2);
+        final List<Scene> scenes = new ArrayList<>();
+        for (Pair p : MAIN_PAIRS) {
+            for (int dir = -1; dir <= 1; dir += 2) {
+                final Scene s = new Scene();
+                s.name = "sharpCurveNearGlare_" + (dir > 0 ? "left" : "right") + "_" + p;
+                s.pair = p; s.fps = 30;
+                s.path = new TrackSim.Path(0, 0, 0).straight(0.5).arc(0.15, 90 * dir).straight(1.0);
+                s.glare.add(nearStripGlare());
+                s.glareOn = k -> k >= 8 && k < 30;
+                s.poses = along(s.path, 40, 40, 30);
+                s.refCfg = v2Config(30);
+                scenes.add(s);
+            }
+        }
+        runAll("sharpCurveNearGlare", scenes, (c, r) -> {
+            for (int f = 0; f < 2; f++) {
+                if (!r.has(f)) continue;
+                int run = 0;
+                final int turn = r.sc.name.contains("_left_") ? -1 : 1;
+                for (int k = 0; k < r.frames(); k++) {
+                    final F t = r.test[f][k], ref = r.ref[f][k];
+                    if (t.pinned()) {
+                        run++;
+                        c.that(Integer.signum(t.s) == turn && run <= 4, r.sc.name, FMT[f], k,
+                                "pinned (wrong side or > 4 frames)", t + " / ref " + ref);
+                    } else {
+                        run = 0;
+                        c.that(t.found || t.coasting, r.sc.name, FMT[f], k, "line lost", t);
+                    }
+                    // User request: unsure of the near part ⇒ never faster than before the glare.
+                    if (k >= 8 && k < 30 && (t.coasting || t.recon))
+                        c.that(t.t <= r.test[f][7].t, r.sc.name, FMT[f], k, "faster while the near part is hidden",
+                                t + " / before glare " + r.test[f][7]);
+                    if (ref.s <= -5) c.that(t.s <= 2, r.sc.name, FMT[f], k, "steering right while v2 says left", t + " / ref " + ref);
+                    if (ref.s >= 5)  c.that(t.s >= -2, r.sc.name, FMT[f], k, "steering left while v2 says right", t + " / ref " + ref);
+                }
+            }
+        });
     }
 
     // ── Distractor scenes ───────────────────────────────────────────────────

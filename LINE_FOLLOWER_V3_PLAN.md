@@ -310,7 +310,60 @@ New FrameData fields (additive): `baseReconstructed`, `coasting`, `corridorCover
   - **Timing** (`gradlew perf`, same JVM, alternating blocks): v3 **1.30–1.33 ms** mean
     (clean 1.25–1.28, strip glare 1.39–1.42) vs v2 flags 1.02–1.06. Budget 1.5 ms; clean frames cost
     +0.2 ms over v2 — to recover in Phase 2.
-- [ ] Phase 2 — corridor tracker + robust fit + Kalman + fallback
+- [x] Phase 2 — corridor tracker + robust fit + Kalman + fallback
+  - New Config: `corridorMode` (true), `corridorSlices` (12), `corridorWidthMult` (2.2),
+    `minChainSlices` (4), `corridorMinConfidence` (0.35), `corridorProcessNoise` (1.0). New
+    FrameData: `corridorCoverage`, `corridorFitRms`, `curveA/B/C`. `edgePairCheck` / `chromaBias`
+    are not added yet (edge pairs are always used inside the corridor; the v2-path flag is Phase 3).
+  - **Slices:** 12, uniform in floor distance from the H-ROI (slice 0 = the strip's 6 middle rows)
+    to `vRoiTop`, 3 rows each. Slices within `FIT_DEPTH` (6 of 12 at 320×240) update the filter;
+    the rest extend the chain (direction of the last two line slices) for tracking/length.
+  - **Detector** (`detectSlice`): rows averaged into a line-ness profile, glare columns filled by
+    interpolation (bridges a saturated centre), box-smoothed, rise / fall peaks; the line is the
+    pair at 0.6 … 1.5 × the expected width (perspective × slant × calibrated gain) with a
+    line-like interior, scored by edge strength, width match and distance from the prediction.
+    The inner edges of a brightened centre make pairs ≈ 0.3 × wide and are never chosen
+    (req. 3). One-edge pairs at the frame edge.
+  - **Kalman** on [A, B, C, dA, dB] (floor units), sequential scalar updates, gate 4σ, Huber above
+    2σ, no matrices allocated. Instead of a separate IRLS/RANSAC fit, the robustness is the gating
+    near → far. **Far-only** (first line slice beyond 0.35 × FIT_DEPTH, user request): far
+    positions with a large variance (≥ 5× and ≥ ½ line width × u / H-ROI distance) plus
+    measurements of the slope at their mean distance and of C; A comes from the prediction; used
+    while σ(A) ≤ 1 line width; `baseReconstructed = true`.
+  - **Hand-over to v2** for the frame (filter restarts from the v2 result): no line slice; the
+    near line > 2σ from the prediction (a jump — Huber would have returned a position *between*
+    old and new); far slices rejected on one side (corner); the chain ends inside the corridor
+    without glare (corner, junction, dead end, line leaving the frame — v2 handles these);
+    < `minChainSlices`; confidence < `corridorMinConfidence`; a relock.
+  - **Outputs:** v2 formulas — offset from A at u = 0, heading ψ = atan B − ψ₀ (confidence from
+    slices / span / fit), tracking from the far-weighted slice columns + visible length (far row
+    refined row by row past the last slice). Overlay path = strip point + line slices.
+  - **Calibration:** in phase 2 each slice's measured / expected width is recorded; the median
+    per slice becomes a width gain (0.6 … 1.6) that corrects a camera tilt not exactly
+    `cameraTiltDeg`. Reset by `requestRecalibration()`.
+  - **User items (2026-11-10):** (1) ambiguous coast and far-only: tracking = the lower of the
+    held value and the value from the far observation (lean, visible length, curvature;
+    100 % at a radius of one H-ROI distance), never below `trackingMinValue`. (2) far-only
+    observations feed the filter as above. Plus: a base rebuilt by the v2 glare logic must agree
+    with the filter's prediction (else coast); after a pin under glare the lock may be taken back
+    mid-image, but only on the pinned side; an edge contact that the filter's own curve predicts
+    is not an exit.
+  - **Lazy rows (perf):** in corridor frames only the strip and the slice rows are converted to
+    line-ness; v2 frames convert the whole look-ahead as before.
+  - **Tests:** all 41 pass, none skipped. `glareOnTapeOnlyPartial` (req. 3) now passes. New
+    `sharpCurveNearGlare` (R 15 cm, left / right, 3 pairs, 0.6 m/s, 30 fps, near glare 22 frames):
+    **0 wrong-direction frames**, never lost, tracking never above its pre-glare value while the
+    near part is hidden. **Open:** 2–4 frames per run pinned to the turn side (see §12).
+  - Corridor share of frames: glare / distractor scenes 95–98 %; corner / dead end / edge exit
+    ≈ 45–50 % (v2 handles the event itself); `sharpCurveNearGlare` 75 %.
+  - **v2 equivalence:** `corridorMode = false, glareMask = false` vs `202e70f`: identical on every
+    frame (same 72 runs × 40 frames as Phase 1).
+  - **Timing** (`gradlew perf`): v3 **0.59–0.61 ms** mean (clean 0.74, strip glare 0.18 — corridor
+    far-only, tape glare 0.86) vs v2 flags 1.05–1.07; p99 1.45. v3 tracks 96/96 benchmark frames
+    (corridor 60), v2 64 + 32 held. The 0.2 ms are more than won back.
+  - **App:** `MainActivity` now times the pipeline call alone; every 30 frames it logs
+    `PERF fps=… pipe_ms=… pipe_max_ms=… frame_ms=…` (`adb logcat -s RoboPhone | grep PERF`) and the
+    HUD line shows FPS / pipe ms / frame ms. No camera code changed; `assembleDebug` builds.
 - [ ] Phase 3 — trimBand continuity, edge-pair, continuity-ranked acquisition
 - [ ] Phase 4 — AE/AWB lock in app
 - [ ] Phase 5 — README v3, CHANGES_v3.md, timings, Blockly values re-checked
@@ -383,3 +436,16 @@ hold L2012–2044, `traceLookAhead(..., trackFound ? centroidX : -1, ...)` L2056
    coasting.
    - Test: a sharp turn where the line exits at the edge while glare covers the near strip ⇒ immediate
      pinning.
+
+## 12. Open question — sharp curve under near glare vs. requirement 4 (2026-11-10)
+
+In `sharpCurveNearGlare` the robot follows a 15 cm-radius turn while glare hides everything nearer
+than ~15 cm. For 2–4 frames per run the only visible line (above the glare) runs off the frame
+edge on the turn side. Requirement 4 says: the look-ahead shows the line leaving through the edge
+⇒ pin to that edge at once. So the pipeline pins (+50 / −50 to the correct side, where v2 on the
+clean frames reads ±30…±41), then takes the line back once the turn's exit leg is visible. With the
+base hidden the camera sees the same picture as in `edgeExitUnderGlare` (robot overshooting).
+Not pinning there would make the overshoot case coast instead of pin. Needs a decision:
+(a) keep requirement 4 as is (current); (b) cap the pin at e.g. ±40 when the filter was tracking a
+curve toward that edge; (c) prefer coasting when the filter was tracking, accepting a later pin in
+the overshoot case.

@@ -47,6 +47,16 @@ public final class PerfBench {
         }
         report("v3 defaults", ns[0]);
         report("v2 flags   ", ns[1]);
+        // Sanity: what the pipelines saw on the benchmark frames (one pass).
+        for (int which = 0; which < 2; which++) {
+            final LineFollowerPipeline p = which == 0 ? v3 : v2;
+            final int[] st = new int[4];   // found, coasting/held, lost, corridor used
+            p.setFrameCallback(d -> { if (d.trackFound) st[0]++; else if (d.lineHeld) st[1]++; else st[2]++; if (d.corridorCoverage > 0f) st[3]++; });
+            for (int i = 0; i < 4 * N; i++) run(p, f[i % N]);
+            p.setFrameCallback(d -> { });
+            System.out.printf("%s frames: found=%d held/coasting=%d lost=%d corridor=%d (of %d)%n",
+                    which == 0 ? "v3" : "v2", st[0], st[1], st[2], st[3], 4 * N);
+        }
     }
 
     private static LineFollowerPipeline pipeline(LineFollowerPipeline.Config cfg, byte[][] cal) {

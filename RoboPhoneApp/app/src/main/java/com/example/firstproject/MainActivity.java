@@ -126,6 +126,8 @@ public class MainActivity extends AppCompatActivity {
     private volatile int     hudFps          = 0;
     private volatile long    hudTotalFrames  = 0L;
     private volatile double  hudElapsedSec   = 0.0;
+    private volatile float   hudPipeMs       = 0f;    // avg ms per frame inside the pipeline (last window)
+    private volatile float   hudFrameMs      = 0f;    // avg ms per frame for the whole analyzer (last window)
     private volatile boolean hudPending      = false;
 
     // Set by the RECALIBRATE button (UI thread), consumed on the camera thread so
@@ -143,7 +145,10 @@ public class MainActivity extends AppCompatActivity {
     private long profLastStartNs   = 0L;   // start timestamp of the previous frame
     private long profWindowStartNs = 0L;   // start timestamp of the current window
     private long profSumProcNs     = 0L;   // Σ per-frame processing time in window
+    private long profSumPipeNs     = 0L;   // Σ time inside the LineFollowerPipeline call only
+    private long profMaxPipeNs     = 0L;   // slowest pipeline call in the window
     private int  profFrameCount    = 0;    // frames accumulated in current window
+    private long lastPipeNs        = 0L;   // pipeline time of the current frame
 
     // =========================================================================
     //  Lifecycle
@@ -376,6 +381,7 @@ public class MainActivity extends AppCompatActivity {
 
             // Calibration phase — learns the colours, then the straight-ahead
             // reference. The FrameCallback reports progress to the HUD/overlay.
+            final long pipeStartNs = System.nanoTime();
             if (!pipeline.isCalibrated()) {
                 pipeline.calibrateYuv420(yFrame, uFrame, vFrame, width, height);
             } else {
@@ -384,6 +390,7 @@ public class MainActivity extends AppCompatActivity {
                 final int[] result = pipeline.processFrameYuv420(yFrame, uFrame, vFrame, width, height);
                 if (VERBOSE) Log.d(TAG, "S=" + result[0] + "  T=" + result[1]);
             }
+            lastPipeNs = System.nanoTime() - pipeStartNs;   // pipeline only (no plane copies)
 
             profileFrame(frameStartNs, System.nanoTime());
 
@@ -494,6 +501,8 @@ public class MainActivity extends AppCompatActivity {
         // Accumulate a window for a stable averaged summary.
         if (profWindowStartNs == 0L) profWindowStartNs = startNs;
         profSumProcNs += procNs;
+        profSumPipeNs += lastPipeNs;
+        if (lastPipeNs > profMaxPipeNs) profMaxPipeNs = lastPipeNs;
         profLastStartNs = startNs;
 
         if (++profFrameCount >= PROF_WINDOW) {
@@ -515,9 +524,22 @@ public class MainActivity extends AppCompatActivity {
                     ROBOT_MAX_SPEED_MPS, cmPerFrame, pipeline.getFramesPerSecond(),
                     pipeline.getTotalFrames(), pipeline.getElapsedSeconds()));
 
+            // One easy-to-grep line for measuring on the phone:  adb logcat -s RoboPhone | grep PERF
+            //   fps      = pipeline.getFramesPerSecond() (frames in the last full second)
+            //   pipe_ms  = time inside the LineFollowerPipeline call (avg / max of the window)
+            //   frame_ms = whole analyzer: plane copies + pipeline
+            final double avgPipeMs = (profSumPipeNs / (double) profFrameCount) / 1e6;
+            Log.i(TAG, String.format(Locale.US,
+                    "PERF fps=%d pipe_ms=%.2f pipe_max_ms=%.2f frame_ms=%.2f frames=%d",
+                    pipeline.getFramesPerSecond(), avgPipeMs, profMaxPipeNs / 1e6, avgProcMs, profFrameCount));
+            hudPipeMs  = (float) avgPipeMs;
+            hudFrameMs = (float) avgProcMs;
+
             // Reset the window.
             profFrameCount    = 0;
             profSumProcNs     = 0L;
+            profSumPipeNs     = 0L;
+            profMaxPipeNs     = 0L;
             profWindowStartNs = 0L;
         }
     }
@@ -568,8 +590,8 @@ public class MainActivity extends AppCompatActivity {
         }
 
         tvFrames.setText(String.format(Locale.US,
-                "FPS: %d    total: %d    time: %.1fs",
-                hudFps, hudTotalFrames, hudElapsedSec));
+                "FPS: %d   pipe: %.2f ms   frame: %.2f ms   total: %d   time: %.1fs",
+                hudFps, hudPipeMs, hudFrameMs, hudTotalFrames, hudElapsedSec));
 
         // Learned colours + vision debug
         final boolean colors = hudColorReady;
