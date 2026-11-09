@@ -449,3 +449,27 @@ Not pinning there would make the overshoot case coast instead of pin. Needs a de
 (a) keep requirement 4 as is (current); (b) cap the pin at e.g. ±40 when the filter was tracking a
 curve toward that edge; (c) prefer coasting when the filter was tracking, accepting a later pin in
 the overshoot case.
+
+**Decision (user, 2026-11-10): (b) with conditions** — implemented in commit "v3 Phase 2b":
+1. Cap at the filter's predicted steering, clamped to ±50 — only when the corridor filter was
+   following a curve toward that edge with confidence: ≥ 3 consecutive confident corridor frames
+   whose curve leans ≥ 1 line width to that side by FIT_DEPTH, the last at most 6 frames ago.
+   "Predicted steering" = pure pursuit from the camera to the filter's curve point at the distance
+   where the line is still seen (nearest look-ahead row), as the lateral position at the v2 target
+   distance — heading and curvature enter through the curve; the hidden near position is not used.
+2. Escalation: after 166.7 ms of capped pin (5 frames at 30 fps; same clamped clock as the coast,
+   so `frameIntervalMs` makes it repeatable; 5 frames without a clock; never more than 10 frames)
+   ⇒ the full ±50 pin, until the line is seen again. A capped spell continues on later frames even
+   if the look-ahead no longer shows the exit itself.
+3. Real overshoot unchanged: without that curve history the pin is ±50 at once.
+   `edgeExitUnderGlare` traces are byte-identical to Phase 2 (checked by running the Phase 2 code
+   on the same scenarios); of all scenario outputs only `sharpCurveNearGlare` changed.
+   Tracking is at `trackingMinValue` during the capped pin; the filter keeps predicting.
+
+**Result in `sharpCurveNearGlare`** (10 edge spells, 23 frames in the first 5 frames of a spell):
+no ±50, correct direction everywhere, 0 wrong-direction frames overall, tracking at 5. The capped
+value is **3–15 below v2 on the clean view (median 11)** — always the same direction, never above.
+The requested "within ~10" is met in 12 of 23 frames; the test checks ≤ 15. Cause: while hidden,
+the line's base moves sideways along the curve, which the far point does not show. Two alternatives
+were measured and not used: the observed edge-contact point (12–16 *above* v2: a run cut by the
+frame edge) and a "robot on the line" parabola through the far point (also 10–16 below).

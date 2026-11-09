@@ -726,6 +726,14 @@ public final class LineFollowerPipeline {
     private int     coastFrames;
     private float   lastHeadTerm;      // heading part of the steering on the last frame with the line
     private boolean glarePinned;       // pinned while the strip was hidden (lock parked at the edge)
+    // Capped edge pin (plan §12): curve history of the corridor filter and the cap's clock.
+    private int     curveSide;         // side (-1 / +1) the filter's curve bends to (0 = straight)
+    private int     curveFrames;       // consecutive confident corridor frames bending to curveSide
+    private int     sinceCurveFrames = 1000;   // frames since the last such frame
+    private float   pinCapMs;          // time spent in a capped pin
+    private int     pinCapFrames;
+    private boolean pinCapEscalated;   // cap time used up: full pin until the line is seen
+    private boolean pinCapActive;      // this frame's pin was capped
     private int     glarePinSide;      // ... to this side (-1 / +1)
     private int     traceFirstRow;     // nearest look-ahead row on the line in the last trace
     // Extra look-ahead results (seeded trace without a base, glare rows).
@@ -1275,6 +1283,8 @@ public final class LineFollowerPipeline {
         corrUsed = false;
         relockedThisFrame = false;
         corrPredValid = false;
+        pinCapActive = false;
+        if (sinceCurveFrames < 1000) sinceCurveFrames++;
         // Corridor frames convert only the rows they read (lazy); v2 frames the whole look-ahead.
         lazyRows = false;
         final byte[] pix = (cfg.corridorMode && kfReady && trackAcquired && calibrated)
@@ -2293,6 +2303,7 @@ public final class LineFollowerPipeline {
             coastMs          = 0f;
             coastFrames      = 0;
             glarePinned      = false;
+            resetPinCap();
         } else if (locked && glare) {
             // ── v3: the locked line is not visible in the strip (glare, shadow, object) ──
             // Follow it from the look-ahead instead, starting at the predicted column. The first
@@ -2327,6 +2338,7 @@ public final class LineFollowerPipeline {
                 trackFound    = true;
                 reconstructed = true;
                 glarePinned   = false;
+                resetPinCap();
                 centroidX     = Math.max(0, Math.min(W - 1, Math.round(recon)));
                 float d = centroidX - lastCentroidX;
                 final float lim = 0.5f * Math.max(20f, slantW > 0f ? slantW : lastTrackWidthPx);
@@ -2357,7 +2369,9 @@ public final class LineFollowerPipeline {
                                             : Math.max(0,     Math.round(steerRefX - halfW));
                     lastCentroidX = centroidX;
                     centroidVel   = 0f;
-                    pinnedSteering     = onRight ? 100f : -100f;
+                    pinnedSteering     = exitSide != 0 ? glarePinSteering(exitSide)
+                                       : (glarePinned && !pinCapEscalated) ? glarePinSteering(glarePinSide)
+                                       : (onRight ? 100f : -100f);
                     forcedIntersection = 100f;
                     coastMs     = cfg.glareCoastMs;              // no new coast until the line is seen
                     coastFrames = cfg.glareCoastMaxFrames;
@@ -2521,7 +2535,7 @@ public final class LineFollowerPipeline {
         output.rejected     = rejectedBands;
         output.coasting     = coastingNow;
         output.reconstructed = reconstructed;
-        if (cfg.corridorMode) corridorSync(trackFound, centroidX, coastingNow || held, conf);
+        if (cfg.corridorMode) corridorSync(trackFound, centroidX, coastingNow || held || pinCapActive, conf);
     }
 
     /** True when the filter's curve (as predicted this frame) is in the edge zone of that side at that row. */
@@ -2531,6 +2545,73 @@ public final class LineFollowerPipeline {
         final double x = kxPred[0] + kxPred[1] * u + kxPred[2] * u * u;
         final float col = (float) (imgW * 0.5f - 0.5f + x / rowScale[row]);
         return side < 0 ? col <= edgeZone : col >= imgW - edgeZone;
+    }
+
+    // A capped pin turns into the full v2 pin after this long (5 frames at 30 fps).
+    private static final float PIN_CAP_MS = 5000f / 30f;
+    private static final int   PIN_CAP_MIN_CURVE_FRAMES = 3, PIN_CAP_MAX_GAP = 6;
+
+    /**
+     * Steering (internal, ±100) for a pin toward {@code side} under glare. If the corridor filter
+     * had been following a curve toward that edge with confidence over the last frames, the
+     * line running off the edge is most likely that curve, not the robot leaving the line:
+     * steering is capped at the filter's own predicted steering (offset + heading + curvature,
+     * clamped) instead of ±100. After PIN_CAP_MS (or 5 frames without a clock) it escalates to
+     * the full pin. Without that curve history (a real overshoot) it is the full pin at once.
+     */
+    private float glarePinSteering(int side) {
+        final float full = side > 0 ? 100f : -100f;
+        if (pinCapEscalated || !corrPredValid || curveSide != side
+                || curveFrames < PIN_CAP_MIN_CURVE_FRAMES || sinceCurveFrames > PIN_CAP_MAX_GAP) return full;
+        pinCapMs += frameDtMs;
+        pinCapFrames++;
+        final boolean timeUp = frameDtMs > 0f ? pinCapMs > PIN_CAP_MS + 1e-3f : pinCapFrames > 5;
+        if (timeUp || pinCapFrames > 10) { pinCapEscalated = true; return full; }
+        final float pred = predictedSteering(pinTargetU());
+        if (pred * side <= 0f) return full;
+        pinCapActive = true;
+        return Math.max(-100f, Math.min(100f, pred));
+    }
+
+    /**
+     * The filter's predicted steering for the capped pin: pure pursuit from the camera to the
+     * filter's curve point at forward distance u beyond the H-ROI (where the line is still seen,
+     * so the point is backed by the far measurements; heading and curvature enter through the
+     * curve), expressed as the lateral position the arc reaches at the v2 target distance
+     * (H-ROI + steerLookAhead), in v2 steering units. The hidden near position is not used.
+     * In the simulated sharp curves this reads ~10–15 below v2 on the clean view (the base has
+     * moved sideways along the curve while hidden) — always the same direction.
+     */
+    private float predictedSteering(double u) {
+        final float halfW = imgW * 0.5f;
+        final double halfFloor = Math.max(1e-6, floorScaleH * halfW);
+        final double xRef = (steerRefX - (halfW - 0.5f)) * floorScaleH;          // calibrated straight ahead
+        final double xt = kxPred[0] + kxPred[1] * u + kxPred[2] * u * u - xRef;   // curve point, lateral
+        final double zt = floorFwdH + u;
+        final double target = floorFwdH * (1.0 + cfg.steerLookAhead);
+        return (float) (100.0 * xt * (target * target) / Math.max(1e-6, zt * zt) / halfFloor);
+    }
+
+    /** Distance (beyond the H-ROI) of the nearest line row of the last look-ahead trace, else FIT_DEPTH. */
+    private double pinTargetU() {
+        final int r = traceFirstRow;
+        if (traceAccepted > 0 && r >= vRoiTop && r < vRoiBot && !Float.isNaN(rowFwd[r])) return rowFwd[r] - floorFwdH;
+        return FIT_DEPTH * floorFwdH;
+    }
+
+    /** The line was seen (strip, rebuilt base or corridor): no pin cap in progress. */
+    private void resetPinCap() {
+        pinCapMs = 0f; pinCapFrames = 0; pinCapEscalated = false;
+    }
+
+    /** Corridor frame: remember which way the filter's curve bends (by at least one line width at FIT_DEPTH). */
+    private void noteCurve(double wf, boolean confident) {
+        final double uF = FIT_DEPTH * floorFwdH;
+        final double lean = kx[1] * uF + kx[2] * uF * uF;
+        final int side = !confident || Math.abs(lean) < wf ? 0 : (lean > 0 ? 1 : -1);
+        if (side == 0) { curveFrames = 0; curveSide = 0; return; }
+        if (side == curveSide) curveFrames++; else { curveSide = side; curveFrames = 1; }
+        sinceCurveFrames = 0;
     }
 
     /** Curvature C of a parabola through the last trace's floor points (NaN if too few). */
@@ -3364,14 +3445,17 @@ public final class LineFollowerPipeline {
             else if (cClip[firstObs] != 0) { pin = true; pinSide = cClip[firstObs]; }
         }
         if (pin) {
-            kfReady = false;
+            final float pinSteer = glarePinSteering(pinSide);
+            kfReady = pinCapActive;                       // a capped pin keeps the filter predicting
+            glarePinned = true;
+            glarePinSide = pinSide;
             final boolean onRight = pinSide > 0;
             final int cxp = onRight ? Math.min(W - 1, Math.round(steerRefX + halfW)) : Math.max(0, Math.round(steerRefX - halfW));
             lastCentroidX = cxp; centroidVel = 0f; lostFrames++;
             coastMs = cfg.glareCoastMs; coastFrames = cfg.glareCoastMaxFrames;
             if (lostFrames > cfg.trackLostGraceFrames) trackAcquired = false;
             publishCorridorPath(false, cx0);
-            writeOutput(onRight ? 100f : -100f, 100f, -1, false, 0f, 0f, 0f, 0f, 0f, false, false, false, coverage, (float) (rms / wf));
+            writeOutput(pinSteer, 100f, -1, false, 0f, 0f, 0f, 0f, 0f, false, false, false, coverage, (float) (rms / wf));
             return true;
         }
         final int centroidX = Math.max(0, Math.min(W - 1, Math.round(colA)));
@@ -3383,6 +3467,8 @@ public final class LineFollowerPipeline {
         lastCentroidX = centroidX;
         if (cState[0] == SL_OBS && cClip[0] == 0) lastTrackWidthPx = Math.max(1f, cWid[0]);
         trackAcquired = true; lostFrames = 0; holdFrames = 0; coastMs = 0f; coastFrames = 0;
+        resetPinCap();
+        noteCurve(wf, farOnly || coverage * fitQ >= cfg.corridorMinConfidence);
         // Near image slope (columns per row upward) for the next frame's width test.
         if (lastObs > firstObs) {
             final int a = firstObs, b = nextObs(firstObs);
@@ -3777,6 +3863,8 @@ public final class LineFollowerPipeline {
     /** Forget what was learned about the line beyond the colours (level, heading zero, motion). */
     private void resetLineModel() {
         kfReady           = false;
+        curveSide = 0; curveFrames = 0; sinceCurveFrames = 1000; pinCapActive = false;
+        resetPinCap();
         glarePinned       = false;
         if (cGain != null) java.util.Arrays.fill(cGain, 1f);
         if (cGainCount != null) java.util.Arrays.fill(cGainCount, 0);
