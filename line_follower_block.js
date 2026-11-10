@@ -137,6 +137,12 @@ Blockly.JavaScript.forBlock['line_follower_read'] = function (block, generator) 
           cfg.cameraTiltDeg    = 45f;     // phone mount angle
           cfg.bottomIgnoreFrac = 0.20f;   // hide robot body from scan
           cfg.trackMemory      = true;    // ignore reflections
+          // Frame size: the pixel values below suit 960 x 1280 portrait (forward = up).
+          // For another size scale them (rows x H/1280, columns x W/960) and set
+          // verticalFovDeg to the FOV along the frame's vertical axis — table in
+          // ROBOT_TEST_CHECKLIST.md, section B0. A sideways frame must be rotated first.
+          // cfg.hRoiThickPx = 24; cfg.steerHeadingMinRows = 24;
+          // cfg.vRoiHalfWidthPx = 80; cfg.trackMemoryMinGatePx = 48;
           pipeline.configure(cfg);
 
           LineFollowerHelper.camera = camera;

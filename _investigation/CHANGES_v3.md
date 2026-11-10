@@ -15,7 +15,8 @@ Branch `v3` (from `202e70f`, the v2 state). Plan and decisions: `LINE_FOLLOWER_V
 | Distractors: short object at the straight-ahead column when re-acquiring; line running into a dark mat | locked on the object 3+ frames; tracking stays 100 across the mat | never locked; tracking ramps to the minimum like a plain dead end |
 | Distractors already handled by v2 (same-width object, blob, soft shadow) | pass | pass (beside a blob of the line's colour, tracking dips while the blob fills the far view — bounded at ≥ 60 once the line is seen past it) |
 | 90° corner, dead end vs the v2 settings | — | steering within 5, tracking within 10 of v2 |
-| Unit tests | 26/26 | **50/50** (26 original — `lostLineReportsTrackLost` and the v1 config now set `glareMask = false`, as planned — + 4 coast-clock tests, 13 scenarios, 1 allocation test, 6 recorder tests; `CapturedScenesTest` is skipped until phone captures are added) |
+| Unit tests | 26/26 | **51/51** (26 original — `lostLineReportsTrackLost` and the v1 config now set `glareMask = false`, as planned — + 4 coast-clock tests, 13 scenarios, 1 allocation test, 6 recorder tests, 1 straight-line test; `CapturedScenesTest` is skipped until phone captures are added) |
+| Straight line, centred (§10) | reads 0 | ±1 in 11–45 of 150 frames before the fix, **1–22 now** (`corridorHeadingDeadbandDeg`); closed loop flips 0.82 → 0.57 per s (x = 1) |
 | `corridorMode = false, glareMask = false` | — | **identical to v2 on every frame** (72 runs × 40 frames, 4 colour pairs × 6 scenes incl. glare × gray / YUV / ARGB, 13 FrameData fields), re-checked after every phase |
 | Heap allocation per 1000 frames (gray / YUV / ARGB, glare + lost frames) | 0 / 0 / 0 B | **0 / 0 / 0 B** (`AllocationTest`) |
 | ms per frame, 960×1280 YUV, desktop, same JVM, alternating blocks (`gradlew perf`) | 1.03–1.07 | **0.59–0.65** (clean 0.74–0.77, glare over the strip 0.17–0.32, tape glare 0.83–0.86); p99 1.35–1.45 |
@@ -322,7 +323,7 @@ decides.
 
 ```bash
 cd LineFollowerLibrary
-gradlew test                    # 50 tests; -Dv3.runAll=true also runs not-yet-enabled scenarios
+gradlew test                    # 51 tests; -Dv3.runAll=true also runs not-yet-enabled scenarios
 gradlew replay -Pcapture=<lfcap_*.bin> [-Pset=glareMask=false,...]   # replay a capture from the phone
 gradlew perf checkJava8         # ms per frame (v3 vs v2 settings); Java 8 check
 cd ../_investigation
@@ -384,3 +385,106 @@ so the same recorder works in RoboPhoneApp and inside the RoboPhone system throu
   - Sliding the robot off the line: the line leaves the image after ~15 cm sideways; steering goes
     to the exit side, stays pinned, and comes back smoothly when the robot returns.
   - Covering the line completely: coast for 600 ms (TRACK ramps down), then ±50 toward the last side.
+
+## 10. Straight-line wobble (2026-11-10, `corridorHeadingDeadbandDeg`)
+
+**Question:** v3 reads ±1 on straights where v2 reads 0. The closed loop showed that this alone can
+start a weave at ~0.5 m/s with x = 1. Where does it come from, and can it be removed without
+adding lag in curves?
+
+**Source: the corridor filter's heading, not rounding or the offset part.**
+
+Robot standing still on a straight (harness, 960 × 1280, sensor noise):
+
+| | v2 | v3 |
+|---|---|---|
+| Heading, white on dark | 0.00° | +1.09° (spread 0.4°) |
+| Heading, black on wood | 0.00° | +0.24° |
+| Offset part | — | ≤ 0.12 steps |
+
+- While driving the heading spreads 1.1–1.4°, with peaks of ±4°.
+- The slice centres scatter by 5–10 px with the floor texture under each slice: 12 slices of a
+  few rows each. v2 averages dozens of look-ahead rows and reads the same pixel every frame.
+- Standing still, the scatter is a constant bias; driving, it is a slow wander that a filter
+  over time cannot remove.
+- One trace (0.5 m/s, x = 1): a false 2–2.6° heading for 0.4 s on a perfect straight gave a
+  steady +1. That is enough to start the weave in this unstable regime.
+
+**Tried and not kept**
+
+| Idea | Result | Why not kept |
+|---|---|---|
+| Rounding hysteresis (±0.35 / ±0.75) | No change | It even held the false +1 longer. |
+| Output deadband (\|S\| < 1 → 0) | Little change | The harness already counts only flips of ≥ 2. |
+| Adaptive slice noise (residual EMA) | No change | — |
+| Lower heading drift on straights (qB 0.02 → 0.008) | No change | — |
+| The corridor's own heading zero, fitted on the calibration frames | Good at 960 × 1280 (bias 1.09 → 0.37° / 0.24 → 0.0°) | Its fit is a different estimator from the filter: 1.6° off on one harness start and 2° off at 320 × 240, where it over-corrected. Unreliable. |
+
+**Kept: `corridorHeadingDeadbandDeg = 1.0`.**
+- Headings below 1° are shrunk toward 0; the excess passes.
+- The shrink fades out with the curvature (`|C|` 0 → 0.08, a radius of ~6 camera heights), so
+  curves keep their full heading. The offset part still corrects.
+- 1.5° was also measured: slightly fewer ±1 frames, no clear closed-loop gain, and one 90° corner
+  run lost at 0.5 m/s with x = 1. So 1.0.
+
+**Results** (v3 before = commit `6b251fa`):
+
+| Measure | v2 | v3 before | v3 now |
+|---|---|---|---|
+| Standing still, frames ≠ 0 of 270, white on dark / black on wood | 0 / 0 | 212 / 3 | **43 / 0** |
+| `StraightLineTest`, open loop, 3 floors × gray / YUV, frames ≠ 0 of 150 | 0 | 11–45 | **1–22** |
+
+In `StraightLineTest` none of the versions has sign flips or values beyond ±1.
+
+Closed loop, 4 starts each (centred, 1 cm off, 2° turned, both) × 2 floors = 8 runs per cell, c = 1.0:
+
+| Regime, track, x | v2 | v3 before | v3 now |
+|---|---|---|---|
+| Realistic speed, straight, x = 0: flips ≥ 2 per s · mean \|S\| | 0.00 · 0.10 | 0.37 · 0.67 | 0.34 · 0.63 |
+| Realistic speed, straight, x = 1 | 0.00 · 0.15 | 0.82 · 1.13 | **0.57 · 0.97** |
+| ~0.5 m/s, straight, x = 0 | 0.02 · 0.21 | 0.78 · 1.20 | 0.59 · 1.06 |
+| ~0.5 m/s, straight, x = 1: steering std · mean lateral | 28.7 · 1.42 cm | 37.2 · 1.78 cm | 35.5 · 1.70 cm |
+| Curves, both speeds (gentle, S-curve, 90°, oval) | — | — | unchanged within run-to-run spread; ~0.5 m/s 90° x = 1: 8/8 (before 7/8) |
+
+**Honest summary**
+- The steady ±1 standing still or driving open-loop is mostly gone.
+- In the closed loop the straight-line dither drops only a little: flips 0.82 → 0.57 per s at
+  x = 1. The texture-driven heading wander while moving is larger than a 1° deadband.
+- **At ~0.5 m/s with x = 1 both versions weave**, v2 too, from any start that is not perfect
+  (std 28.7). That regime is unstable for the control loop whichever library runs, as found
+  before. The recommendation stays x = 0 at our speed, to be confirmed in Stage B.
+- Whether the real floor's texture wanders the heading like the simulator's will show in the
+  Stage A CSVs (`headingDeg` while pushing straight).
+- `corridorHeadingDeadbandDeg` is the knob: 0 = previous v3; 1.5–2 if the real floor is noisier.
+
+**Not changed:**
+- v2 equivalence with `corridorMode = false, glareMask = false`: identical, 72 runs.
+- Zero allocations.
+- Timing, same machine, back to back: 0.67 ms (now) vs 0.71 ms (`6b251fa`). The machine was
+  slower today than for §1 (0.59–0.65).
+
+## 11. Frame size and camera FOV (2026-11-10)
+
+- **Frame size.** `ROBOT_TEST_CHECKLIST.md` §B0 has a table "if your frame is W × H".
+  - The library needs forward = up; a sideways frame must be rotated before the call.
+  - The four pixel values scale with the frame: rows by H / 1280, columns by W / 960.
+  - `verticalFovDeg` is the FOV along the frame's vertical axis.
+  - Simulation, against 960 × 1280:
+
+    | Frame | Steering, mean / max difference | Tracking, max difference |
+    |---|---|---|
+    | 480 × 640, 240 × 320, scaled | 1 / 3–4 | 2 |
+    | 240 × 320, unscaled | — | 12 |
+    | 9:16 frames | 2.5 / 6 | ~15 |
+    | landscape | 3.4 / 9 | ~25 |
+
+    For 9:16 and landscape the different view (steering is relative to the half-width) causes the
+    difference, not the pixel values. Prefer 3:4 portrait.
+  - Defaults unchanged.
+- **Camera FOV.** RoboPhoneApp computes the vertical / horizontal FOV of its frames from Camera2:
+  - inputs: focal length, physical sensor size scaled to the active array, the stream's centred
+    crop, and the rotation to portrait;
+  - code: `FieldOfView.java`, with 5 unit tests (e.g. 4:3 sensor, portrait 960 × 1280 → 65.5°);
+  - it logs `FOV vertical=… deg …` and shows `vFOV` on the HUD.
+  - Not applied: `verticalFovDeg` stays 60 until the number is confirmed (checklist A0.5).
+  - Tilt: the phone is mounted at 45°, which is the default `cameraTiltDeg`.

@@ -287,6 +287,13 @@ public final class LineFollowerPipeline {
         // Larger = follows sudden changes sooner, smooths less.
         public float corridorProcessNoise = 1.0f;
 
+        // Straight-line heading deadband of the corridor tracker, degrees. On a straight the
+        // filter's heading wanders by about 1° with the floor texture under the slices; headings
+        // below this are shrunk toward 0 (the excess passes), fading out on curves (gone at a
+        // radius of ~6 camera heights). Stops the ±1 steering dither on straights that can start a
+        // weave at speed; the offset part still corrects. 0 = off (v3 before 2026-11-10).
+        public float corridorHeadingDeadbandDeg = 1.0f;
+
         // Distractor hardening (v3, active with corridorMode): a candidate band in the scan
         // strip must show a sharp floor→line AND line→floor edge at its width — a shadow or a
         // blob with soft edges only counts a third as much as a band with both edges (it is
@@ -3200,6 +3207,7 @@ public final class LineFollowerPipeline {
     private boolean corrPredValid;
     private float   corrPredCol, corrPredSd;
     private final double[] kxPred = new double[5];
+    private static final double HEADING_DB_CURVE = 0.08;   // |C| where the heading deadband is gone
 
     /** Slice geometry from the floor model; called from init(). */
     private void initCorridor(Config config, int width, int height) {
@@ -3716,6 +3724,14 @@ public final class LineFollowerPipeline {
             conf = Math.max(0f, rowsK) * span * fitQ;
             if (conf > 0f) {
                 headingDeg = (float) Math.toDegrees(Math.atan(kx[1])) - headingRefDeg;
+                // Straight-line deadband (plan §14): on a straight the filter's heading is off by
+                // ~1° and wanders with the floor texture under the slices, which alone steered ±1
+                // and could start a weave. Small headings are shrunk toward 0 by up to the deadband; the
+                // shrink fades out as the curve sharpens (gone at |C| = 0.08, a radius of ~6 camera
+                // heights), so curves keep the full heading. The offset part still corrects.
+                final float db = cfg.corridorHeadingDeadbandDeg
+                        * (float) Math.max(0.0, 1.0 - Math.abs(kx[2]) / HEADING_DB_CURVE);
+                if (db > 0f) headingDeg = Math.signum(headingDeg) * Math.max(0f, Math.abs(headingDeg) - db);
                 final double psi = Math.toRadians(Math.max(-75f, Math.min(75f, headingDeg)));
                 headingTerm = (float) (100.0 * cfg.steerLookAhead * floorFwdH * Math.tan(psi) / Math.max(1e-6, floorScaleH * halfW));
             }

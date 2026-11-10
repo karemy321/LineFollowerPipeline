@@ -446,12 +446,19 @@ New FrameData fields (additive): `baseReconstructed`, `coasting`, `corridorCover
     and CHANGES_v3.
   - 50/50 tests (+1 skipped without captures); Java 8 OK; app builds; PDF regenerated (25 pages,
     `check_docs.py` OK).
+- [x] Before Stage A (user, 2026-11-10, §14): branch `v2` at `202e70f`; straight-line wobble
+      (`corridorHeadingDeadbandDeg = 1.0`; standing ±1 frames 212 → 43, open loop 11–45 → 1–22 of
+      150; closed-loop flips 0.82 → 0.57 per s at x = 1; curves unchanged); frame-size table in the
+      checklist §B0; tilt 45 kept; app computes and logs the real camera FOV (`FieldOfView`, 5 tests;
+      default 60 kept); `StraightLineTest`; 51/51 tests (+1 skipped); v2 equivalence identical
+      (72 runs); app builds; PDF regenerated.
 - [ ] **Stage A — manual test with RoboPhoneApp** (`ROBOT_TEST_CHECKLIST.md` A1–A9, CSV + captures)
       — **pending, user**
 - [ ] **Stage B — closed loop inside RoboPhone** (B1–B5: weaving, Blockly c / x, ~0.6 m/s, full laps)
       — **pending, after Stage A and the RoboPhone integration**
 - [ ] **Tuning after the tests** — defaults (`glareLumaMax`, `glareCoastMs`, `corridorWidthMult`,
-      `corridorProcessNoise`, `edgePairCheck`, Blockly c / x), AE/AWB lock / EV defaults in the app;
+      `corridorProcessNoise`, `corridorHeadingDeadbandDeg` from the Stage A heading noise,
+      `verticalFovDeg` from the logged FOV, `edgePairCheck`, Blockly c / x), AE/AWB lock / EV defaults in the app;
       phone captures of glare / distractor moments added to `src/test/captures/` as replay tests;
       then README "Robot Results", CHANGES_v3 and PDF update
 
@@ -572,3 +579,28 @@ Measured: in `blobTouchingLine` (12 cm blob) the dip ramps 98 → 47 while nothi
 view, then the frame where the line past the blob first shows reads **60 (was 37)**, then 99–100.
 With a 4 cm blob the dip is 98 → 76 for 2 frames. `deadEndIntoMat` still ramps to 5. Test added to
 `blobTouchingLine` (12 cm and 4 cm): once ≥ 4 cm of line past the blob is within the view, tracking ≥ 60.
+
+## 14. Straight-line wobble and camera geometry (user, 2026-11-10)
+
+User request before Stage A:
+1. Create branch `v2` at `202e70f` (done).
+2. Fix the ±1 on straights without adding lag in curves, and report the weave before and after
+   with x = 0 and x = 1.
+3. Add a frame-size table to the checklist; keep the defaults.
+4. Keep `cameraTiltDeg = 45` (the mount angle).
+5. Read the real vertical FOV in the app (Camera2), log it, show it, and add a checklist step;
+   keep the default 60 until it is measured.
+
+**Outcome:** details and tables in `_investigation/CHANGES_v3.md` §10–11.
+- The source is the corridor filter's heading: ~1° off on a straight and wandering with the
+  floor texture under the 12 slices.
+- Kept: `corridorHeadingDeadbandDeg = 1.0`, a heading deadband that fades out with curvature.
+- Tried and dropped:
+  - a calibrated corridor heading zero: a different estimator, unreliable across sizes;
+  - rounding hysteresis and an output deadband;
+  - adaptive slice noise;
+  - lower heading drift.
+- Standing and open-loop ±1 are mostly gone (212 → 43, 11–45 → 1–22 frames).
+- In the closed loop the straight-line flips drop only modestly (0.82 → 0.57 per s at x = 1).
+- At ~0.5 m/s with x = 1 v2 weaves too from imperfect starts, so x = 0 stays the recommendation.
+- The real floor's heading noise will show in the Stage A CSVs. The knob can be tuned then.

@@ -24,6 +24,7 @@ Fill in the table at the end of each stage and send it back, together with the r
    - `AE/AWB LOCKED after calibration` / `AE/AWB unlocked` — only when the lock setting is on.
    - `EV compensation -1.0 -> index -3 (step 0.33)` — when EV is changed.
    - `REC off: <path>` / `CAPTURE saved <path>` — recording files (§A0.4).
+   - `FOV vertical=… deg horizontal=… deg (frame 960x1280; f=… mm; sensor …)` — once, at start.
 3. **HUD controls.** All are OFF / 0 by default.
    - Row 1, remembered between app starts, so check them before each test:
      - **AE/AWB LOCK**: locks exposure and white balance when calibration finishes; RECALIBRATE
@@ -64,9 +65,15 @@ Fill in the table at the end of each stage and send it back, together with the r
      - fps and `lib_ms`.
    - Replay a capture on the PC: `gradlew replay -Pcapture=recordings/lfcap_….bin`, run in
      `LineFollowerLibrary/`.
-5. **Calibrate** as before. Put the robot straight on a straight section, with the line in the cyan
+5. **Camera geometry.**
+   - The phone is mounted at **45°**, which is `cameraTiltDeg = 45`, the default. Keep it.
+   - **Write down the logged FOV.** It's the logcat line `FOV vertical=… deg horizontal=… deg …`, and
+     the HUD shows `vFOV …°` after the colour swatches.
+   - `verticalFovDeg` stays 60 (a guess) until we have this number. Copy the whole FOV line into the
+     Stage A table (A0 row).
+6. **Calibrate** as before. Put the robot straight on a straight section, with the line in the cyan
    STEER strip, floor visible on both sides, and nothing else in the strip. Wait for TRACKING.
-6. **Moving by hand.**
+7. **Moving by hand.**
    - **Push the whole robot** rather than the bare phone, so the camera height and tilt (20 cm,
      45°) stay as calibrated. If you move only the phone on its mount, keep the mount height and angle.
    - Keep the robot's centre over the line and turn it with the line, the way the robot would drive.
@@ -106,6 +113,8 @@ Fill in the table at the end of each stage and send it back, together with the r
 ### A1. Baseline: straight and curves, lock OFF
 
 - **Set up:** AE/AWB LOCK off, EV 0, normal room light. Calibrate. REC CSV on.
+- **Note (v3 straight-line fix, 2026-11-10):** on a straight, centred and still, STEER should read 0
+  most of the time. ±1 now and then is fine; a steady +1 or −1 is not, so note it.
 - **Do:**
   1. Push the robot along a straight, then through a gentle curve: slow, normal and fast passes.
   2. Standing on a straight, shift the robot sideways ~2 cm left of the line, then ~2 cm right.
@@ -254,6 +263,7 @@ after the pass.
 
 | # | Test | Variant | Pass / fail | Numbers | CSV / capture files | Notes |
 |---|---|---|---|---|---|---|
+| A0 | Camera | — | — | FOV line from logcat: · HUD vFOV: · phone model: | | |
 | A1 | Baseline | slow / normal / fast | | steer centred: · steer 2 cm left/right: · steer ±10°: · min TRACK on straight: · corr: · jumps: | | |
 | A2 | Lock OFF | — | | steer shade / no shade: · image re-exposes (y/n): | | |
 | A2 | Lock ON | — | | steer shade / no shade: · image fixed (y/n): · lock/unlock in logcat: | | |
@@ -284,9 +294,64 @@ failure with the HUD visible.
 
 1. **Integration.** Use the library in the RoboPhone system through `LineFollowerHelper`; the sketch
    is in `line_follower_block.js`, part 4.
-   - Use the same Config as RoboPhoneApp, but set `cameraTiltDeg` to the real mount angle.
+   - Use the same Config as RoboPhoneApp. `cameraTiltDeg = 45` (the mount angle, the default).
    - The camera may deliver grayscale (`getGrayscaleFrame`) or YUV. Note which one; with grayscale
      the line and floor must differ in brightness.
+   - **Frame size and orientation:** see the table below. Do not change the library defaults; set
+     these values in the Config that the helper creates.
+
+   **If your frame is W × H**
+
+   The library needs **forward = up** in the frame: the line must run from the bottom of the buffer
+   to the top as the robot drives. Then any size or aspect ratio works.
+
+   If RoboPhone delivers the frame sideways, with the line running left to right, rotate the
+   buffer by 90° before calling `calibrate` / `processFrame`; the library does not rotate. That is
+   the camera sensor's raw landscape orientation, while the phone is mounted upright.
+
+   Four Config values are in pixels and were chosen for 960 × 1280. Scale them:
+   - rows by H / 1280;
+   - columns by W / 960.
+
+   Everything else is a fraction of the frame or a multiple of the measured line width and stays
+   as it is.
+
+   | Frame W × H (forward up) | `hRoiThickPx` | `steerHeadingMinRows` | `vRoiHalfWidthPx` | `trackMemoryMinGatePx` | `verticalFovDeg` |
+   |---|---|---|---|---|---|
+   | 960 × 1280 (RoboPhoneApp, 4:3 portrait) | 24 | 24 | 80 | 48 | FOV logged by the app |
+   | 720 × 1280 (16:9 portrait) | 24 | 24 | 60 | 36 | FOV of the long side ¹ |
+   | 1080 × 1920 (16:9 portrait) | 36 | 36 | 90 | 54 | FOV of the long side ¹ |
+   | 480 × 640 (4:3 portrait) | 12 | 12 | 40 | 24 | same as 960 × 1280 |
+   | 240 × 320 (4:3 portrait) | 6 | 6 | 20 | 12 | same as 960 × 1280 |
+   | 1280 × 960 (4:3 landscape, forward up) | 18 | 18 | 107 | 64 | FOV of the short side ² |
+   | 640 × 480 (4:3 landscape, forward up) | 9 | 9 | 53 | 32 | FOV of the short side ² |
+   | any W × H | round(24·H/1280) | round(24·H/1280) | round(80·W/960) | round(48·W/960) | FOV along the frame's vertical axis |
+
+   - ¹ A 16:9 stream from a 4:3 sensor keeps the long side and crops the short side.
+   - ² The FOV the app logs as "horizontal" for the same stream.
+   - `verticalFovDeg` is always the FOV along the **frame's vertical axis**. RoboPhoneApp computes it
+     for its own stream (`FieldOfView.compute` in the app: focal length, sensor size, stream crop
+     and rotation). If RoboPhone uses a different resolution or aspect ratio, compute it again for
+     that stream.
+   - **The aspect ratio changes the steering scale; the size does not.** Steering is measured
+     relative to the frame's half-width.
+     - A narrower view (9:16) gives a larger Steering for the same offset on the floor. Use Blockly
+       c ≈ 0.75 instead of 1.0.
+     - A landscape view is much wider and gives a smaller Steering. Its look-ahead is also shorter,
+       so tracking reads differently.
+     - **Prefer a 3:4 portrait frame**, as in RoboPhoneApp. The defaults and the simulation results
+       are for it.
+   - Checked in simulation, along a straight + 80° curve, against 960 × 1280:
+
+     | Frame | Pixel values | Steering, mean / max difference | Tracking, max difference |
+     |---|---|---|---|
+     | 480 × 640, 240 × 320 | scaled | 1 / 3–4 | 2 |
+     | 240 × 320 | unscaled | — | up to 12 |
+     | 9:16 (720 × 1280, 1080 × 1920) | either | 2.5 / 6 | ~15 |
+     | landscape (1280 × 960, 640 × 480) | either | 3.4 / 9 | ~25 |
+
+     For 9:16 and landscape the different field of view causes the difference, not the pixel
+     values.
 2. **Recording.** It works the same way. The recorder uses only the pipeline's FrameCallback, so it
    runs inside any host app:
 
@@ -376,7 +441,7 @@ failure with the HUD visible.
 
 | # | Test | Variant | Pass / fail | Numbers | CSV / capture files | Notes |
 |---|---|---|---|---|---|---|
-| B0 | Setup | — | — | frame format (gray / YUV): · size: · phone: · tilt: · power for 0.6 m/s: | | |
+| B0 | Setup | — | — | frame format (gray / YUV): · size W×H: · forward up (y/n, rotated?): · Config pixel values used: · verticalFovDeg used: · phone: · power for 0.6 m/s: | | |
 | B1 | Straight | centred | | weaving: · max side error (cm): · sign changes/s: · steer std: | | |
 | B1 | Straight | start 3 cm off | | settles within (m): · weaving: | | |
 | B2 | Values | c 1.0, x 0 | | laps /2: · off line: · weaving: · lap time: | | |

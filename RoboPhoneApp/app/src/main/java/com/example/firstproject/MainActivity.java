@@ -25,6 +25,7 @@ import androidx.annotation.NonNull;
 import androidx.annotation.OptIn;
 import androidx.appcompat.app.AppCompatActivity;
 import androidx.camera.camera2.interop.Camera2CameraControl;
+import androidx.camera.camera2.interop.Camera2CameraInfo;
 import androidx.camera.camera2.interop.Camera2Interop;
 import androidx.camera.camera2.interop.CaptureRequestOptions;
 import androidx.camera.camera2.interop.ExperimentalCamera2Interop;
@@ -97,6 +98,13 @@ public class MainActivity extends AppCompatActivity {
     // ── CameraX ───────────────────────────────────────────────────────────────
     private PreviewView        previewView;
     private Camera             camera;          // bound camera (null until bound)
+    // Real vertical field of view of the frames the pipeline gets (deg), from Camera2 focal
+    // length + sensor size, for this stream's crop and orientation; 0 = not known yet. Only
+    // logged and shown — the pipeline still uses Config.verticalFovDeg (60) until measured.
+    private static final float APP_VFOV_DEG   = 60f;   // Config.verticalFovDeg used by the app
+    private volatile float     measuredVFovDeg = 0f;
+    private volatile float     measuredHFovDeg = 0f;
+    private boolean            fovRequested    = false;   // camera thread
 
     // ── v3 test settings (all OFF by default, remembered in SharedPreferences) ──
     // AE/AWB lock: after calibration completes, auto-exposure and auto-white-balance are locked
@@ -451,6 +459,11 @@ public class MainActivity extends AppCompatActivity {
             final int height = imageProxy.getHeight();
             final ImageProxy.PlaneProxy[] planes = imageProxy.getPlanes();
 
+            if (!fovRequested) {   // once: the real FOV for this frame size / orientation
+                fovRequested = true;
+                runOnUiThread(() -> computeFieldOfView(width, height));
+            }
+
             // Lazy-configure the library on the first frame when dimensions are known.
             if (!pipeline.isInitialized()) {
                 LineFollowerPipeline.Config cfg = new LineFollowerPipeline.Config();
@@ -461,7 +474,7 @@ public class MainActivity extends AppCompatActivity {
                 cfg.bottomIgnoreFrac = 0.25f;
                 cfg.vRoiHalfWidthPx  = 80;
                 cfg.cameraTiltDeg    = 45f;
-                cfg.verticalFovDeg   = 60f;
+                cfg.verticalFovDeg   = APP_VFOV_DEG;   // still the guess; see computeFieldOfView()
                 pipeline.configure(cfg);
                 final int cw = (width + 1) / 2, ch = (height + 1) / 2;
                 yFrame     = new byte[width * height];
@@ -726,9 +739,11 @@ public class MainActivity extends AppCompatActivity {
         swatchLine.setBackgroundColor(colors ? hudLineColor : Color.DKGRAY);
         swatchFloor.setBackgroundColor(colors ? hudFloorColor : Color.DKGRAY);
         final String thr = hudThreshold < 0 ? "none" : String.valueOf(hudThreshold);
-        tvDebug.setText(colors
+        final String fov = measuredVFovDeg > 0f
+                ? String.format(Locale.US, "  vFOV %.1f°", measuredVFovDeg) : "";
+        tvDebug.setText((colors
                 ? String.format(Locale.US, "thr: %s  sep: %.1fσ", thr, hudSeparation)
-                : String.format(Locale.US, "thr: %s  sep: --", thr));
+                : String.format(Locale.US, "thr: %s  sep: --", thr)) + fov);
 
         if (hudV3Enabled) {
             tvV3.setText(String.format(Locale.US,
@@ -804,6 +819,47 @@ public class MainActivity extends AppCompatActivity {
             Log.i(TAG, String.format(Locale.US, "EV compensation %+.1f -> index %d (step %.2f)", evSetting, idx, step));
         } catch (Exception e) {
             Log.w(TAG, "EV compensation failed: " + e.getMessage());
+        }
+    }
+
+    /**
+     * Real field of view of the frames handed to the pipeline, from the bound camera's Camera2
+     * characteristics: FOV = 2·atan(size / 2f) with f = LENS_INFO_AVAILABLE_FOCAL_LENGTHS[0] and
+     * size = the sensor's physical size (SENSOR_INFO_PHYSICAL_SIZE) scaled to the active array,
+     * then cropped to the stream's aspect ratio (CameraX scales the active array and crops the
+     * centre). The frame's vertical axis is the sensor axis with as many pixels as the frame
+     * height (the app rotates the frames to portrait). Logged as "FOV ..." and shown on the HUD.
+     * Not applied: Config.verticalFovDeg stays 60 until the number is confirmed.
+     */
+    @OptIn(markerClass = ExperimentalCamera2Interop.class)
+    private void computeFieldOfView(int frameW, int frameH) {
+        if (camera == null) return;
+        try {
+            final Camera2CameraInfo info = Camera2CameraInfo.from(camera.getCameraInfo());
+            final float[] focal = info.getCameraCharacteristic(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS);
+            final android.util.SizeF phys = info.getCameraCharacteristic(CameraCharacteristics.SENSOR_INFO_PHYSICAL_SIZE);
+            final Size pix = info.getCameraCharacteristic(CameraCharacteristics.SENSOR_INFO_PIXEL_ARRAY_SIZE);
+            final android.graphics.Rect act = info.getCameraCharacteristic(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE);
+            final Integer orient = info.getCameraCharacteristic(CameraCharacteristics.SENSOR_ORIENTATION);
+            if (focal == null || focal.length == 0 || phys == null || pix == null || act == null) {
+                Log.w(TAG, "FOV: camera characteristics incomplete");
+                return;
+            }
+            final double f = focal[0];
+            final double[] r = FieldOfView.compute(f, phys.getWidth(), phys.getHeight(), pix.getWidth(), pix.getHeight(),
+                    act.width(), act.height(), frameW, frameH);
+            measuredVFovDeg = (float) r[0];
+            measuredHFovDeg = (float) r[1];
+            Log.i(TAG, String.format(Locale.US,
+                    "FOV vertical=%.1f deg horizontal=%.1f deg (frame %dx%d; f=%.2f mm; sensor %.2fx%.2f mm,"
+                    + " active %dx%d of %dx%d px; crop %.2fx%.2f mm; sensor orientation %s)."
+                    + " Config.verticalFovDeg is still %.0f.",
+                    measuredVFovDeg, measuredHFovDeg, frameW, frameH, f, phys.getWidth(), phys.getHeight(),
+                    act.width(), act.height(), pix.getWidth(), pix.getHeight(), r[2], r[3],
+                    orient, APP_VFOV_DEG));
+            if (focal.length > 1) Log.i(TAG, "FOV: lens has several focal lengths " + Arrays.toString(focal) + "; used the first");
+        } catch (Exception e) {
+            Log.w(TAG, "FOV computation failed: " + e.getMessage());
         }
     }
 

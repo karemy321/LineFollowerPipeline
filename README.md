@@ -191,7 +191,9 @@ Calling `configure()` later discards the calibration (colours given with `setTra
 | Field | Type | Default | Range | Description |
 |---|---|---|---|---|
 | `cameraTiltDeg` | `float` | `45f` | `0 … 90` (degrees) | How far the phone's camera points below horizontal. Used for the perspective taper of the look-ahead, the look-ahead zero reference, the road-length slowdown, the line-width test of the look-ahead and the **heading** used by the steering (the line is projected onto the floor). Measure it on the real robot — a wrong value scales the heading part of the steering. Keep it large enough that the whole look-ahead lies below the horizon (floor only). |
-| `verticalFovDeg` | `float` | `60f` | `1 … 179` (degrees; phones ~55–65) | Vertical field of view of the camera (along the frame height). Most phone back cameras are ~55–65°. Used together with `cameraTiltDeg` for the floor projection. |
+| `verticalFovDeg` | `float` | `60f` | `1 … 179` (degrees; phones ~55–65) | Vertical field of view of the camera (along the frame height). Most phone back cameras are ~55–65°. Used together with `cameraTiltDeg` for the floor projection. RoboPhoneApp computes the real value for its stream from the Camera2 focal length and sensor size and logs it (`FOV vertical=…`); the default stays 60 until it is measured. |
+
+**Other frame sizes.** The library needs *forward = up* in the frame (the line runs from the bottom of the buffer to the top); a frame delivered sideways must be rotated before the call. Four values are in pixels and suit 960 × 1280: scale `hRoiThickPx` and `steerHeadingMinRows` by H / 1280, and `vRoiHalfWidthPx` and `trackMemoryMinGatePx` by W / 960. `verticalFovDeg` is the FOV along the frame's vertical axis. A table for common sizes is in `ROBOT_TEST_CHECKLIST.md` §B0.
 
 ### Track Memory
 
@@ -325,6 +327,7 @@ When the line is locked, the pipeline follows it as a curve on the floor, `x = A
 | `minChainSlices` | `int` | `4` | `≥ 2` | Slices on the line needed (when the near part is visible) to use the corridor result. |
 | `corridorMinConfidence` | `float` | `0.35f` | `0 … 1` | Below this confidence (coverage × fit quality) the frame uses the v2 logic. |
 | `corridorProcessNoise` | `float` | `1.0f` | `> 0` | How fast the curve may change between frames in the filter. Larger = follows sudden changes sooner, smooths less. |
+| `corridorHeadingDeadbandDeg` | `float` | `1.0f` | `≥ 0` degrees (`0` = off) | Straight-line deadband of the corridor's heading. On a straight the filter's heading is off by about 1° and wanders with the floor texture, which alone steered ±1 and could start a weave at speed. Headings below this are shrunk toward 0 (the excess passes); the shrink fades out as the curve sharpens, so curves keep their full heading. The offset part still corrects. |
 | `edgePairCheck` | `boolean` | `true` | `true` / `false` | With `corridorMode`: a scan-strip band without both sharp edges counts only a third. |
 
 ### Sensitivity
@@ -789,6 +792,7 @@ Set these before switching capture on.
 - **RECALIBRATE** button — re-learns the colours and the straight-ahead reference (place the robot on the line first).
 - **v3 test settings** (all off by default, remembered between runs): **AE/AWB LOCK** locks auto-exposure and white balance when calibration completes (Camera2 `CONTROL_AE_LOCK` / `CONTROL_AWB_LOCK` via Camera2Interop; RECALIBRATE unlocks first), **EV** sets exposure compensation (0, −0.5 … −2, +0.5, +1), **v3 HUD** shows corridor coverage / fit, `COAST` / `RECON`, the masked fraction, rejected bands, the lock state and EV, and a second line with the largest steering step, the jumps ≥ 25 and the frames at ±50 (tap it to reset). With all off the camera is set up exactly as before.
 - **Test recording** (off at every start): **REC CSV** writes the per-frame CSV log, **CAPTURE** keeps the last ~2 s of frames and saves them on events, **SAVE 2s** saves them now. The files go to `/sdcard/Android/data/com.example.firstproject/files/linefollower/` (see [Test Recording](#test-recording-v3)).
+- **Camera FOV**: at start the app computes the real vertical and horizontal field of view of its frames from the Camera2 data (focal length, sensor size, the stream's crop and rotation; `FieldOfView.java`, unit-tested), logs `FOV vertical=… deg horizontal=… deg …` and shows `vFOV …°` on the HUD. It is not applied: `verticalFovDeg` stays 60 until the number is confirmed.
 - **Logcat** (`adb logcat -s RoboPhone`): every 30 frames `PERF fps=… pipe_ms=… pipe_max_ms=… frame_ms=…`; `AE/AWB LOCKED after calibration` / `unlocked`; `EV compensation …`; `REC off: <file>`, `CAPTURE saved <file>`. See `ROBOT_TEST_CHECKLIST.md` for the tests (Stage A: by hand with this app; Stage B: closed loop inside RoboPhone).
 
 ---
@@ -802,7 +806,7 @@ cd LineFollowerLibrary
 gradlew test
 ```
 
-All **50 tests pass** with the v3 defaults (about 1 minute; one more, `CapturedScenesTest`, is skipped until captures from the phone are added):
+All **51 tests pass** with the v3 defaults (about 2 minutes; one more, `CapturedScenesTest`, is skipped until captures from the phone are added):
 
 - `LineFollowerPipelineTest` (24) — every input format and colour pair, calibration, the steering parts, the v2 hold (with `glareMask = false`), the v3 coast clock (600 ms, 100 ms clamp per frame, frame limit) and the v1 behaviour.
 - `TrackSimTest` (6) — rendered camera views: shadows, wood grain, turns, line loss, distractor tapes, dead ends.
@@ -810,6 +814,7 @@ All **50 tests pass** with the v3 defaults (about 1 minute; one more, `CapturedS
 - `AllocationTest` (1) — zero bytes allocated by 1000 `processFrame*` calls in each format, glare and lost-line frames included.
 - `RecorderTest` (6) — the test recorder: off it changes nothing and writes nothing; the CSV holds one line per frame with the FrameData values; the Config text round-trips; a capture replays on the desktop (steering within 1 of the "phone"); auto-capture saves on an event; zero bytes allocated on the camera thread with CSV and capture on.
 - `CapturedScenesTest` (1) — replays every capture in `src/test/captures/` (skipped while there are none).
+- `StraightLineTest` (1) — driving straight along a straight line on three floors (gray and YUV): steering stays 0 in at least 80 % of the frames, never flips sign and never exceeds ±1; the heading deadband at least halves the ±1 frames (v2 settings: always 0).
 
 Further tasks: `gradlew perf` (ms per frame at 960 × 1280, v3 vs the v2 settings), `gradlew checkJava8` (the library compiles as Java 8), `gradlew replay -Pcapture=…` (replay a capture from the phone). `gradlew jar` and the app build do not run the tests. The closed-loop simulator comparing v2 and v3 is in `_investigation/` (`run_v3_closed_loop.sh`, results in `_investigation/CHANGES_v3.md`).
 
