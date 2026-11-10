@@ -116,6 +116,19 @@ public class MainActivity extends AppCompatActivity {
     private Button           btnEv;
     private TextView         tvV3;
     private final Runnable   lockRunnable = () -> setAeAwbLock(true);
+
+    // ── Test recording (LineFollowerPipeline.Recorder; OFF at every start) ──
+    // REC CSV: one CSV line per frame (FrameData + timestamp). CAPTURE: keep the last ~2 s of
+    // frames (1/4 size) and save them on SAVE 2s or automatically on a coast / rebuilt base /
+    // rejected band / loss / steering jump. Files: getExternalFilesDir("linefollower").
+    private LineFollowerPipeline.Recorder recorder;
+    private CheckBox         cbRec, cbCapture;
+    private int              shownCaptures = 0;   // UI thread: captures already reported
+    private String           shownError;          // UI thread: recorder error already logged
+    // Steering-jump counters for the v3 HUD (camera thread writes; reset by tapping the line).
+    private volatile int     hudJumps = 0, hudPin50 = 0, hudMaxStep = 0, hudRejected = 0;
+    private int              prevSteer = Integer.MIN_VALUE;
+    private volatile boolean resetJumps = false;
     private ExecutorService    cameraExecutor;
 
     // ── Vision pipeline ───────────────────────────────────────────────────────
@@ -243,8 +256,26 @@ public class MainActivity extends AppCompatActivity {
             applyExposureCompensation(true);
         });
 
-        // Every calibration and processing frame reports here (camera thread).
-        pipeline.setFrameCallback(this::onPipelineFrame);
+        // Every calibration and processing frame reports here (camera thread). The recorder sits
+        // in front of onPipelineFrame and only forwards while REC / CAPTURE are off.
+        recorder = LineFollowerPipeline.Recorder.attach(pipeline,
+                getExternalFilesDir("linefollower"), this::onPipelineFrame);
+        cbRec     = findViewById(R.id.cb_rec);
+        cbCapture = findViewById(R.id.cb_capture);
+        cbRec.setOnCheckedChangeListener((b, on) -> {
+            recorder.setRecording(on);
+            Log.i(TAG, on ? "REC on" : "REC off: " + recorder.getLastCsvPath());
+        });
+        cbCapture.setOnCheckedChangeListener((b, on) -> {
+            recorder.setCapture(on);
+            recorder.setAutoCapture(on);
+            Log.i(TAG, "CAPTURE " + (on ? "on (auto-save on events)" : "off"));
+        });
+        findViewById(R.id.btn_save_capture).setOnClickListener(v -> {
+            if (!recorder.isCapturing()) { cbCapture.setChecked(true); return; }   // first tap: start keeping frames
+            recorder.captureNow();
+        });
+        tvV3.setOnClickListener(v -> resetJumps = true);
 
         // Dedicated background thread for image analysis
         cameraExecutor = Executors.newSingleThreadExecutor();
@@ -261,13 +292,15 @@ public class MainActivity extends AppCompatActivity {
     @Override
     protected void onPause() {
         super.onPause();
-        // CameraX unbinds automatically on lifecycle pause
+        // CameraX unbinds automatically on lifecycle pause. Close the CSV so the file is complete.
+        if (cbRec != null && cbRec.isChecked()) cbRec.setChecked(false);
     }
 
     @Override
     protected void onDestroy() {
         super.onDestroy();
         if (cameraExecutor != null) cameraExecutor.shutdown();
+        if (recorder != null) recorder.close();
         pipeline.release();
     }
 
@@ -539,6 +572,20 @@ public class MainActivity extends AppCompatActivity {
         hudRecon         = d.baseReconstructed;
         hudHeld          = d.lineHeld;
         hudMasked        = d.maskedFrac;
+        hudRejected      = d.rejectedBands;
+        // Steering jumps between consecutive frames (v3 HUD: "no ±50 jumps in glare").
+        if (resetJumps) { resetJumps = false; hudJumps = 0; hudPin50 = 0; hudMaxStep = 0; }
+        if (d.isCalibrated && wasCalibrated) {           // processing frames only
+            if (prevSteer != Integer.MIN_VALUE) {
+                final int step = Math.abs(d.steering - prevSteer);
+                if (step > hudMaxStep) hudMaxStep = step;
+                if (step >= 25) hudJumps++;
+            }
+            if (Math.abs(d.steering) >= 50) hudPin50++;
+            prevSteer = d.steering;
+        } else {
+            prevSteer = Integer.MIN_VALUE;
+        }
         // Calibration just finished: lock exposure / white balance if enabled (UI thread).
         if (d.isCalibrated && !wasCalibrated && aeLockEnabled) runOnUiThread(lockRunnable);
         wasCalibrated = d.isCalibrated;
@@ -685,11 +732,27 @@ public class MainActivity extends AppCompatActivity {
 
         if (hudV3Enabled) {
             tvV3.setText(String.format(Locale.US,
-                    "corr %.2f  rms %.2f  %s%s%s mask %.0f%%  AE %s  EV %+.1f",
+                    "corr %.2f  rms %.2f  %s%s%s mask %.0f%%  rej %d  AE %s  EV %+.1f%n"
+                    + "max step %d  jumps(>=25) %d  frames at ±50 %d  (tap to reset)%s%s",
                     hudCorrCoverage, hudCorrRms,
                     hudCoasting ? "COAST " : "", hudRecon ? "RECON " : "",
                     (hudHeld && !hudCoasting) ? "HOLD " : "",
-                    hudMasked * 100f, aeLocked ? "LOCKED" : "auto", evSetting));
+                    hudMasked * 100f, hudRejected, aeLocked ? "LOCKED" : "auto", evSetting,
+                    hudMaxStep, hudJumps, hudPin50,
+                    recorder.isRecording() ? "  REC" : "",
+                    recorder.isCapturing() ? "  CAP " + recorder.getCaptureCount()
+                            + (recorder.isCaptureBusy() ? " saving" : "") : ""));
+        }
+        // A capture was saved: tell the tester where (logcat + short toast).
+        final int caps = recorder.getCaptureCount();
+        if (caps != shownCaptures) {
+            shownCaptures = caps;
+            Log.i(TAG, "CAPTURE saved " + recorder.getLastCapturePath());
+            android.widget.Toast.makeText(this, "capture saved (" + caps + ")", android.widget.Toast.LENGTH_SHORT).show();
+        }
+        if (recorder.getLastError() != null) {
+            final String err = recorder.getLastError();
+            if (!err.equals(shownError)) { shownError = err; Log.w(TAG, "Recorder: " + err); }
         }
 
         hudPending = false;

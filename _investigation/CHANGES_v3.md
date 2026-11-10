@@ -1,8 +1,9 @@
 # LineFollowerPipeline v3 — glare robustness, corridor tracker, distractor hardening
 
 Branch `v3` (from `202e70f`, the v2 state). Plan and decisions: `LINE_FOLLOWER_V3_PLAN.md`
-(§11 user requirements, §12 capped edge pin, §13 bounded blob slowdown). On-robot tests:
-`ROBOT_TEST_CHECKLIST.md`. **Everything below is simulation; robot results are pending.**
+(§11 user requirements, §12 capped edge pin, §13 bounded blob slowdown). Tests on the phone:
+`ROBOT_TEST_CHECKLIST.md` (Stage A by hand with RoboPhoneApp, Stage B closed loop inside RoboPhone).
+**Everything below is simulation; robot results are pending.**
 
 ## 1. Results in short
 
@@ -14,12 +15,13 @@ Branch `v3` (from `202e70f`, the v2 state). Plan and decisions: `LINE_FOLLOWER_V
 | Distractors: short object at the straight-ahead column when re-acquiring; line running into a dark mat | locked on the object 3+ frames; tracking stays 100 across the mat | never locked; tracking ramps to the minimum like a plain dead end |
 | Distractors already handled by v2 (same-width object, blob, soft shadow) | pass | pass (beside a blob of the line's colour, tracking dips while the blob fills the far view — bounded at ≥ 60 once the line is seen past it) |
 | 90° corner, dead end vs the v2 settings | — | steering within 5, tracking within 10 of v2 |
-| Unit tests | 26/26 | **44/44** (26 original — `lostLineReportsTrackLost` and the v1 config now set `glareMask = false`, as planned — + 4 coast-clock tests, 13 scenarios, 1 allocation test) |
+| Unit tests | 26/26 | **50/50** (26 original — `lostLineReportsTrackLost` and the v1 config now set `glareMask = false`, as planned — + 4 coast-clock tests, 13 scenarios, 1 allocation test, 6 recorder tests; `CapturedScenesTest` is skipped until phone captures are added) |
 | `corridorMode = false, glareMask = false` | — | **identical to v2 on every frame** (72 runs × 40 frames, 4 colour pairs × 6 scenes incl. glare × gray / YUV / ARGB, 13 FrameData fields), re-checked after every phase |
 | Heap allocation per 1000 frames (gray / YUV / ARGB, glare + lost frames) | 0 / 0 / 0 B | **0 / 0 / 0 B** (`AllocationTest`) |
 | ms per frame, 960×1280 YUV, desktop, same JVM, alternating blocks (`gradlew perf`) | 1.03–1.07 | **0.59–0.65** (clean 0.74–0.77, glare over the strip 0.17–0.32, tape glare 0.83–0.86); p99 1.35–1.45 |
 | Closed loop, glare over the near strip (realistic speed / 3× speed, 40 runs each) | 11 / 7 completed | **37 / 32** completed |
 | Closed loop, no glare (realistic / 3× speed) | 120 / 72 completed | 120 / 73 completed |
+| Test recorder (§9), 1280×720 YUV, desktop | — | off: forwards only, output identical; CSV log ≈ 0 ms per frame; capture +0.17 ms per frame; 0 B allocated on the camera thread; desktop replay of a capture within 1 steering step of the "phone" |
 
 ## 2. What changed (by phase)
 
@@ -32,13 +34,15 @@ Branch `v3` (from `202e70f`, the v2 state). Plan and decisions: `LINE_FOLLOWER_V
 | 3 | `02d8cbd` | Continuity helper; D1 continuity-ranked (re)acquisition; D2 trimmed bands / cut look-ahead rows; D3 `edgePairCheck`. |
 | — | `efaaf50` | Bounded D2 slowdown (§13): tracking ≥ 60 when the line is seen continuing past a blob. |
 | 4 | `055630a` | App: AE/AWB lock after calibration (Camera2Interop), EV compensation, v3 HUD line — all off by default. |
-| 5 | `4550e56` + this | Filter tuning from the closed loop (see §5); harness glare; README, PDF, this report. |
+| 5 | `4550e56` + `8c417e2` | Filter tuning from the closed loop (see §5); harness glare; README, PDF, this report. |
+| — | (recorder commit) | Test recorder `LineFollowerPipeline.Recorder` (§9), desktop replay (`CaptureReplay`, `gradlew replay`), `tools/analyze_recording.py`; app REC CSV / CAPTURE / SAVE 2s and jump counters in the v3 HUD; `LineFollowerHelper` sketch with recording; checklist split into Stage A (by hand) and Stage B (closed loop in RoboPhone). |
 
 Public API: unchanged — only Config fields (`glareMask`, `glareLumaMax`, `glareCoastMs`,
 `glareCoastMaxFrames`, `frameIntervalMs`, `corridorMode`, `corridorSlices`, `corridorWidthMult`,
 `minChainSlices`, `corridorMinConfidence`, `corridorProcessNoise`, `edgePairCheck`) and FrameData
 fields (`baseReconstructed`, `coasting`, `maskedFrac`, `corridorCoverage`, `corridorFitRms`,
-`curveA`, `curveB`, `curveC`) were added. One file, Java 8 (`checkJava8`), no dependencies.
+`curveA`, `curveB`, `curveC`) and the optional nested class `Recorder` were added. One file, Java 8
+(`checkJava8`), no dependencies.
 
 ## 3. How v3 handles glare (plain words)
 
@@ -278,9 +282,10 @@ Runs whose outcome changed:
 | oval | black_on_wood | no | 0.50 | 0 | LEFT@0.83m | DONE |
 | oval | black_on_wood | no | 0.50 | 1 | LEFT@2.59m | DONE |
 
-## 6. Recommended starting values (Blockly program) — re-checked
+## 6. Recommended starting values (Blockly program) — simulation result, to be confirmed in Stage B
 
-Re-checked in the closed loop (§5) for v3:
+Re-checked in the closed loop (§5) for v3. **Simulation result, to be confirmed on the robot in
+Stage B** (`ROBOT_TEST_CHECKLIST.md` B1–B3):
 
 | Setting | Start with | Result in simulation |
 |---|---|---|
@@ -289,12 +294,14 @@ Re-checked in the closed loop (§5) for v3:
 | Offset **+ 5** | `5` (unchanged) | Raise to 6–8 if the robot does not move at power 5. |
 | Library | v3 defaults | `corridorMode`, `glareMask`, `edgePairCheck` on; `cameraTiltDeg` = real mount angle. For a v2 comparison on the robot: `corridorMode = false, glareMask = false`. |
 
-These values come from simulation; the robot test (`ROBOT_TEST_CHECKLIST.md`, tests 1, 6) decides.
+These values come from simulation; Stage B of `ROBOT_TEST_CHECKLIST.md` (B1 weaving, B2 c / x, B3 ~0.6 m/s)
+decides.
 
 ## 7. Known limitations / to verify on the robot
 
 1. **Simulation only.** Glare is an image-fixed saturated ellipse; real highlights move, flicker and
-   have colour fringes. Test 3 of the checklist is the important one.
+   have colour fringes. Tests A3 / A4 (by hand) and B4 (laps) of the checklist are the important ones;
+   captures of real glare can be replayed on the desktop (§9).
 2. **Capped pin accuracy** (§12): the capped value is a median of 6, at worst 16, from what v2 reads on a
    clean view — always the same direction, never ±50 (±50 stays the edge-exit signal).
 3. **Blob of the line's own colour touching the line**: Tracking dips while the blob fills the far view
@@ -307,18 +314,73 @@ These values come from simulation; the robot test (`ROBOT_TEST_CHECKLIST.md`, te
    from calibration absorbs small tilt errors only.
 7. **Time base**: the coast uses `System.nanoTime()` on the phone; in simulation/replay set
    `frameIntervalMs`.
-8. **App settings** (AE/AWB lock, EV) are untested on a real phone; with all off the camera set-up is
-   unchanged.
+8. **App settings** (AE/AWB lock, EV) and the **recorder** are untested on a real phone; with all
+   off the camera set-up is unchanged and the recorder only forwards frames. Capture adds ~0.2 ms per
+   frame on the desktop (more on a phone) and holds ~20 MB at 960 × 1280.
 
 ## 8. How to rerun
 
 ```bash
 cd LineFollowerLibrary
-gradlew test                    # 44 tests; -Dv3.runAll=true also runs not-yet-enabled scenarios
+gradlew test                    # 50 tests; -Dv3.runAll=true also runs not-yet-enabled scenarios
+gradlew replay -Pcapture=<lfcap_*.bin> [-Pset=glareMask=false,...]   # replay a capture from the phone
 gradlew perf checkJava8         # ms per frame (v3 vs v2 settings); Java 8 check
 cd ../_investigation
 ./run_v3_closed_loop.sh         # v2 (202e70f) vs v3, 4 regimes, ~10 min on 20 threads
 py -X utf8 summarize_v3.py > results/v3/summary.md
 py -X utf8 pdf_source/build_guide.py           # README.md + template -> ../LineFollowerPipeline_Integration_Guide.pdf
 py -X utf8 pdf_source/check_docs.py ../LineFollowerLibrary/src/main/java/com/example/linefollower/LineFollowerPipeline.java ../README.md <old.pdf> ../LineFollowerPipeline_Integration_Guide.pdf
+cd ..
+py tools/analyze_recording.py recordings/     # summary of CSV logs pulled from the phone
 ```
+
+## 9. Test recording (for the tests on the phone)
+
+`LineFollowerPipeline.Recorder` (nested in the one library file) is a `FrameCallback` that sits in
+the pipeline's callback slot and forwards every frame to the host's callback. It uses nothing else,
+so the same recorder works in RoboPhoneApp and inside the RoboPhone system through
+`LineFollowerHelper` (sketch in `line_follower_block.js`). Off by default.
+
+- **CSV log:** one line per calibrate / processFrame call.
+  - Contents: `t_ms`, frame counters, every scalar FrameData field (look-ahead path: first and
+    last point), `fps`, and `lib_ms`, the time inside `processFrame`, measured from the frame's
+    start timestamp. A `.cfg.txt` holds the Config.
+  - Lines are formatted into two pre-allocated 64 KB buffers. A background thread writes them at
+    least once a second; if it falls behind, lines are dropped and counted.
+- **Capture:** a ring of the last 120 frames at 1/4 size (Y + U + V; ARGB input stored as YUV),
+  plus the calibration frames (the first 16 and the last 32).
+  - Saved on `captureNow()` or on an event (coast, rebuilt base, rejected band, loss, steering
+    jump ≥ 30). An event save comes 30 frames after the event, so the file holds ~1.5 s before
+    and ~0.5 s after it.
+  - At most one capture per 120 frames, and at most 10 per recorder.
+  - The ring is frozen while the background thread writes it.
+- **Desktop replay** (`CaptureReplay`, `gradlew replay`): bilinear upscale to the phone's frame
+  size, Config from the file, calibration on the saved calibration frames, coast clock from the
+  phone's timestamps. Prints the phone's steering, tracking and flags next to the replay's.
+  - Simulated frames, YUV at 1/2 size: mean |Δsteering| 0.23, max 1. At 1/4 size: mean 0.1, max 1.
+  - Real frames will differ more: the downscaling, and the window starts without the phone's
+    earlier lock and filter state.
+- **Cost** (desktop, 1280 × 720 YUV, 3000 frames):
+
+  | | ms per frame |
+  |---|---|
+  | Off | 0.41 |
+  | CSV | 0.41 |
+  | CSV + capture | 0.58–0.59 |
+
+  - A capture file is 11.4 MB at 1280 × 720, about 15 MB at the app's 960 × 1280.
+  - 0 B allocated on the camera thread over 1000 frames with CSV, capture and auto-capture on,
+    including a save (`RecorderTest`).
+- **Tests** (`RecorderTest`, 6):
+  - off: identical output and no files;
+  - the CSV matches the FrameData of every frame;
+  - the Config text round-trips;
+  - a capture replays;
+  - auto-capture fires on an event;
+  - zero allocations.
+
+  `CapturedScenesTest` replays every capture copied to `LineFollowerLibrary/src/test/captures/`.
+- **Checked in simulation for the checklist:**
+  - Sliding the robot off the line: the line leaves the image after ~15 cm sideways; steering goes
+    to the exit side, stays pinned, and comes back smoothly when the robot returns.
+  - Covering the line completely: coast for 600 ms (TRACK ramps down), then ±50 toward the last side.

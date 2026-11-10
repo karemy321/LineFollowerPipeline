@@ -140,6 +140,8 @@ Blockly.JavaScript.forBlock['line_follower_read'] = function (block, generator) 
           pipeline.configure(cfg);
 
           LineFollowerHelper.camera = camera;
+          // Optional, for the Stage B tests (off unless called):
+          // startRecording(context.getExternalFilesDir("linefollower"), true, true);
       }
 
       // --- Calibration: feed frames until this returns true ---
@@ -167,8 +169,31 @@ Blockly.JavaScript.forBlock['line_follower_read'] = function (block, generator) 
       public static int getPower() { ensureProcessed(); return power; }
 
       public static void release() {
+          stopRecording();
           if (pipeline != null) pipeline.release();
       }
+
+      // --- Optional: test recording (default OFF; see ROBOT_TEST_CHECKLIST.md, Stage B) ---
+      // Uses only the pipeline's FrameCallback, so it works inside any host app.
+      //   dir: the host app's folder, e.g. context.getExternalFilesDir("linefollower")
+      //        → /sdcard/Android/data/<host package>/files/linefollower  (adb pull)
+      //   csv:     one CSV line per frame (FrameData + timestamp)
+      //   capture: keep the last ~2 s of frames (1/4 size) and save them automatically on a
+      //            coast / rebuilt base / rejected band / line loss / steering jump
+      private static LineFollowerPipeline.Recorder recorder;
+
+      public static void startRecording(java.io.File dir, boolean csv, boolean capture) {
+          if (recorder == null) recorder = LineFollowerPipeline.Recorder.attach(pipeline, dir, null);
+          recorder.setRecording(csv);
+          recorder.setCapture(capture);
+          recorder.setAutoCapture(capture);
+      }
+
+      // Save the last ~2 s now (e.g. from a "save capture" block or a button).
+      public static void saveCapture() { if (recorder != null) recorder.captureNow(); }
+
+      // Write everything still buffered and close the files (call when the program stops).
+      public static void stopRecording() { if (recorder != null) { recorder.close(); recorder = null; } }
   }
   ------------------------------------------------------------------------
 */

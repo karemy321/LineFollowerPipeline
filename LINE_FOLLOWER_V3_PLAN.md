@@ -424,9 +424,35 @@ New FrameData fields (additive): `baseReconstructed`, `coasting`, `corridorCover
     behaviour, app, tests, **Robot Results — pending**); PDF regenerated with `build_guide.py`
     (23 pages; `check_docs.py`: no mismatches); `_investigation/CHANGES_v3.md`.
   - Timing 0.59–0.65 ms/frame vs 1.03–1.07 (v2 settings); 0 bytes allocated; Java 8 OK; 44/44 tests.
-- [ ] **Robot test** — run `ROBOT_TEST_CHECKLIST.md` (7 tests, results table) — **pending, user**
-- [ ] **Tuning after the robot test** — defaults (`glareLumaMax`, `glareCoastMs`, `corridorWidthMult`,
-      `corridorProcessNoise`, `edgePairCheck`, Blockly c / x), AE/AWB lock / EV defaults in the app,
+- [x] Test recording + two-stage checklist (user request 2026-11-10: the robot cannot run under program
+      control yet; first a manual test with the app, then closed loop inside RoboPhone)
+  - `LineFollowerPipeline.Recorder` (nested, off by default), using only the FrameCallback, so it
+    works in RoboPhoneApp and inside RoboPhone via `LineFollowerHelper`:
+    - per-frame CSV: FrameData + `t_ms` + `lib_ms`;
+    - capture: the last 120 frames at 1/4 size + the calibration frames, saved on demand or on an
+      event (coast / rebuilt base / rejected band / loss / jump).
+  - Writes on a background thread; 0 B allocated on the camera thread. Capture +0.17 ms per frame
+    on the desktop; CSV ≈ 0.
+  - Desktop replay: `CaptureReplay` / `gradlew replay`, within 1 steering step on simulated
+    frames. `CapturedScenesTest` replays phone captures put in `src/test/captures/`.
+    `tools/analyze_recording.py` summarises a CSV.
+  - App: REC CSV, CAPTURE and SAVE 2s (off at every start); the v3 HUD adds `rej` and a line with
+    max step / jumps ≥ 25 / frames at ±50. The `LineFollowerHelper` sketch got
+    `startRecording` / `saveCapture` / `stopRecording`.
+  - `ROBOT_TEST_CHECKLIST.md`, with a fill-in table per stage:
+    - Stage A (by hand): A1–A9;
+    - Stage B (closed loop): B1–B5.
+  - Blockly c = 1.0, x = 0 marked "simulation result, to be confirmed in Stage B" in README, PDF
+    and CHANGES_v3.
+  - 50/50 tests (+1 skipped without captures); Java 8 OK; app builds; PDF regenerated (25 pages,
+    `check_docs.py` OK).
+- [ ] **Stage A — manual test with RoboPhoneApp** (`ROBOT_TEST_CHECKLIST.md` A1–A9, CSV + captures)
+      — **pending, user**
+- [ ] **Stage B — closed loop inside RoboPhone** (B1–B5: weaving, Blockly c / x, ~0.6 m/s, full laps)
+      — **pending, after Stage A and the RoboPhone integration**
+- [ ] **Tuning after the tests** — defaults (`glareLumaMax`, `glareCoastMs`, `corridorWidthMult`,
+      `corridorProcessNoise`, `edgePairCheck`, Blockly c / x), AE/AWB lock / EV defaults in the app;
+      phone captures of glare / distractor moments added to `src/test/captures/` as replay tests;
       then README "Robot Results", CHANGES_v3 and PDF update
 
 ## 10. Notes from the code check before Phase 0 (2026-11-09)

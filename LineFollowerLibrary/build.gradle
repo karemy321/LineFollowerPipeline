@@ -36,6 +36,8 @@ jar {
 test {
     systemProperty 'v3.runAll', System.getProperty('v3.runAll', 'false')
     systemProperty 'v3.reportDir', layout.buildDirectory.dir('v3-scenarios').get().asFile.absolutePath
+    // CapturedScenesTest: captures saved on the phone (default src/test/captures)
+    systemProperty 'captures.dir', System.getProperty('captures.dir', file('src/test/captures').absolutePath)
     maxHeapSize = '2g'
 }
 
@@ -53,4 +55,13 @@ tasks.register('checkJava8', JavaCompile) {
     destinationDirectory = layout.buildDirectory.dir('java8-check')
     options.release = 8
     options.compilerArgs += ['-Xlint:-options']
+}
+
+// gradlew replay -Pcapture=<lfcap_*.bin> [-Pset=name=value,...] — replay a capture saved on the phone
+// by LineFollowerPipeline.Recorder (CaptureReplay).
+tasks.register('replay', JavaExec) {
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'com.example.linefollower.CaptureReplay'
+    maxHeapSize = '2g'
+    args = [project.findProperty('capture') ?: '', project.findProperty('set') ?: '']
 }

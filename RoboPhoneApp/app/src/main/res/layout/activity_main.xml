@@ -186,6 +186,40 @@
                 android:textSize="11sp" />
         </LinearLayout>
 
+        <!-- Row 4d: test recording (OFF at every start; files in Android/data/<app>/files/linefollower) -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:gravity="center_vertical"
+            android:orientation="horizontal">
+
+            <CheckBox
+                android:id="@+id/cb_rec"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="REC CSV"
+                android:textColor="#AAAAAA"
+                android:textSize="11sp" />
+
+            <CheckBox
+                android:id="@+id/cb_capture"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="CAPTURE"
+                android:textColor="#AAAAAA"
+                android:textSize="11sp" />
+
+            <Button
+                android:id="@+id/btn_save_capture"
+                style="?android:attr/buttonBarButtonStyle"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:minHeight="32dp"
+                android:text="SAVE 2s"
+                android:textColor="#AAAAAA"
+                android:textSize="11sp" />
+        </LinearLayout>
+
         <!-- Row 5: learned colours + vision debug + recalibrate -->
         <LinearLayout
             android:layout_width="match_parent"

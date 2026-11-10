@@ -4275,4 +4275,568 @@ public final class LineFollowerPipeline {
         }
         return bestT;
     }
+
+    // =========================================================================
+    //  Recorder — per-frame CSV log and short frame capture for tests on the phone
+    // =========================================================================
+
+    /**
+     * Optional test recorder. Everything is OFF until switched on.
+     *
+     * It is a {@link FrameCallback}: {@link #attach} puts it in the pipeline's callback slot and
+     * it forwards every frame to the host's own callback (overlay / HUD). It needs nothing but
+     * the pipeline, so the same code works in RoboPhoneApp and inside the RoboPhone system
+     * (a Blockly program through LineFollowerHelper).
+     *
+     * <ul>
+     * <li><b>CSV log</b> ({@link #setRecording}): one line per calibrate / processFrame call:
+     *     a timestamp and every scalar FrameData field. File {@code dir/lf_YYYYMMDD_HHMMSS.csv},
+     *     plus {@code .cfg.txt} with the Config in use.</li>
+     * <li><b>Capture</b> ({@link #setCapture}): keeps the last {@link #captureFrames} frames,
+     *     downscaled by {@link #captureScale}, and the calibration frames in memory.
+     *     {@link #captureNow()} — or an event when {@link #setAutoCapture} is on — writes them
+     *     to {@code dir/lfcap_YYYYMMDD_HHMMSS_<reason>.bin}, which the desktop tool
+     *     {@code CaptureReplay} feeds back through the pipeline.</li>
+     * </ul>
+     *
+     * The camera thread does not allocate and does not wait for file I/O: CSV lines are
+     * formatted into two pre-allocated 64 KB buffers that a background thread writes; if that
+     * thread falls behind, lines are dropped and counted ({@link #getDroppedLines()}). The
+     * capture buffers are allocated once, on the first frame after capture is switched on
+     * (about 20 MB for 960 × 1280 at the defaults; a saved capture is about 15 MB). The setters
+     * may be called from any thread.
+     */
+    public static final class Recorder implements FrameCallback {
+
+        /** Frames kept for a capture: the last ~2 s at 60 fps. Set before setCapture(true). */
+        public int captureFrames = 120;
+        /** Capture downscale factor (1 = full size, 2, 4 …). Set before setCapture(true). */
+        public int captureScale = 4;
+        /** Auto-capture: frames still recorded after the event before saving (~0.5 s at 60 fps). */
+        public int postTriggerFrames = 30;
+        /** Most captures this recorder saves (protects the phone's storage). */
+        public int maxCaptures = 10;
+        /** Auto-capture: a steering change of at least this much between two frames is an event. */
+        public int jumpTrigger = 30;
+
+        /** Auto-capture reasons, also the last part of the file name. */
+        public static final String REASON_MANUAL = "manual", REASON_COAST = "coast",
+                REASON_RECON = "recon", REASON_REJECT = "reject", REASON_LOST = "lost",
+                REASON_JUMP = "jump";
+
+        static final String CSV_COLUMNS = "t_ms,frame,total_frames,processing,calibrated,calib_phase,"
+                + "calib_progress,calib_issue,track_found,steering,tracking,centroid_x,track_width,"
+                + "steer_ref_x,track_ref_x,tilt_deg,heading_deg,heading_conf,steer_offset,steer_heading,"
+                + "threshold,line_held,coasting,base_recon,rejected_bands,masked_frac,corr_coverage,"
+                + "corr_rms,curve_a,curve_b,curve_c,la_points,la_near_col,la_near_row,la_far_col,"
+                + "la_far_row,color_ready,line_color,floor_color,color_sep,img_w,img_h,hroi_top,"
+                + "hroi_bot,vroi_top,ignore_top,half_bot,half_top,fps,lib_ms";
+        static final int CAPTURE_VERSION = 1;
+        private static final byte[] CSV_HEADER = (CSV_COLUMNS + "\n").getBytes(java.nio.charset.StandardCharsets.US_ASCII);
+        private static final int  CHUNK = 64 * 1024, MAX_LINE = 1024;
+        private static final int  CAL_HEAD = 16, CAL_TAIL = 32;    // calibration frames kept
+        private static final long FLUSH_NS = 1000000000L;          // hand the CSV to the writer ≥ 1×/s
+
+        private final LineFollowerPipeline p;
+        private final java.io.File dir;
+        private volatile FrameCallback next;
+        private final Object lock = new Object();
+        private Thread writer;
+        private volatile String lastCsvPath, lastCapturePath, lastError;
+
+        // ── CSV log (guarded by lock) ──
+        private final byte[][] chunk = { new byte[CHUNK], new byte[CHUNK] };
+        private final int[]  chunkLen = new int[2], chunkSession = new int[2];
+        private final long[] chunkEpoch = new long[2];
+        private final int[]  chunkW = new int[2], chunkH = new int[2];
+        private int  active, pos, queued = -1, session, closeSession = -1;
+        private volatile boolean recording;
+        private long t0Ns, epochMs, lastSubmitNs;
+        private int  frameNo;
+        private volatile int dropped;
+        private boolean stopWriter;
+        private byte[] buf;   // = chunk[active] while formatting a line
+
+        // ── Capture (ring written by the camera thread; read by the writer only while frozen) ──
+        private volatile boolean wantCapture, autoCapture, captureRequested;
+        private volatile boolean frozen;           // set by the camera thread, cleared by the writer
+        private volatile int captureCount;
+        private boolean capturePending;            // guarded by lock
+        private String  saveReason;                // guarded by lock
+        private int     saveCal, saveRun, saveCalCount, saveRunCount;
+        private byte[][] capY, capU, capV;         // slots: [0, CAL_HEAD + CAL_TAIL) calibration, then run ring
+        private int[]   mFrame, mSteer, mTrack, mFlags, mRej;
+        private long[]  mT;
+        private float[] mMask;
+        private int capS, capW, capH, capCw, capCh, capFullW, capFullH, capN;
+        private boolean capChroma;
+        private int calCount, runCount, sinceSave, countdown = -1, capFrameNo;
+        private boolean lastRun;
+        private String  pendingReason;
+        private boolean prevFound, prevCoast, prevRecon;
+        private int     prevRej, prevSteer;
+
+        private Recorder(LineFollowerPipeline pipeline, java.io.File dir, FrameCallback next) {
+            this.p = pipeline; this.dir = dir; this.next = next;
+        }
+
+        /**
+         * Create a recorder for {@code pipeline} and register it as the pipeline's frame
+         * callback. Nothing is recorded until {@link #setRecording} / {@link #setCapture}.
+         *
+         * @param pipeline  the pipeline to record
+         * @param dir       folder for the files (created if missing), e.g.
+         *                  {@code context.getExternalFilesDir("linefollower")}
+         * @param next      the host's own callback (overlay / HUD), or null
+         */
+        public static Recorder attach(LineFollowerPipeline pipeline, java.io.File dir, FrameCallback next) {
+            final Recorder r = new Recorder(pipeline, dir, next);
+            pipeline.setFrameCallback(r);
+            return r;
+        }
+
+        /** Replace the callback that receives every frame after the recorder. */
+        public void setNext(FrameCallback next) { this.next = next; }
+
+        /** Start (true) or stop (false) the CSV log; each start opens a new file. */
+        public void setRecording(boolean on) {
+            synchronized (lock) {
+                if (on == recording) return;
+                if (on) {
+                    ensureWriter();
+                    session++;
+                    pos = 0;
+                    System.arraycopy(CSV_HEADER, 0, chunk[active], 0, CSV_HEADER.length);
+                    pos = CSV_HEADER.length;
+                    t0Ns = lastSubmitNs = System.nanoTime();
+                    epochMs = System.currentTimeMillis();
+                    frameNo = 0;
+                    recording = true;
+                } else {
+                    recording = false;
+                    flushLocked(1000);
+                    closeSession = session;
+                    lock.notifyAll();
+                }
+            }
+        }
+
+        /** Keep the last frames in memory for {@link #captureNow()} / auto-capture. */
+        public void setCapture(boolean on) {
+            if (on) synchronized (lock) { ensureWriter(); }
+            wantCapture = on;
+        }
+
+        /** Save a capture automatically on a coast / rebuilt base / rejected band / loss / jump
+         *  (at most one per {@link #captureFrames} frames, at most {@link #maxCaptures}). Needs
+         *  setCapture(true). */
+        public void setAutoCapture(boolean on) { autoCapture = on; }
+
+        /** Save the frames in memory (the last ~2 s) on the next frame. Needs setCapture(true). */
+        public void captureNow() { captureRequested = true; }
+
+        public boolean isRecording()      { return recording; }
+        public boolean isCapturing()      { return wantCapture; }
+        public boolean isAutoCapture()    { return autoCapture; }
+        /** True while a capture waits for its post-event frames or is being written. */
+        public boolean isCaptureBusy()    { return frozen || countdown >= 0; }
+        public int     getCaptureCount()  { return captureCount; }
+        /** CSV lines lost because the writer thread fell behind (should stay 0). */
+        public int     getDroppedLines()  { return dropped; }
+        public String  getLastCsvPath()   { return lastCsvPath; }
+        public String  getLastCapturePath() { return lastCapturePath; }
+        /** Last file error (null if none). */
+        public String  getLastError()     { return lastError; }
+
+        /**
+         * Stop recording, write what is still buffered and stop the writer thread (waits up to
+         * 5 s). Call from onDestroy / release. The recorder stays registered as the callback and
+         * keeps forwarding frames.
+         */
+        public void close() {
+            wantCapture = false;
+            autoCapture = false;
+            setRecording(false);
+            final Thread t;
+            synchronized (lock) {
+                stopWriter = true;
+                lock.notifyAll();
+                t = writer;
+            }
+            if (t != null) {
+                try { t.join(5000); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+            }
+            synchronized (lock) { writer = null; stopWriter = false; }
+        }
+
+        @Override public void onFrame(FrameData d) {
+            if (recording) {
+                synchronized (lock) { if (recording) appendLine(d); }
+            }
+            if (wantCapture || capY != null) captureFrame(d);
+            final FrameCallback n = next;
+            if (n != null) n.onFrame(d);
+        }
+
+        // ── CSV ────────────────────────────────────────────────────────────
+
+        private void ensureWriter() {
+            if (writer != null) return;
+            stopWriter = false;
+            writer = new Thread(new Runnable() { @Override public void run() { writerLoop(); } }, "LF-Recorder");
+            writer.setDaemon(true);
+            writer.setPriority(Thread.MIN_PRIORITY);
+            writer.start();
+        }
+
+        /** Hand the active buffer to the writer; false if the writer still holds the other one. */
+        private boolean submitLocked() {
+            if (queued >= 0) return false;
+            chunkLen[active] = pos; chunkSession[active] = session; chunkEpoch[active] = epochMs;
+            chunkW[active] = p.imgW; chunkH[active] = p.imgH;
+            queued = active;
+            active ^= 1;
+            pos = 0;
+            lastSubmitNs = System.nanoTime();
+            lock.notifyAll();
+            return true;
+        }
+
+        /** Submit what is buffered, waiting up to {@code waitMs} for the writer. */
+        private void flushLocked(long waitMs) {
+            if (pos == 0) return;
+            final long end = System.currentTimeMillis() + waitMs;
+            while (queued >= 0 && System.currentTimeMillis() < end) {
+                try { lock.wait(20); } catch (InterruptedException e) { Thread.currentThread().interrupt(); break; }
+            }
+            if (!submitLocked()) { dropped++; pos = 0; }
+        }
+
+        private void appendLine(FrameData d) {
+            if (pos + MAX_LINE > CHUNK && !submitLocked()) { dropped++; return; }
+            final long now = System.nanoTime();
+            buf = chunk[active];
+            final long us = (now - t0Ns) / 1000L;
+            putLong(us / 1000L); put('.'); put3(us % 1000L); put(',');
+            putLong(frameNo++); put(',');
+            putLong(p.totalFrames); put(',');
+            putBool(p.isProcessing); putBool(d.isCalibrated);
+            putLong(d.calibPhase); put(','); putFix(d.calibProgress, 3); putLong(d.calibIssue); put(',');
+            putBool(d.trackFound); putLong(d.steering); put(','); putLong(d.tracking); put(',');
+            putFix(d.centroidXFrac, 4); putFix(d.trackWidthFrac, 4);
+            putFix(d.steerRefXFrac, 4); putFix(d.trackRefXFrac, 4);
+            putFix(d.tiltDeg, 2); putFix(d.headingDeg, 2); putFix(d.headingConfidence, 3);
+            putFix(d.steerOffsetTerm, 2); putFix(d.steerHeadingTerm, 2);
+            putLong(d.threshold); put(',');
+            putBool(d.lineHeld); putBool(d.coasting); putBool(d.baseReconstructed);
+            putLong(d.rejectedBands); put(',');
+            putFix(d.maskedFrac, 3); putFix(d.corridorCoverage, 3); putFix(d.corridorFitRms, 3);
+            putFix(d.curveA, 4); putFix(d.curveB, 4); putFix(d.curveC, 4);
+            final int n = d.lookAheadPointCount;
+            putLong(n); put(',');
+            putFix(n > 0 ? d.lookAheadColFrac[0] : -1f, 4); putFix(n > 0 ? d.lookAheadRowFrac[0] : -1f, 4);
+            putFix(n > 0 ? d.lookAheadColFrac[n - 1] : -1f, 4); putFix(n > 0 ? d.lookAheadRowFrac[n - 1] : -1f, 4);
+            putBool(d.colorModelReady); putHex6(d.lineColorArgb); putHex6(d.floorColorArgb);
+            putFix(d.colorSeparation, 2);
+            putLong(d.imgW); put(','); putLong(d.imgH); put(',');
+            putFix(d.hRoiTopFrac, 4); putFix(d.hRoiBotFrac, 4); putFix(d.vRoiTopFrac, 4);
+            putFix(d.ignoreTopFrac, 4); putFix(d.halfBotFrac, 4); putFix(d.halfTopFrac, 4);
+            putLong(p.framesPerSecond); put(',');
+            // Time inside processFrame up to this callback (≈ the library's time for the frame).
+            putFix(p.isProcessing && p.lastFrameNs != 0L ? (now - p.lastFrameNs) / 1e6f : 0f, 3);
+            buf[pos - 1] = '\n';
+            if (now - lastSubmitNs >= FLUSH_NS) submitLocked();
+        }
+
+        private void put(char c) { buf[pos++] = (byte) c; }
+        private void putBool(boolean b) { buf[pos++] = (byte) (b ? '1' : '0'); buf[pos++] = ','; }
+        private void put3(long v) {
+            buf[pos++] = (byte) ('0' + v / 100); buf[pos++] = (byte) ('0' + v / 10 % 10); buf[pos++] = (byte) ('0' + v % 10);
+        }
+        private void putLong(long v) {
+            if (v < 0) { buf[pos++] = '-'; v = -v; }
+            if (v < 0) v = Long.MAX_VALUE;        // Long.MIN_VALUE
+            int start = pos;
+            do { buf[pos++] = (byte) ('0' + v % 10); v /= 10; } while (v > 0);
+            for (int i = start, j = pos - 1; i < j; i++, j--) { final byte t = buf[i]; buf[i] = buf[j]; buf[j] = t; }
+        }
+        /** Fixed-point number with {@code dec} decimals, then a comma. */
+        private void putFix(float f, int dec) {
+            if (f != f) { buf[pos++] = 'n'; buf[pos++] = 'a'; buf[pos++] = 'n'; buf[pos++] = ','; return; }
+            long scale = 1; for (int i = 0; i < dec; i++) scale *= 10;
+            double v = Math.max(-1e12, Math.min(1e12, f));
+            long r = Math.round(Math.abs(v) * scale);
+            if (v < 0 && r != 0) buf[pos++] = '-';
+            putLong(r / scale);
+            if (dec > 0) {
+                buf[pos++] = '.';
+                long frac = r % scale;
+                for (long s = scale / 10; s > 0; s /= 10) { buf[pos++] = (byte) ('0' + frac / s % 10); }
+            }
+            buf[pos++] = ',';
+        }
+        private void putHex6(int c) {
+            for (int sh = 20; sh >= 0; sh -= 4) buf[pos++] = (byte) "0123456789abcdef".charAt((c >> sh) & 0xF);
+            buf[pos++] = ',';
+        }
+
+        // ── Capture ────────────────────────────────────────────────────────
+
+        private void captureFrame(FrameData d) {
+            if (frozen) return;
+            if (!wantCapture) { capY = capU = capV = null; countdown = -1; return; }
+            final LineFollowerPipeline q = p;
+            final boolean chroma = q.srcFormat != FMT_GRAY;
+            final int s = Math.max(1, captureScale), n = Math.max(1, captureFrames);
+            if (capY == null || capFullW != q.imgW || capFullH != q.imgH || capChroma != chroma
+                    || capS != s || capN != n) allocCapture(q.imgW, q.imgH, s, n, chroma);
+            final boolean run = q.isProcessing;
+            final int slot;
+            if (!run) {
+                if (lastRun) { calCount = 0; runCount = 0; countdown = -1; }   // recalibration
+                slot = calCount < CAL_HEAD ? calCount : CAL_HEAD + (calCount - CAL_HEAD) % CAL_TAIL;
+                calCount++;
+            } else {
+                slot = CAL_HEAD + CAL_TAIL + runCount % capN;
+                runCount++;
+                sinceSave++;
+            }
+            lastRun = run;
+            grab(slot);
+            mFrame[slot] = capFrameNo++;
+            mT[slot]     = System.nanoTime();
+            mSteer[slot] = d.steering;
+            mTrack[slot] = d.tracking;
+            mFlags[slot] = (d.trackFound ? 1 : 0) | (d.lineHeld ? 2 : 0) | (d.coasting ? 4 : 0)
+                         | (d.baseReconstructed ? 8 : 0) | (d.isCalibrated ? 16 : 0);
+            mRej[slot]   = d.rejectedBands;
+            mMask[slot]  = d.maskedFrac;
+
+            if (captureRequested) {
+                captureRequested = false;
+                countdown = -1;
+                save(REASON_MANUAL);
+            } else if (run) {
+                if (countdown < 0 && autoCapture && sinceSave >= capN && captureCount < maxCaptures) {
+                    final String why = d.coasting && !prevCoast ? REASON_COAST
+                            : d.baseReconstructed && !prevRecon ? REASON_RECON
+                            : d.rejectedBands > 0 && prevRej == 0 ? REASON_REJECT
+                            : !d.trackFound && prevFound ? REASON_LOST
+                            : Math.abs(d.steering - prevSteer) >= jumpTrigger ? REASON_JUMP : null;
+                    if (why != null) { pendingReason = why; countdown = Math.max(0, postTriggerFrames); }
+                }
+                if (countdown >= 0 && countdown-- == 0) { countdown = -1; save(pendingReason); }
+            }
+            if (run) {
+                prevFound = d.trackFound; prevCoast = d.coasting; prevRecon = d.baseReconstructed;
+                prevRej = d.rejectedBands; prevSteer = d.steering;
+            }
+        }
+
+        private void allocCapture(int w, int h, int s, int n, boolean chroma) {
+            capFullW = w; capFullH = h; capS = s; capN = n; capChroma = chroma;
+            capW = Math.max(1, w / s); capH = Math.max(1, h / s);
+            capCw = (capW + 1) / 2; capCh = (capH + 1) / 2;
+            final int slots = CAL_HEAD + CAL_TAIL + n;
+            capY = new byte[slots][capW * capH];
+            capU = chroma ? new byte[slots][capCw * capCh] : null;
+            capV = chroma ? new byte[slots][capCw * capCh] : null;
+            mFrame = new int[slots]; mSteer = new int[slots]; mTrack = new int[slots];
+            mFlags = new int[slots]; mRej = new int[slots]; mT = new long[slots]; mMask = new float[slots];
+            calCount = runCount = 0; sinceSave = n; countdown = -1; lastRun = false;
+        }
+
+        /** Downscale the frame being processed into a slot (2 × 2 average at each block centre). */
+        private void grab(int slot) {
+            final LineFollowerPipeline q = p;
+            final int W = q.imgW, H = q.imgH, s = capS, dw = capW, dh = capH;
+            final int o = s >= 2 ? s / 2 - 1 : 0, o2 = s >= 2 ? 1 : 0;
+            final byte[] dy = capY[slot];
+            if (q.srcFormat == FMT_ARGB) {
+                final int[] a = q.srcArgb;
+                final byte[] du = capU[slot], dv = capV[slot];
+                for (int y = 0; y < dh; y++) {
+                    final int row = Math.min(H - 1, y * s + o) * W;
+                    for (int x = 0; x < dw; x++) {
+                        final int c = a[row + Math.min(W - 1, x * s + o)];
+                        dy[y * dw + x] = (byte) lumaOf(c);
+                        if ((x & 1) == 0 && (y & 1) == 0) {
+                            du[(y >> 1) * capCw + (x >> 1)] = (byte) chromaUOf(c);
+                            dv[(y >> 1) * capCw + (x >> 1)] = (byte) chromaVOf(c);
+                        }
+                    }
+                }
+                return;
+            }
+            final byte[] sy = q.srcY;
+            for (int y = 0; y < dh; y++) {
+                final int r0 = Math.min(H - 1, y * s + o) * W, r1 = Math.min(H - 1, y * s + o + o2) * W;
+                for (int x = 0; x < dw; x++) {
+                    final int c0 = Math.min(W - 1, x * s + o), c1 = Math.min(W - 1, x * s + o + o2);
+                    dy[y * dw + x] = (byte) (((sy[r0 + c0] & 0xFF) + (sy[r0 + c1] & 0xFF)
+                                            + (sy[r1 + c0] & 0xFF) + (sy[r1 + c1] & 0xFF) + 2) >> 2);
+                }
+            }
+            if (!capChroma) return;
+            final int uw = q.uvW, uh = (H + 1) / 2;
+            downChroma(q.srcU, capU[slot], uw, uh, s, o, o2);
+            downChroma(q.srcV, capV[slot], uw, uh, s, o, o2);
+        }
+
+        private void downChroma(byte[] src, byte[] dst, int uw, int uh, int s, int o, int o2) {
+            for (int y = 0; y < capCh; y++) {
+                final int r0 = Math.min(uh - 1, y * s + o) * uw, r1 = Math.min(uh - 1, y * s + o + o2) * uw;
+                for (int x = 0; x < capCw; x++) {
+                    final int c0 = Math.min(uw - 1, x * s + o), c1 = Math.min(uw - 1, x * s + o + o2);
+                    dst[y * capCw + x] = (byte) (((src[r0 + c0] & 0xFF) + (src[r0 + c1] & 0xFF)
+                                               + (src[r1 + c0] & 0xFF) + (src[r1 + c1] & 0xFF) + 2) >> 2);
+                }
+            }
+        }
+
+        /** Freeze the ring and let the writer save it (skipped if a save is still running). */
+        private void save(String reason) {
+            synchronized (lock) {
+                if (capturePending || writer == null) return;
+                capturePending = true;
+                saveReason   = reason;
+                saveCalCount = calCount;
+                saveRunCount = runCount;
+                saveCal = Math.min(calCount, CAL_HEAD + CAL_TAIL);
+                saveRun = Math.min(runCount, capN);
+                frozen = true;
+                lock.notifyAll();
+            }
+            sinceSave = 0;
+        }
+
+        // ── Writer thread ──────────────────────────────────────────────────
+
+        private void writerLoop() {
+            java.io.OutputStream csv = null;
+            int csvSession = -1;
+            while (true) {
+                final int q, closeS;
+                final boolean cap, stop;
+                synchronized (lock) {
+                    while (queued < 0 && !capturePending && !stopWriter && closeSession < 0) {
+                        try { lock.wait(); } catch (InterruptedException e) { return; }
+                    }
+                    q = queued; cap = capturePending; stop = stopWriter; closeS = closeSession;
+                    closeSession = -1;
+                }
+                if (q >= 0) {
+                    try {
+                        if (chunkSession[q] != csvSession) {
+                            closeQuietly(csv);
+                            csvSession = chunkSession[q];
+                            csv = openCsv(chunkEpoch[q], chunkW[q], chunkH[q]);
+                        }
+                        if (csv != null) csv.write(chunk[q], 0, chunkLen[q]);
+                    } catch (java.io.IOException e) {
+                        lastError = "CSV: " + e.getMessage();
+                    }
+                    synchronized (lock) { queued = -1; lock.notifyAll(); }
+                }
+                if (closeS >= 0 && closeS == csvSession) { closeQuietly(csv); csv = null; csvSession = -1; }
+                if (cap) {
+                    try {
+                        writeCapture();
+                    } catch (java.io.IOException e) {
+                        lastError = "capture: " + e.getMessage();
+                    }
+                    synchronized (lock) { capturePending = false; frozen = false; lock.notifyAll(); }
+                }
+                if (stop) {
+                    synchronized (lock) {
+                        if (queued < 0 && !capturePending) { closeQuietly(csv); return; }
+                    }
+                }
+            }
+        }
+
+        private static void closeQuietly(java.io.Closeable c) {
+            if (c == null) return;
+            try { c.close(); } catch (java.io.IOException ignored) { }
+        }
+
+        private java.io.File newFile(long epoch, String prefix, String suffix) {
+            if (!dir.isDirectory() && !dir.mkdirs() && !dir.isDirectory()) lastError = "cannot create " + dir;
+            final String stamp = new java.text.SimpleDateFormat("yyyyMMdd_HHmmss", java.util.Locale.US)
+                    .format(new java.util.Date(epoch));
+            java.io.File f = new java.io.File(dir, prefix + stamp + suffix);
+            for (int i = 2; f.exists(); i++) f = new java.io.File(dir, prefix + stamp + "_" + i + suffix);
+            return f;
+        }
+
+        private java.io.OutputStream openCsv(long epoch, int w, int h) throws java.io.IOException {
+            final java.io.File f = newFile(epoch, "lf_", ".csv");
+            final java.io.OutputStream out = new java.io.FileOutputStream(f);
+            final String base = f.getPath().substring(0, f.getPath().length() - 4);
+            final java.io.Writer cfgOut = new java.io.OutputStreamWriter(
+                    new java.io.FileOutputStream(base + ".cfg.txt"), java.nio.charset.StandardCharsets.UTF_8);
+            try {
+                cfgOut.write("# LineFollowerPipeline recording " + f.getName() + ", started "
+                        + new java.util.Date(epoch) + ", frame " + w + "x" + h + "\n");
+                cfgOut.write(configText(p.cfg));
+            } finally {
+                cfgOut.close();
+            }
+            lastCsvPath = f.getPath();
+            return out;
+        }
+
+        /** Every public Config field as {@code name=value} lines (read back by CaptureReplay). */
+        static String configText(Config c) {
+            final StringBuilder sb = new StringBuilder();
+            for (java.lang.reflect.Field f : Config.class.getFields()) {
+                if (java.lang.reflect.Modifier.isStatic(f.getModifiers())) continue;
+                try {
+                    sb.append(f.getName()).append('=').append(f.get(c)).append('\n');
+                } catch (IllegalAccessException ignored) { }
+            }
+            return sb.toString();
+        }
+
+        /** Capture file (big-endian): "LFCAP", version, sizes, reason, Config text, frames. */
+        private void writeCapture() throws java.io.IOException {
+            final long epoch = System.currentTimeMillis();
+            final java.io.File f = newFile(epoch, "lfcap_", "_" + saveReason + ".bin");
+            final java.io.DataOutputStream out = new java.io.DataOutputStream(
+                    new java.io.BufferedOutputStream(new java.io.FileOutputStream(f), 1 << 16));
+            try {
+                out.writeBytes("LFCAP");
+                out.writeByte(CAPTURE_VERSION);
+                out.writeInt(capFullW); out.writeInt(capFullH); out.writeInt(capS);
+                out.writeInt(capW); out.writeInt(capH); out.writeBoolean(capChroma);
+                out.writeLong(epoch);
+                out.writeUTF(saveReason);
+                out.writeUTF(configText(p.cfg));
+                out.writeInt(saveCal + saveRun);
+                // Calibration frames: the first CAL_HEAD, then the last CAL_TAIL (oldest first).
+                final int head = Math.min(saveCalCount, CAL_HEAD);
+                for (int i = 0; i < head; i++) writeSlot(out, 0, i);
+                final int tail = saveCal - head;
+                for (int k = saveCalCount - CAL_HEAD - tail; k < saveCalCount - CAL_HEAD; k++) {
+                    writeSlot(out, 0, CAL_HEAD + k % CAL_TAIL);
+                }
+                for (int k = saveRunCount - saveRun; k < saveRunCount; k++) {
+                    writeSlot(out, 1, CAL_HEAD + CAL_TAIL + k % capN);
+                }
+            } finally {
+                out.close();
+            }
+            captureCount++;
+            lastCapturePath = f.getPath();
+        }
+
+        private void writeSlot(java.io.DataOutputStream out, int kind, int slot) throws java.io.IOException {
+            out.writeByte(kind);
+            out.writeInt(mFrame[slot]); out.writeLong(mT[slot]);
+            out.writeInt(mSteer[slot]); out.writeInt(mTrack[slot]);
+            out.writeInt(mFlags[slot]); out.writeInt(mRej[slot]); out.writeFloat(mMask[slot]);
+            out.write(capY[slot]);
+            if (capChroma) { out.write(capU[slot]); out.write(capV[slot]); }
+        }
+    }
 }
