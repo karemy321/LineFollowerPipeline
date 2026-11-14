@@ -74,9 +74,14 @@ public final class OverlayView extends View {
         final float[] laCol = new float[48];
         final float[] laRow = new float[48];
         int     laCount;
+        float   rowBaseTopFrac;                 // Phase 1 row-wise base (0 = off)
+        int     rowBaseGroups, rowBaseValid;
+        boolean rowBaseUsed;
 
         void copyFrom(LineFollowerPipeline.FrameData d) {
             valid         = true;
+            rowBaseTopFrac = d.rowBaseTopFrac; rowBaseGroups = d.rowBaseGroups;
+            rowBaseValid   = d.rowBaseValidGroups; rowBaseUsed = d.rowBaseUsed;
             imgW          = d.imgW;          imgH          = d.imgH;
             hRoiTopFrac   = d.hRoiTopFrac;   hRoiBotFrac   = d.hRoiBotFrac;
             vRoiTopFrac   = d.vRoiTopFrac;   ignoreTopFrac = d.ignoreTopFrac;
@@ -91,6 +96,8 @@ public final class OverlayView extends View {
 
         void copyFrom(Snapshot s) {
             valid         = s.valid;
+            rowBaseTopFrac = s.rowBaseTopFrac; rowBaseGroups = s.rowBaseGroups;
+            rowBaseValid   = s.rowBaseValid;   rowBaseUsed   = s.rowBaseUsed;
             imgW          = s.imgW;          imgH          = s.imgH;
             hRoiTopFrac   = s.hRoiTopFrac;   hRoiBotFrac   = s.hRoiBotFrac;
             vRoiTopFrac   = s.vRoiTopFrac;   ignoreTopFrac = s.ignoreTopFrac;
@@ -279,6 +286,15 @@ public final class OverlayView extends View {
         hStrokePaint.setAlpha(230);
         canvas.drawRect(0f, hTop, W, hBot, hFillPaint);
         canvas.drawRect(0f, hTop, W, hBot, hStrokePaint);
+
+        // ── 2b. Phase 1 row-wise steering base (debug only): dashed outline from its top down
+        //        to the strip bottom, label "BASE valid/groups" (white = used this frame).
+        if (s.rowBaseTopFrac > 0f) {
+            final float bt = my(s.rowBaseTopFrac);
+            canvas.drawRect(0f, bt, W, hBot, refPaint);
+            canvas.drawText("BASE " + s.rowBaseValid + "/" + s.rowBaseGroups + (s.rowBaseUsed ? "" : " (strip)"),
+                    W * 0.55f, bt - 10f, labelPaint);
+        }
 
         // ── 3. Calibrated straight-ahead reference (dashed white) ─────────────
         canvas.drawLine(refX, hTop - 20f, refX, hBot + 20f, refPaint);

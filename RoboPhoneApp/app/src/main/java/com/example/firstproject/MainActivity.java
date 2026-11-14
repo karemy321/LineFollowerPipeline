@@ -102,6 +102,19 @@ public class MainActivity extends AppCompatActivity {
     // length + sensor size, for this stream's crop and orientation; 0 = not known yet. Only
     // logged and shown — the pipeline still uses Config.verticalFovDeg (60) until measured.
     private static final float APP_VFOV_DEG   = 60f;   // Config.verticalFovDeg used by the app
+
+    // Steering improvements, Phase 1 (STEERING_IMPROVEMENTS.md). All at the ORIGINAL behaviour:
+    // the changes were not free of regressions in the simulator and are kept for robot tests.
+    //   USE_RED_ZONE_EXCLUSION = true   bottom 25 % excluded, strip pushed up to rows ~73–75 %
+    //                                   (false = strip at 0.85: glare regression in the simulator)
+    //   USE_WIDE_STEERING_BASE = false  strip 24 rows (LineFollowerPipeline.STEERING_BASE_ROWS_ORIGINAL)
+    //   USE_ROW_WISE_BASE      = false  true = steering offset from a taller base above the strip,
+    //                                   row groups with glare or no line dropped (Config.rowWiseSteeringBase)
+    private static final boolean USE_RED_ZONE_EXCLUSION = true;
+    private static final boolean USE_WIDE_STEERING_BASE = false;
+    private static final int     STEERING_BASE_ROWS     = 72;   // rows, for the 720 × 1280 portrait frame
+    private static final boolean USE_ROW_WISE_BASE      = false;
+    private static final int     ROW_WISE_BASE_ROWS     = 48;   // rows (72 failed the straight-line test)
     private volatile float     measuredVFovDeg = 0f;
     private volatile float     measuredHFovDeg = 0f;
     private boolean            fovRequested    = false;   // camera thread
@@ -471,7 +484,12 @@ public class MainActivity extends AppCompatActivity {
                 cfg.thresholdMargin  = 0;
                 cfg.hRoiCenterYFrac  = 0.85f;
                 cfg.hRoiThickPx      = 24;
-                cfg.bottomIgnoreFrac = 0.25f;
+                cfg.bottomIgnoreFrac = 0.25f;   // red zone; only used with USE_RED_ZONE_EXCLUSION
+                cfg.useRedZoneExclusion = USE_RED_ZONE_EXCLUSION;   // Phase 1
+                cfg.wideSteeringBase    = USE_WIDE_STEERING_BASE;   // Phase 1
+                cfg.steeringBaseRows    = STEERING_BASE_ROWS;       // Phase 1
+                cfg.rowWiseSteeringBase = USE_ROW_WISE_BASE;        // Phase 1
+                cfg.rowWiseBaseRows     = ROW_WISE_BASE_ROWS;       // Phase 1
                 cfg.vRoiHalfWidthPx  = 80;
                 cfg.cameraTiltDeg    = 45f;
                 cfg.verticalFovDeg   = APP_VFOV_DEG;   // still the guess; see computeFieldOfView()

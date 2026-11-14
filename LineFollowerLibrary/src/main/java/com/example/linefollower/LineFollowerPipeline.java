@@ -126,6 +126,53 @@ public final class LineFollowerPipeline {
         // excluded. Only pulls the strip up when it would otherwise overlap.
         public float bottomIgnoreFrac = 0.15f;
 
+        // ── Steering base (steering improvements, Phase 1 — STEERING_IMPROVEMENTS.md) ──
+        // Defaults = the original behaviour (useRedZoneExclusion = true, wideSteeringBase =
+        // false: the code below is then exactly the baseline). Moving or widening the strip
+        // itself made glare handling worse in the simulator (STEERING_IMPROVEMENTS.md, Phase 1),
+        // so both stay off; see rowWiseSteeringBase below for the base that is kept.
+        //
+        // true (original)  = the bottomIgnoreFrac band ("red zone") pushes the strip up.
+        // false            = no red zone: the strip stays at hRoiCenterYFrac, even over the
+        //                    bottom of the frame, and the overlay shows no red band.
+        public boolean useRedZoneExclusion = true;
+
+        // true = the scan strip itself is steeringBaseRows tall instead of hRoiThickPx.
+        // hRoiThickPx itself is NOT changed: it also sets look-ahead limits (gap tolerance,
+        // near rows), which stay as they were.
+        public boolean wideSteeringBase = false;
+        public int     steeringBaseRows = 72;   // pixels, for a 1280-row frame
+                                                // (original: STEERING_BASE_ROWS_ORIGINAL = 24)
+
+        // When the base is moved or widened (either flag above changed): keep the steering
+        // in the same units as with the original strip. A strip lower in the frame sees the
+        // floor closer and larger, which would make the offset part bigger and the heading
+        // part smaller for the same robot position. Both parts are rescaled with the camera
+        // geometry so the steering still aims at the same target point as with the original
+        // strip, and the far end of the look-ahead stays at its original row. No effect while
+        // both flags above are at their original values.
+        public boolean steeringScaleNormalize = true;
+
+        // ── Row-wise steering base (Phase 1, second version) ──
+        // The scan strip and everything that uses it (threshold, lock, gate, distractor and
+        // glare handling) stay exactly as they are. In addition, the steering OFFSET is
+        // measured over a taller base that grows UPWARD from the strip's bottom row
+        // (rowWiseBaseRows tall), in groups of rowWiseGroupRows rows: each group finds the
+        // line on its own near the predicted line; a group where the line is not found, or
+        // that has glare on or next to the line, is dropped. The offset then comes from the
+        // MEDIAN of the valid groups (each moved to the strip's centre row along the line's
+        // slant), so glare over part of the base does not move the steering. Used only on
+        // frames where the existing code found the line (not held, coasting or pinned).
+        // Fewer valid groups than rowWiseMinValidFrac of them: the frame is reported as a
+        // base discontinuity (FrameData.rowBaseDiscontinuity) and the strip's own position
+        // is used, as before. false = exactly the original steering.
+        public boolean rowWiseSteeringBase = false;
+        public int     rowWiseBaseRows     = 48;    // pixels, for a 1280-row frame (strip: 24);
+                                                    // 48 = the value to try on the robot (72 failed
+                                                    // the straight-line test in the simulator)
+        public int     rowWiseGroupRows    = 6;
+        public float   rowWiseMinValidFrac = 0.5f;
+
         // V-ROI: how wide the vertical column is (pixels each side of centroid).
         // Keep this wider than the road line so the line stays inside even on curves.
         public int vRoiHalfWidthPx = 80;
@@ -533,6 +580,16 @@ public final class LineFollowerPipeline {
         /** Corridor curve on the floor, x = curveA + curveB·u + curveC·u² (camera heights; u =
          *  forward distance beyond the scan strip, x = sideways, + = right). 0 when not used. */
         public float curveA, curveB, curveC;
+        /** Row-wise steering base (Config.rowWiseSteeringBase): top of the base as a fraction
+         *  of the frame height (it ends at hRoiBotFrac); 0 when off. */
+        public float rowBaseTopFrac;
+        /** Row-wise steering base: row groups in the base, and how many found the line cleanly. */
+        public int rowBaseGroups, rowBaseValidGroups;
+        /** Row-wise steering base: true when this frame's steering offset came from the base. */
+        public boolean rowBaseUsed;
+        /** Row-wise steering base: the line was found, but too few groups were valid (glare or
+         *  a broken line across the base). Phase 2 treats it as a discontinuity. */
+        public boolean rowBaseDiscontinuity;
     }
 
     // =========================================================================
@@ -546,6 +603,18 @@ public final class LineFollowerPipeline {
     private int hRoiTop, hRoiBot;  // H-ROI row range [hRoiTop, hRoiBot)
     private int vRoiTop, vRoiBot;  // V-ROI row range [vRoiTop, vRoiBot)
     private int ignoreTop;         // first row of the ignored robot-body band
+    /** Steering-base height before Phase 1 (the original strip = Config.hRoiThickPx = 24). */
+    public static final int STEERING_BASE_ROWS_ORIGINAL = 24;
+    // Steering-base rescaling (Phase 1, see Config.steeringScaleNormalize). Exactly 1 with the
+    // original base, so the original steering is computed unchanged.
+    private float steerOffsetNorm = 1f, steerHeadingNorm = 1f;
+    // Row-wise steering base (Config.rowWiseSteeringBase): rows [rwTop, hRoiBot), per-frame result.
+    private int     rwTop;
+    private int[]   rwCount, rwGlare;     // per column: line / glare pixels in one row group
+    private float[] rwVals;               // valid groups' line positions at the strip centre row
+    private boolean rwValid, rwLow, rwUsed;
+    private float   rwX;
+    private int     rwGroups, rwValidGroups;
     private int lastCentroidX;
     private float lastTrackWidthPx; // most recent measured track width (held on loss)
 
@@ -969,10 +1038,44 @@ public final class LineFollowerPipeline {
             hRoiTop = Math.max(0, hRoiBot - thick);
         }
 
+        // Steering base (Phase 1). The original strip rows above are kept for the rescaling and
+        // for the far end of the look-ahead; with both flags at their original values nothing
+        // below changes the strip.
+        final int origHRoiTop = hRoiTop, origHRoiBot = hRoiBot;
+        final boolean baseChanged = !config.useRedZoneExclusion || config.wideSteeringBase;
+        if (baseChanged) {
+            final int bThick = config.wideSteeringBase
+                    ? Math.max(1, Math.min(config.steeringBaseRows, height)) : thick;
+            hRoiTop = Math.max(0,      hRoiCY - bThick / 2);
+            hRoiBot = Math.min(height, hRoiTop + bThick);
+            if (config.useRedZoneExclusion) {
+                if (hRoiBot > ignoreTop) {               // same slide-up as the original
+                    hRoiBot = Math.max(bThick, ignoreTop);
+                    hRoiTop = Math.max(0, hRoiBot - bThick);
+                }
+            } else {
+                ignoreTop = height;                      // no red zone (overlay draws none)
+            }
+        }
+
         vRoiBot = hRoiTop;   // V-ROI bottom sits just above the H-ROI
         // Cap the look-ahead height so it stops short of the dim, noisy far top of
         // the frame: it reaches at most vRoiHeightFrac of the frame above the H-ROI.
         vRoiTop = Math.max(0, vRoiBot - Math.round(config.vRoiHeightFrac * height));
+        if (baseChanged) {
+            // Phase 1: the look-ahead still ends at its original far row; it only reaches
+            // down to the new strip.
+            final int origVTop = Math.max(0, origHRoiTop - Math.round(config.vRoiHeightFrac * height));
+            vRoiTop = Math.max(0, Math.min(origVTop, vRoiBot - 1));
+        }
+
+        // Row-wise steering base: grows upward from the strip's bottom row (never shorter than
+        // the strip). Only read when Config.rowWiseSteeringBase is on.
+        rwTop = Math.max(0, hRoiBot - Math.max(hRoiBot - hRoiTop, config.rowWiseBaseRows));
+        final int rwGroupRows = Math.max(1, config.rowWiseGroupRows);
+        rwVals  = new float[(hRoiBot - rwTop) / rwGroupRows + 1];
+        rwCount = new int[width];
+        rwGlare = new int[width];
 
         // Horizon row from the mount geometry. The optical axis hits the image
         // centre (yFrac 0.5); the horizon lies cameraTiltDeg ABOVE the axis (it is
@@ -1024,6 +1127,25 @@ public final class LineFollowerPipeline {
             final int hc = Math.min(height - 1, (hRoiTop + hRoiBot) / 2);
             floorFwdH   = rowFwd[hc];
             floorScaleH = rowScale[hc];
+
+            // Phase 1 rescaling to the original strip row hcO (1 = no change). Steering is the
+            // sideways position of the pure-pursuit target point at floor distance
+            // zO·(1 + L) (zO = original strip distance, L = steerLookAhead), in units of the
+            // floor half-width at the original strip. The new strip is at zN, so:
+            //   offset:  floor units at the new row → units at the original row
+            //   heading: L·zN replaced by (1 + L)·zO − zN, so the target point stays where
+            //            it was — on a straight line the steering is then the same for any
+            //            robot position and angle.
+            steerOffsetNorm  = 1f;
+            steerHeadingNorm = 1f;
+            final int hcO = Math.min(height - 1, (origHRoiTop + origHRoiBot) / 2);
+            final double la = config.steerLookAhead;
+            if (baseChanged && config.steeringScaleNormalize && hcO != hc && la > 1e-6
+                    && rowScale[hcO] > 0f && rowScale[hc] > 0f && rowFwd[hc] > 0f && rowFwd[hcO] > 0f) {
+                steerOffsetNorm  = rowScale[hc] / rowScale[hcO];
+                steerHeadingNorm = (float) (((1.0 + la) * rowFwd[hcO] - rowFwd[hc]) / (la * rowFwd[hc]))
+                                 * steerOffsetNorm;
+            }
         }
 
         rowCx             = new float[height];
@@ -1306,6 +1428,7 @@ public final class LineFollowerPipeline {
         relockedThisFrame = false;
         corrPredValid = false;
         pinCapActive = false;
+        rwValid = false; rwLow = false; rwUsed = false; rwGroups = 0; rwValidGroups = 0;
         if (sinceCurveFrames < 1000) sinceCurveFrames++;
         // Corridor frames convert only the rows they read (lazy); v2 frames the whole look-ahead.
         lazyRows = false;
@@ -2133,6 +2256,92 @@ public final class LineFollowerPipeline {
     }
 
     /**
+     * Row-wise steering base (Config.rowWiseSteeringBase, Phase 1). Rows [rwTop, hRoiBot) in
+     * groups of rowWiseGroupRows, from the bottom up. In each group, around the predicted line
+     * (predX at the strip centre row, moved along the line's slant): a column is "line" when
+     * most of the group's rows pass the threshold (the strip's own threshold, per column with
+     * glareMask); runs of line columns are bridged over small gaps; the run of an acceptable
+     * width (the strip's limits) nearest the prediction is the line. A group is dropped when it
+     * has no such run, or when glare covers a column on or next to the line (glareMask).
+     * Writes rwX (median of the valid groups, moved back to the strip centre row), rwValid,
+     * rwLow (too few valid groups), rwGroups, rwValidGroups. Reads pixels only.
+     */
+    private void rowWiseBase(byte[] pixels, int threshold, boolean bright, float predX, int gateHalf) {
+        final int W = imgW, top = rwTop, bot = hRoiBot;
+        final int gr = Math.max(1, cfg.rowWiseGroupRows);
+        final float hc = (hRoiTop + hRoiBot) / 2;          // strip centre row (steering reference)
+        final float s = Math.max(-3f, Math.min(3f, lastImgSlope));   // columns per row, upward
+        final boolean mask = maskActive;
+        final int[] ct = colThr, n = rwCount, g = rwGlare;
+        final byte[] gs = glareSrc;
+        final int gl = glareLim;
+        final int gapTol = runGapTol();
+        ensureRows(top, bot);
+        int groups = 0, valid = 0;
+        for (int r1 = bot; r1 > top; r1 -= gr) {
+            final int r0 = Math.max(top, r1 - gr), rows = r1 - r0;
+            groups++;
+            final float rowc = (r0 + r1 - 1) * 0.5f;
+            final float xp = predX + s * (hc - rowc);
+            final int lo = Math.max(0, Math.round(xp) - gateHalf), hi = Math.min(W, Math.round(xp) + gateHalf);
+            if (hi <= lo) continue;
+            for (int c = lo; c < hi; c++) { n[c] = 0; g[c] = 0; }
+            for (int row = r0; row < r1; row++) {
+                final int base = row * W;
+                for (int c = lo; c < hi; c++) {
+                    if (mask && (gs[base + c] & 0xFF) >= gl) { g[c]++; continue; }
+                    final int t = mask ? ct[c] : threshold;
+                    if (t == NO_TRACK) continue;
+                    final int px = pixels[base + c] & 0xFF;
+                    if (bright ? px >= t : px <= t) n[c]++;
+                }
+            }
+            float best = Float.NaN, bestD = Float.MAX_VALUE;
+            int bestS = 0, bestE = 0;
+            int cs = -1, cl = -1;
+            long sum = 0;
+            double mom = 0;
+            for (int c = lo; c <= hi; c++) {
+                if (c < hi && 2 * n[c] >= rows) {
+                    if (cs < 0) { cs = c; sum = 0; mom = 0; }
+                    cl = c; sum += n[c]; mom += (double) c * n[c];
+                } else if (cs >= 0 && (c == hi || c - cl > gapTol)) {
+                    final int w = cl + 1 - cs;
+                    if (w >= fMinW && w <= fMaxW && sum > 0) {
+                        final float x = (float) (mom / sum);
+                        final float d = Math.abs(x - xp);
+                        if (d < bestD) { bestD = d; best = x; bestS = cs; bestE = cl + 1; }
+                    }
+                    cs = -1;
+                }
+            }
+            if (Float.isNaN(best)) continue;
+            if (mask) {                                         // glare on or next to the line
+                final int w = bestE - bestS;
+                boolean glared = false;
+                for (int c = Math.max(lo, bestS - w), e = Math.min(hi, bestE + w); c < e && !glared; c++) {
+                    glared = 2 * g[c] >= rows;
+                }
+                if (glared) continue;
+            }
+            rwVals[valid++] = best - s * (hc - rowc);
+        }
+        rwGroups = groups;
+        rwValidGroups = valid;
+        final int need = Math.max(2, (int) Math.ceil(cfg.rowWiseMinValidFrac * groups));
+        if (valid < need) { rwLow = true; return; }
+        final float[] v = rwVals;                               // median (insertion sort, ≤ ~20 values)
+        for (int i = 1; i < valid; i++) {
+            final float x = v[i];
+            int j = i - 1;
+            while (j >= 0 && v[j] > x) { v[j + 1] = v[j]; j--; }
+            v[j + 1] = x;
+        }
+        rwX = (valid & 1) == 1 ? v[valid / 2] : 0.5f * (v[valid / 2 - 1] + v[valid / 2]);
+        rwValid = true;
+    }
+
+    /**
      * Fraction [0 … 1] of the look-ahead's floor distance covered by the line when
      * it reaches image row {@code row}: 0 at the V-ROI bottom, 1 at its top. On a
      * flat floor the distance to the point seen at row y grows as 1/(y − horizon),
@@ -2300,6 +2509,12 @@ public final class LineFollowerPipeline {
             }
         } else {
             relockCount = 0;
+        }
+
+        // Row-wise steering base (Phase 1): measured around the same predicted line; it only
+        // replaces the position in the steering offset below, nothing else reads it.
+        if (cfg.rowWiseSteeringBase && locked && calibrated) {
+            rowWiseBase(pixels, threshold, bright, predX, gateHalf);
         }
 
         // ── v3 corridor tracker (locked line, filter running) ──────────────────
@@ -2492,7 +2707,9 @@ public final class LineFollowerPipeline {
         // point L further along the line. The heading part fades out
         // (headingConfidence) when too little of the line is visible ahead or the
         // line is not a smooth curve (a corner), leaving the v1 offset-only steering.
-        final float offsetTerm = (centroidX - steerRefX) / halfW * 100f;
+        // Phase 1 row-wise base: its position replaces the strip's, only on a clean find.
+        rwUsed = rwValid && trackFound && !held && !coastingNow && pinnedSteering == 0f;
+        final float offsetTerm = ((rwUsed ? rwX : centroidX) - steerRefX) / halfW * 100f * steerOffsetNorm;   // Phase 1: ×1 = original
         float headingTerm = 0f, headingDeg = 0f, conf = 0f;
         if (trackFound && cfg.steerHeadingWeight != 0f) {
             computeHeading();
@@ -2502,7 +2719,8 @@ public final class LineFollowerPipeline {
                 final double psi = Math.toRadians(Math.max(-75f, Math.min(75f, headingDeg)));
                 final double lookAhead = cfg.steerLookAhead * floorFwdH;
                 final double halfFloor = floorScaleH * halfW;
-                headingTerm = (float) (100.0 * lookAhead * Math.tan(psi) / Math.max(1e-6, halfFloor));
+                headingTerm = (float) (100.0 * lookAhead * Math.tan(psi) / Math.max(1e-6, halfFloor))
+                        * steerHeadingNorm;   // Phase 1: ×1 = original
             }
         }
         float steering = (pinnedSteering != 0f) ? pinnedSteering
@@ -3714,7 +3932,8 @@ public final class LineFollowerPipeline {
             if (b > a && cRow[a] != cRow[b]) lastImgSlope = (cCol[b] - cCol[a]) / (cRow[a] - cRow[b]);
         }
 
-        final float offsetTerm = (centroidX - steerRefX) / halfW * 100f;
+        rwUsed = rwValid;   // Phase 1 row-wise base (the line was found: not a pin)
+        final float offsetTerm = ((rwUsed ? rwX : centroidX) - steerRefX) / halfW * 100f * steerOffsetNorm;   // Phase 1: ×1 = original
         float headingTerm = 0f, headingDeg = 0f, conf = 0f;
         if (cfg.steerHeadingWeight != 0f) {
             final float rowsK = Math.min(1f, (obsFit - 1) / 3f);
@@ -3733,7 +3952,8 @@ public final class LineFollowerPipeline {
                         * (float) Math.max(0.0, 1.0 - Math.abs(kx[2]) / HEADING_DB_CURVE);
                 if (db > 0f) headingDeg = Math.signum(headingDeg) * Math.max(0f, Math.abs(headingDeg) - db);
                 final double psi = Math.toRadians(Math.max(-75f, Math.min(75f, headingDeg)));
-                headingTerm = (float) (100.0 * cfg.steerLookAhead * floorFwdH * Math.tan(psi) / Math.max(1e-6, floorScaleH * halfW));
+                headingTerm = (float) (100.0 * cfg.steerLookAhead * floorFwdH * Math.tan(psi) / Math.max(1e-6, floorScaleH * halfW))
+                        * steerHeadingNorm;   // Phase 1: ×1 = original
             }
         }
         final float steering = Math.max(-100f, Math.min(100f,
@@ -4205,6 +4425,12 @@ public final class LineFollowerPipeline {
         d.curveA            = corr ? (float) kx[0] : 0f;
         d.curveB            = corr ? (float) kx[1] : 0f;
         d.curveC            = corr ? (float) kx[2] : 0f;
+        final boolean rw    = cfg.rowWiseSteeringBase;
+        d.rowBaseTopFrac       = rw ? rwTop / (float) imgH : 0f;
+        d.rowBaseGroups        = live && rw ? rwGroups : 0;
+        d.rowBaseValidGroups   = live && rw ? rwValidGroups : 0;
+        d.rowBaseUsed          = live && rw && rwUsed;
+        d.rowBaseDiscontinuity = live && rw && rwLow && output.trackFound;
         frameCallback.onFrame(d);
     }
 

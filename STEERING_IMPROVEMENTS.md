@@ -114,7 +114,33 @@ Do nothing else.
 
 Keep this checklist updated in this file as you go:
 
-- [ ] Phase 0: Baseline saved, code report delivered, plan approved
+- [x] Phase 0: Baseline saved, code report delivered, plan approved
+  - [x] Baseline saved (2026-11-14): branch `steering-improvements`, tag `baseline-before-steering-improvements` (commit 4965f2b). Library tests at baseline: 50 pass, 1 skipped (CapturedScenesTest, needs phone captures).
+  - [x] Code report and proposed plan delivered (2026-11-14)
+  - [x] Open questions answered, plan approved (2026-11-14). Robot host = RoboPhoneApp `MainActivity` (the only compiled Config); Phase 2: hold keeps power (`holdPowerScale`, default 1.0), glare coast untouched, edge exits never held.
 - [ ] Phase 1: Wider steering base implemented, tested by me, approved
+  - [x] Implemented (2026-11-14), not committed: flags `useRedZoneExclusion`, `wideSteeringBase` / `steeringBaseRows`, `steeringScaleNormalize` in Config; switched on in `MainActivity`. Library tests 53 pass, 1 skipped; app builds.
+  - [x] Library defaults switched to the new base (2026-11-14): `useRedZoneExclusion = false`, `wideSteeringBase = true`.
+  - [x] Original flags verified identical to the baseline tag: 112 simulated drives, every output field byte-identical; original tests 50 pass, 1 skipped.
+  - [ ] Open: with the new defaults 4 existing tests fail (StraightLineTest ±1 dither 31/30; TrackSimTest and edgeExitUnderGlare scene setups; sharpCurveNearGlare steering against the line). Glare + sharp curve is worse with the new base at 720×1280 too (53 vs 17 frames). Waiting for a decision.
+  - [x] steeringBaseRows sweep 72 / 48 / 36 / 24 (2026-11-14): no value removes the glare regression (glare band over the strip: 146–207 steering jumps ≥ 20 at every height vs 10 at baseline; sharpCurveNearGlare fails at every height) and the straight-line dither is over its limit at every height (31–69 vs 30). Clean drives: no jumps at any height. Stopped as instructed: tests not pinned, nothing committed. Waiting for a decision.
+  - [x] Option 3 (strip widened upward U72 / U48, strip moved to 0.78 / 0.81 with 48 rows): every candidate has a glare regression (wrong-side pins, or 12–115 steering jumps ≥ 20 vs 0–10). Not adopted.
+  - [x] Row-wise steering base (2026-11-14): `rowWiseSteeringBase`, `rowWiseBaseRows`, `rowWiseGroupRows`, `rowWiseMinValidFrac`. Strip and glare code unchanged; the offset comes from the median of row groups above the strip, glared / lineless groups dropped. Sweep: no regression in the 112 drives or the glare scenes (identical to baseline in all glare cells). Scenario tests: RW72 fails StraightLineTest (dither 77/150, 31 sign flips) and sharpCurveNearGlare; RW48 fails sharpCurveNearGlare (capped pin 20 vs allowed 18). Not default.
+  - [x] Defaults back to the original (`useRedZoneExclusion = true`, `wideSteeringBase = false`, `rowWiseSteeringBase = false`); all new code kept behind the flags; the app uses the original too. Original flags verified byte-identical to the baseline tag (112 drives). Tests: original 50 pass + 1 skipped, plus 5 new SteeringBaseTest pass. Build passes.
+  - [x] Approved (option 1): original defaults, row-wise base 48 rows behind `rowWiseSteeringBase` for robot tests. Committed on `steering-improvements` (2026-11-14).
+  - [ ] Tested on the robot
+
+**How to test Phase 1 on the robot.** In `RoboPhoneApp/app/src/main/java/com/example/firstproject/MainActivity.java` (constants near the top of the class):
+
+| Constant | Robot test | Original (revert) |
+|---|---|---|
+| `USE_ROW_WISE_BASE` | `true` | `false` |
+| `ROW_WISE_BASE_ROWS` | `48` (recommended) | — (not used when off) |
+| `USE_RED_ZONE_EXCLUSION` | `true` (keep) | `true` |
+| `USE_WIDE_STEERING_BASE` | `false` (keep) | `false` |
+
+Rebuild and install the app. On screen, a dashed white "BASE" box appears above the cyan strip (rows 912–960 of 1280); its label shows how many row groups found the line cleanly, "(strip)" when the strip's own position was used. To revert: `USE_ROW_WISE_BASE = false` (exactly the original steering, proven byte-identical in the simulator), or check out the tag `baseline-before-steering-improvements`.
+
+**Known limitation (Phase 1):** no variant of the wider steering base passed all simulator checks, so the robot runs the original base. In the simulator, moving or widening the strip itself makes glare handling worse. The row-wise base leaves glare handling unchanged, but its unfiltered per-frame position adds straight-line dither (72 rows) and steers about 2 units harder than allowed in one glare case (48 rows). To try it on the robot: `USE_ROW_WISE_BASE = true` in `MainActivity` (48 rows); the overlay then shows the base and "BASE valid/groups".
 - [ ] Phase 2: Trend hold implemented, tested by me, approved
 - [ ] Phase 3: Tuned, cleaned up, `CHANGES.md` written
