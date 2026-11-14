@@ -32,6 +32,11 @@ android {
                 "proguard-rules.pro"
             )
         }
+        // "demo" variant: same as debug (debuggable, debug-signed).
+        create("demo") {
+            initWith(getByName("debug"))
+            matchingFallbacks += listOf("debug")
+        }
     }
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_11

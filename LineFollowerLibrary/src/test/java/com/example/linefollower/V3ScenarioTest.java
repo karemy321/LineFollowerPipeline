@@ -74,6 +74,7 @@ public class V3ScenarioTest {
         final LineFollowerPipeline.Config c = v3Config(fps);
         set(c, "glareMask", false);
         set(c, "corridorMode", false);
+        set(c, "useTrendHold", false);   // Phase 2: the reference stays the exact v2 output
         return c;
     }
 

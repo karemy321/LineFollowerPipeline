@@ -130,6 +130,9 @@ public class LineFollowerPipelineTest {
     /** Calibrate on a centred line, then check centred / right / left steering. */
     private static void assertFollows(Fmt f, int floorRgb, int lineRgb) {
         final LineFollowerPipeline p = new LineFollowerPipeline();
+        final LineFollowerPipeline.Config original = new LineFollowerPipeline.Config();
+        original.useTrendHold = false;   // the 60 px step between frames is a "jump" for the Phase 2 hold
+        p.configure(original);
         final LineFollowerPipeline.FrameData[] last = {null};
         p.setFrameCallback(d -> last[0] = d);
         final int[] centred = straight(floorRgb, lineRgb, W / 2, 30);
@@ -160,6 +163,7 @@ public class LineFollowerPipelineTest {
         cfg.steerHeadingWeight = 0f;
         cfg.trackHoldFrames    = 0;
         cfg.glareMask          = false;   // v3 glare handling off (it replaces the hold by a coast)
+        cfg.useTrendHold       = false;   // Phase 2 trend hold off (original output)
         return cfg;
     }
 
@@ -344,6 +348,7 @@ public class LineFollowerPipelineTest {
         final LineFollowerPipeline p = new LineFollowerPipeline();
         final LineFollowerPipeline.Config v2 = new LineFollowerPipeline.Config();
         v2.glareMask = false;
+        v2.useTrendHold = false;   // Phase 2 trend hold off: this checks the original v2 hold
         p.configure(v2);
         final int holdFrames = v2.trackHoldFrames;
         final LineFollowerPipeline.FrameData[] last = {null};
@@ -415,6 +420,7 @@ public class LineFollowerPipelineTest {
     @Test public void glareMaskOffKeepsV2Hold() {
         final LineFollowerPipeline.Config cfg = new LineFollowerPipeline.Config();
         cfg.glareMask = false;
+        cfg.useTrendHold = false;   // Phase 2 trend hold off: this checks the original v2 hold
         final LineFollowerPipeline p = new LineFollowerPipeline();
         p.configure(cfg);
         final LineFollowerPipeline.FrameData[] last = {null};

@@ -102,6 +102,23 @@ public class MainActivity extends AppCompatActivity {
     // length + sensor size, for this stream's crop and orientation; 0 = not known yet. Only
     // logged and shown — the pipeline still uses Config.verticalFovDeg (60) until measured.
     private static final float APP_VFOV_DEG   = 60f;   // Config.verticalFovDeg used by the app
+
+    // Steering improvements, Phase 1 (STEERING_IMPROVEMENTS.md). All at the ORIGINAL behaviour:
+    // the changes were not free of regressions in the simulator and are kept for robot tests.
+    //   USE_RED_ZONE_EXCLUSION = true   bottom 25 % excluded, strip pushed up to rows ~73–75 %
+    //                                   (false = strip at 0.85: glare regression in the simulator)
+    //   USE_WIDE_STEERING_BASE = false  strip 24 rows (LineFollowerPipeline.STEERING_BASE_ROWS_ORIGINAL)
+    //   USE_ROW_WISE_BASE      = false  true = steering offset from a taller base above the strip,
+    //                                   row groups with glare or no line dropped (Config.rowWiseSteeringBase)
+    private static final boolean USE_RED_ZONE_EXCLUSION = true;
+    private static final boolean USE_WIDE_STEERING_BASE = false;
+    private static final int     STEERING_BASE_ROWS     = 72;   // rows, for the 720 × 1280 portrait frame
+    private static final boolean USE_ROW_WISE_BASE      = false;
+    private static final int     ROW_WISE_BASE_ROWS     = 48;   // rows (72 failed the straight-line test)
+    // Steering improvements, Phase 2: hold the steering / power trend over a discontinuity.
+    //   USE_TREND_HOLD = false  exactly the original output
+    private static final boolean USE_TREND_HOLD   = true;
+    private static final float   HOLD_POWER_SCALE = 1.0f;   // < 1 = slower while holding
     private volatile float     measuredVFovDeg = 0f;
     private volatile float     measuredHFovDeg = 0f;
     private boolean            fovRequested    = false;   // camera thread
@@ -161,6 +178,7 @@ public class MainActivity extends AppCompatActivity {
     private volatile float   hudSteering     = 0f;
     private volatile float   hudIntersection = 0f;
     private volatile boolean hudTrackFound   = false;
+    private volatile boolean hudTrendHolding = false;   // Phase 2: FrameData.trendState == HOLDING
     private volatile boolean hudCalibrated   = false;
     private volatile int     hudCalibPhase   = LineFollowerPipeline.CALIB_LEARNING_COLORS;
     private volatile float   hudCalibProgress = 0f;
@@ -471,7 +489,14 @@ public class MainActivity extends AppCompatActivity {
                 cfg.thresholdMargin  = 0;
                 cfg.hRoiCenterYFrac  = 0.85f;
                 cfg.hRoiThickPx      = 24;
-                cfg.bottomIgnoreFrac = 0.25f;
+                cfg.bottomIgnoreFrac = 0.25f;   // red zone; only used with USE_RED_ZONE_EXCLUSION
+                cfg.useRedZoneExclusion = USE_RED_ZONE_EXCLUSION;   // Phase 1
+                cfg.wideSteeringBase    = USE_WIDE_STEERING_BASE;   // Phase 1
+                cfg.steeringBaseRows    = STEERING_BASE_ROWS;       // Phase 1
+                cfg.rowWiseSteeringBase = USE_ROW_WISE_BASE;        // Phase 1
+                cfg.rowWiseBaseRows     = ROW_WISE_BASE_ROWS;       // Phase 1
+                cfg.useTrendHold        = USE_TREND_HOLD;           // Phase 2
+                cfg.holdPowerScale      = HOLD_POWER_SCALE;         // Phase 2
                 cfg.vRoiHalfWidthPx  = 80;
                 cfg.cameraTiltDeg    = 45f;
                 cfg.verticalFovDeg   = APP_VFOV_DEG;   // still the guess; see computeFieldOfView()
@@ -570,6 +595,7 @@ public class MainActivity extends AppCompatActivity {
         hudSteering      = d.steering;
         hudIntersection  = d.tracking;
         hudTrackFound    = d.trackFound;
+        hudTrendHolding  = d.trendState == LineFollowerPipeline.TREND_HOLDING;
         hudCalibrated    = d.isCalibrated;
         hudCalibPhase    = d.calibPhase;
         hudCalibProgress = d.calibProgress;
@@ -720,7 +746,10 @@ public class MainActivity extends AppCompatActivity {
                 android.content.res.ColorStateList.valueOf(trackColor));
         tvIntersection.setTextColor(trackColor);
 
-        if (hudCalibrated) {
+        if (hudCalibrated && hudTrendHolding) {          // Phase 2: trend hold active
+            tvStatus.setText("HOLDING");
+            tvStatus.setTextColor(Color.parseColor("#80D8FF"));
+        } else if (hudCalibrated) {
             tvStatus.setText(found ? "TRACKING" : "TRACK LOST");
             tvStatus.setTextColor(found ? Color.parseColor("#00E676")
                                         : Color.parseColor("#FF6D00"));
