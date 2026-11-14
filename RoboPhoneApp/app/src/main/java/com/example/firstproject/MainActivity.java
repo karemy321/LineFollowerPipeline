@@ -113,7 +113,7 @@ public class MainActivity extends AppCompatActivity {
     private static final boolean USE_RED_ZONE_EXCLUSION = true;
     private static final boolean USE_WIDE_STEERING_BASE = false;
     private static final int     STEERING_BASE_ROWS     = 72;   // rows, for the 720 × 1280 portrait frame
-    private static final boolean USE_ROW_WISE_BASE      = false;
+    private static final boolean USE_ROW_WISE_BASE      = true;    // robot test (original: false)
     private static final int     ROW_WISE_BASE_ROWS     = 48;   // rows (72 failed the straight-line test)
     // Steering improvements, Phase 2: hold the steering / power trend over a discontinuity.
     //   USE_TREND_HOLD = false  exactly the original output
