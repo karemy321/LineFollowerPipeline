@@ -173,6 +173,30 @@ public final class LineFollowerPipeline {
         public int     rowWiseGroupRows    = 6;
         public float   rowWiseMinValidFrac = 0.5f;
 
+        // ── Trend hold (steering improvements, Phase 2 — STEERING_IMPROVEMENTS.md) ──
+        // A filter on the final [steering, tracking] output only; it never changes what the
+        // pipeline sees or remembers. On a valid frame (line found, not coasting, not rebuilt
+        // from the look-ahead) the output passes through UNCHANGED and is added to the trend:
+        // the average of the last trendWindowFrames valid outputs. A DISCONTINUITY is
+        //   • a jump: the line is found but the steering is more than maxSteeringJump away from
+        //     the trend (only right after a valid frame), held for at most maxJumpHoldMs — a
+        //     change that lasts longer is a real one and is accepted;
+        //   • the line lost in the MIDDLE of the image with glareMask OFF (with glareMask on the
+        //     glare coast handles it, unchanged), held for at most maxHoldMs;
+        //   • a row-wise base discontinuity (Phase 1, only with rowWiseSteeringBase).
+        // While held, the steering is the trend and the tracking (power) is the LOWER of the
+        // trend and the last valid frame's value, × holdPowerScale — the robot never speeds up
+        // while it cannot see the line. The trend is not updated. A line leaving at the frame
+        // EDGE is never held. When the hold time runs out
+        // the output is exactly what the pipeline gives (today's behaviour).
+        // false = exactly the original output.
+        public boolean useTrendHold    = true;
+        public float   maxSteeringJump = 25f;    // steering output units (−50 … +50 scale)
+        public int     trendWindowFrames = 4;
+        public float   maxHoldMs       = 300f;   // line lost mid-image (glareMask off)
+        public float   maxJumpHoldMs   = 70f;    // jump: ~2 camera frames at 30 fps
+        public float   holdPowerScale  = 1.0f;   // multiplies the held tracking (power)
+
         // V-ROI: how wide the vertical column is (pixels each side of centroid).
         // Keep this wider than the road line so the line stays inside even on curves.
         public int vRoiHalfWidthPx = 80;
@@ -590,7 +614,17 @@ public final class LineFollowerPipeline {
         /** Row-wise steering base: the line was found, but too few groups were valid (glare or
          *  a broken line across the base). Phase 2 treats it as a discontinuity. */
         public boolean rowBaseDiscontinuity;
+        /** Trend hold (Config.useTrendHold): TREND_TRACKING, TREND_HOLDING (the output is the
+         *  held trend) or TREND_LOST (line not found, output as the pipeline gives it). */
+        public int trendState;
     }
+
+    /** FrameData.trendState: the line is found (output unchanged). */
+    public static final int TREND_TRACKING = 0;
+    /** FrameData.trendState: discontinuity — the output is the held trend. */
+    public static final int TREND_HOLDING  = 1;
+    /** FrameData.trendState: the line is not found and not held (output unchanged). */
+    public static final int TREND_LOST     = 2;
 
     // =========================================================================
     //  State
@@ -615,6 +649,17 @@ public final class LineFollowerPipeline {
     private boolean rwValid, rwLow, rwUsed;
     private float   rwX;
     private int     rwGroups, rwValidGroups;
+    // Trend hold (Config.useTrendHold, Phase 2). Output filter state only.
+    private float[] trSteer, trPower;     // ring buffer of the last valid outputs
+    private int     trCount, trNext;
+    private int     trLastPower;          // power (tracking) of the last valid frame
+    private boolean trPrevValid;          // previous frame was a valid (tracking) frame
+    private boolean trHolding;
+    private int     trHoldKind;           // HOLD_LOSS or HOLD_JUMP
+    private float   trHoldMs;
+    private int     trState;              // FrameData.trendState of this frame
+    private boolean lostMidImageNow;      // v2 path: locked line lost with the prediction mid-image
+    private static final int HOLD_LOSS = 1, HOLD_JUMP = 2;
     private int lastCentroidX;
     private float lastTrackWidthPx; // most recent measured track width (held on loss)
 
@@ -1076,6 +1121,10 @@ public final class LineFollowerPipeline {
         rwVals  = new float[(hRoiBot - rwTop) / rwGroupRows + 1];
         rwCount = new int[width];
         rwGlare = new int[width];
+        // Trend hold (Phase 2): output filter buffers.
+        trSteer = new float[Math.max(1, config.trendWindowFrames)];
+        trPower = new float[Math.max(1, config.trendWindowFrames)];
+        resetTrend();
 
         // Horizon row from the mount geometry. The optical axis hits the image
         // centre (yFrac 0.5); the horizon lies cameraTiltDeg ABOVE the axis (it is
@@ -1247,6 +1296,7 @@ public final class LineFollowerPipeline {
         learnedLineW       = 0f;
         relockCount        = 0;
         resetLineModel();
+        resetTrend();
         trackAcquired      = false;
         lostFrames         = 0;
         laPathCount        = 0;
@@ -1429,6 +1479,7 @@ public final class LineFollowerPipeline {
         corrPredValid = false;
         pinCapActive = false;
         rwValid = false; rwLow = false; rwUsed = false; rwGroups = 0; rwValidGroups = 0;
+        lostMidImageNow = false;
         if (sinceCurveFrames < 1000) sinceCurveFrames++;
         // Corridor frames convert only the rows they read (lazy); v2 frames the whole look-ahead.
         lazyRows = false;
@@ -1441,10 +1492,83 @@ public final class LineFollowerPipeline {
         //   internal 0   (straight) → output 100 (no braking needed)
         //   internal 100 (hard turn / lost) → output min (brake / slow down)
         result[1] = Math.max(cfg.trackingMinValue, Math.round(100f - output.intersection));
+        // Phase 2: trend hold on the final output (valid frames pass through unchanged).
+        trState = output.trackFound ? TREND_TRACKING : TREND_LOST;
+        if (cfg.useTrendHold && calibrated) applyTrendHold();   // never before calibration
         isProcessing = true;
         fireCallback(result[0], result[1], output.trackFound, output.centroidX);
         isProcessing = false;
         return result;
+    }
+
+    // =========================================================================
+    //  Trend hold (Phase 2) — a filter on result[] only
+    // =========================================================================
+
+    /** Forget the trend and any hold in progress (init, recalibration). */
+    private void resetTrend() {
+        trCount = 0; trNext = 0;
+        trPrevValid = false; trHolding = false; trHoldKind = 0; trHoldMs = 0f;
+        trState = TREND_TRACKING;
+    }
+
+    /**
+     * Config.useTrendHold. Reads the pipeline's output for this frame (output, result[], the
+     * v2 "lost mid-image" flag, the row-wise base flag) and, during a discontinuity, replaces
+     * result[] with the trend. On every other frame result[] is left exactly as it is. Writes
+     * nothing the pipeline reads.
+     */
+    private void applyTrendHold() {
+        final boolean found = output.trackFound;
+        // A valid measurement: the line found by the strip / corridor itself (the glare coast
+        // and the base rebuilt from the look-ahead belong to the glare handling: untouched).
+        final boolean clean = found && !output.coasting && !output.reconstructed;
+        final boolean baseDisc = cfg.rowWiseSteeringBase && rwLow && found;
+        float tS = 0f, tP = 0f;
+        for (int i = 0; i < trCount; i++) { tS += trSteer[i]; tP += trPower[i]; }
+        if (trCount > 0) { tS /= trCount; tP /= trCount; }
+        final boolean jump = clean && trCount >= 2 && Math.abs(result[0] - tS) > cfg.maxSteeringJump;
+        // Line hidden in the middle of the image, glare coast not active (glareMask off).
+        final boolean lossMid = !found && !maskActive && lostMidImageNow;
+
+        boolean acceptJump = false;               // a jump that lasted longer than maxJumpHoldMs
+        if (trHolding) {
+            trHoldMs += frameDtMs;
+            final boolean more = trHoldKind == HOLD_LOSS
+                    ? !found && trHoldMs <= cfg.maxHoldMs
+                    : (jump || baseDisc) && trHoldMs <= cfg.maxJumpHoldMs;
+            if (!more) {
+                trHolding = false;
+                acceptJump = trHoldKind == HOLD_JUMP && (jump || baseDisc);
+            }
+        } else if (trPrevValid && trCount > 0 && (lossMid || jump || baseDisc)) {
+            trHolding  = true;                     // starts only right after a valid frame
+            trHoldKind = lossMid ? HOLD_LOSS : HOLD_JUMP;
+            trHoldMs   = 0f;
+        }
+
+        if (trHolding) {
+            result[0] = Math.round(tS);
+            // Never faster than the last valid frame: when the power was ramping down (dead end,
+            // end of the track) the average would be higher than the last value.
+            final float heldPower = Math.min(tP, trLastPower);
+            result[1] = Math.max(cfg.trackingMinValue, Math.min(100, Math.round(heldPower * cfg.holdPowerScale)));
+            trState = TREND_HOLDING;
+            trPrevValid = false;
+            return;
+        }
+        // Not held: result[] stays as the pipeline gave it.
+        if (clean && !baseDisc || acceptJump) {
+            if (!trPrevValid || acceptJump) { trCount = 0; trNext = 0; }   // fresh trend after a gap
+            trSteer[trNext] = result[0];
+            trPower[trNext] = result[1];
+            trLastPower = result[1];
+            trNext = (trNext + 1) % trSteer.length;
+            if (trCount < trSteer.length) trCount++;
+            trPrevValid = true;
+        } else {
+            trPrevValid = false;
+        }
     }
 
     // =========================================================================
@@ -2642,6 +2766,7 @@ public final class LineFollowerPipeline {
             // over it) or briefly unreadable: hold the last output for a few frames.
             final float edgeZone = Math.max(lastTrackWidthPx, 0.12f * W);
             final boolean midImage = filter && predX > edgeZone && predX < W - edgeZone;
+            lostMidImageNow = midImage;   // Phase 2 trend hold: hidden mid-image, not an edge exit
             if (midImage && holdFrames < cfg.trackHoldFrames) {
                 holdFrames++;
                 held          = true;
@@ -4431,6 +4556,7 @@ public final class LineFollowerPipeline {
         d.rowBaseValidGroups   = live && rw ? rwValidGroups : 0;
         d.rowBaseUsed          = live && rw && rwUsed;
         d.rowBaseDiscontinuity = live && rw && rwLow && output.trackFound;
+        d.trendState           = live ? trState : TREND_TRACKING;
         frameCallback.onFrame(d);
     }
 
