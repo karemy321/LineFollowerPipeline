@@ -222,6 +222,23 @@ public class MainActivity extends AppCompatActivity {
     private int  profFrameCount    = 0;    // frames accumulated in current window
     private long lastPipeNs        = 0L;   // pipeline time of the current frame
 
+    // ── Latency measurement: camera sensor → output vector (logcat "LAT") ──
+    // Per processed frame, on the elapsedRealtime clock (the camera's timestamp base when
+    // SENSOR_INFO_TIMESTAMP_SOURCE = REALTIME, logged at start):
+    //   sensor → app   : start of exposure (ImageInfo timestamp) → analyzer called
+    //                    (exposure + readout + ISP + CameraX buffering)
+    //   app → vector   : analyzer called → processFrameYuv420 returned [steer, power]
+    //   sensor → vector: the whole chain
+    //   output interval: time between two output vectors (→ output rate in Hz)
+    // Summary every LAT_WINDOW frames; preallocated, no per-frame allocation.
+    private static final boolean MEASURE_LATENCY = true;
+    private static final int     LAT_WINDOW      = 150;   // ~5 s at 30 fps
+    private final long[] latSensorApp = new long[LAT_WINDOW], latAppOut = new long[LAT_WINDOW],
+                         latTotal = new long[LAT_WINDOW], latInterval = new long[LAT_WINDOW],
+                         latScratch = new long[LAT_WINDOW];
+    private int  latN = 0;
+    private long latPrevOutNs = 0L;
+
     // =========================================================================
     //  Lifecycle
     // =========================================================================
@@ -472,6 +489,8 @@ public class MainActivity extends AppCompatActivity {
 
     private void analyzeFrame(ImageProxy imageProxy) {
         final long frameStartNs = System.nanoTime();
+        final long latEntryNs   = android.os.SystemClock.elapsedRealtimeNanos();   // latency: app entry
+        final long latSensorNs  = imageProxy.getImageInfo().getTimestamp();        // latency: exposure start
         try {
             final int width  = imageProxy.getWidth();
             final int height = imageProxy.getHeight();
@@ -531,6 +550,7 @@ public class MainActivity extends AppCompatActivity {
                 // Run the library — returns [steering, tracking]. Overlay + HUD are
                 // updated from the FrameCallback fired inside this call.
                 final int[] result = pipeline.processFrameYuv420(yFrame, uFrame, vFrame, width, height);
+                if (MEASURE_LATENCY) recordLatency(latSensorNs, latEntryNs, android.os.SystemClock.elapsedRealtimeNanos());
                 if (VERBOSE) Log.d(TAG, "S=" + result[0] + "  T=" + result[1]);
             }
             lastPipeNs = System.nanoTime() - pipeStartNs;   // pipeline only (no plane copies)
@@ -540,6 +560,39 @@ public class MainActivity extends AppCompatActivity {
         } finally {
             imageProxy.close();
         }
+    }
+
+    /** Latency measurement (MEASURE_LATENCY): one processed frame; logs a summary every LAT_WINDOW. */
+    private void recordLatency(long sensorNs, long entryNs, long outNs) {
+        latSensorApp[latN] = entryNs - sensorNs;
+        latAppOut[latN]    = outNs - entryNs;
+        latTotal[latN]     = outNs - sensorNs;
+        latInterval[latN]  = latPrevOutNs != 0L ? outNs - latPrevOutNs : -1L;
+        latPrevOutNs = outNs;
+        if (++latN < LAT_WINDOW) return;
+        latN = 0;
+        Log.i(TAG, "LAT " + LAT_WINDOW + " frames (ms: mean / median / p95 / max):  "
+                + "sensor->app " + latStats(latSensorApp) + "   app->vector " + latStats(latAppOut)
+                + "   sensor->vector " + latStats(latTotal) + "   output interval " + latStats(latInterval)
+                + "   output rate " + String.format(Locale.US, "%.1f Hz", 1000.0 / latMeanMs(latInterval)));
+    }
+
+    private String latStats(long[] v) {
+        int n = 0;
+        for (long x : v) if (x >= 0L) latScratch[n++] = x;
+        if (n == 0) return "n/a";
+        java.util.Arrays.sort(latScratch, 0, n);
+        long sum = 0L;
+        for (int i = 0; i < n; i++) sum += latScratch[i];
+        return String.format(Locale.US, "%.1f / %.1f / %.1f / %.1f",
+                sum / (double) n / 1e6, latScratch[n / 2] / 1e6,
+                latScratch[Math.min(n - 1, (int) Math.ceil(0.95 * n) - 1)] / 1e6, latScratch[n - 1] / 1e6);
+    }
+
+    private double latMeanMs(long[] v) {
+        long sum = 0L; int n = 0;
+        for (long x : v) if (x >= 0L) { sum += x; n++; }
+        return n > 0 ? sum / (double) n / 1e6 : Double.NaN;
     }
 
     /** Copy the Y plane into {@code dst} (width × height, no padding). */
@@ -865,6 +918,12 @@ public class MainActivity extends AppCompatActivity {
         if (camera == null) return;
         try {
             final Camera2CameraInfo info = Camera2CameraInfo.from(camera.getCameraInfo());
+            if (MEASURE_LATENCY) {   // the latency measurement needs sensor timestamps on elapsedRealtime
+                final Integer tsSrc = info.getCameraCharacteristic(CameraCharacteristics.SENSOR_INFO_TIMESTAMP_SOURCE);
+                Log.i(TAG, "LAT timestamp source: " + (tsSrc == null ? "unknown"
+                        : tsSrc == CameraCharacteristics.SENSOR_INFO_TIMESTAMP_SOURCE_REALTIME
+                        ? "REALTIME (sensor->app is valid)" : "UNKNOWN (sensor->app is NOT comparable)"));
+            }
             final float[] focal = info.getCameraCharacteristic(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS);
             final android.util.SizeF phys = info.getCameraCharacteristic(CameraCharacteristics.SENSOR_INFO_PHYSICAL_SIZE);
             final Size pix = info.getCameraCharacteristic(CameraCharacteristics.SENSOR_INFO_PIXEL_ARRAY_SIZE);
