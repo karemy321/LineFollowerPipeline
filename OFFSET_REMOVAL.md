@@ -172,14 +172,230 @@ from the same checkout, so nothing else needs to be switched.
 
 ---
 
+## Phase 1 Report (Discovery and Measurement)
+
+No code was changed. Line numbers refer to
+`LineFollowerLibrary/src/main/java/com/example/linefollower/LineFollowerPipeline.java` at the tag.
+
+### 1. Where the offset is defined and used
+
+**There is no fixed offset value.** The "offset" is the calibrated straight-ahead column
+`steerRefX` (pixels, image column):
+- `:1237` init: `steerRefX = width * 0.5f`, the image centre, until calibrated.
+- `:1422–1442` calibration: the line's centroid in the steering strip is sampled on
+  `calibFrames = 10` frames, and `steerRefX` = their **median**. The robot is placed with its
+  centre over a straight line (`ROBOT_TEST_CHECKLIST.md` step 6), so the line's position in the
+  image at that moment becomes "straight ahead".
+- `:1445` derived from it: `trackRefX = W/2 + (steerRefX − W/2) × laPerspectiveRatio`, the same
+  offset projected to the look-ahead row.
+
+The offset is `steerRefX − W/2` px, re-learned every calibration and every RECALIBRATE.
+
+**Every use of `steerRefX` and what it affects**
+
+| Line | Use | Affects |
+|---|---|---|
+| 2837, 4061 | `offsetTerm = (centroid − steerRefX) / halfW × 100` (v2 strip path and v3 corridor path) | **steering error**, the main use |
+| 2586, 2619, 3124–3125 | `findBand(…, steerRefX, …)`: preferred column when searching or re-acquiring the line, and in the continuity check | **search** and **lock** (which band is taken) |
+| 2610 | `scoreBand(…, steerRefX, …)` lock-correction score | **lock** (relock) |
+| 2745–2747, 2784–2786, 4035 | edge pin: side = `lastCentroidX ≥ steerRefX`, gate parked at `steerRefX ± halfW` | **edge-exit** side choice and gate park position. The pinned steering is ±100 either way. |
+| 2703 | glare pin: take the line back only on the pinned side, relative to `steerRefX` | **glare / edge exit** |
+| 2821 | look-ahead X when there is no look-ahead = `steerRefX` | **tracking** (power) fallback |
+| 2982 | `predictedSteering`: `xRef` = `steerRefX` on the floor | **pin cap** steering under glare |
+| 2863, 4195 via `trackRefX` | `intersection = |lookAheadX − trackRefX| / span` | **tracking (power)**: power = 100 − intersection |
+| 4496 → app `OverlayView:223, 264, 309` | `FrameData.steerRefXFrac` / `trackRefXFrac` | **HUD / overlay**: the dashed reference line and the steering marker |
+
+**Not affected:** the corridor Kalman state (`kx`, floor coordinates around the optical axis,
+`:3262`, `:3896–3902`), the edge zones (`edgeZone` from the image edges, `:2766`), the colour,
+width and level calibration, the glare mask, the trend hold, and the row-wise base geometry.
+
+### 2. What the offset compensates for
+
+`steerRefX` takes in **everything** that puts the line off-centre at calibration:
+1. the camera's sideways position (the intended part);
+2. camera yaw, as forward distance to the strip × tan(yaw). The strip is ≈ 9.7 cm ahead of the
+   camera (geometry below), so 1° of yaw ≈ 0.17 cm ≈ 5 px;
+3. any placement error of the robot at calibration.
+
+**Camera rotation is also compensated separately**, by `headingRefDeg` (`:1448–1452`): the
+median line heading at calibration becomes heading zero, used if |h| ≤ 10°
+(`steerHeadingCalibMaxDeg`). It is subtracted in the heading term (`:2843`, `:4070`).
+
+**Conclusion:** if only `steerRefX` is moved to the centre and `headingRefDeg` is kept, the
+robot **does not drive at an angle**. In steady state, steering is 0 when the offset term and the
+heading term are both 0: the robot is parallel to the line (heading = calibrated zero) and the
+line crosses the strip at the image centre. The robot centre then runs parallel to the tape,
+shifted by camera offset + 9.7 cm × tan(yaw).
+
+### 3. Image orientation: which side the line appears on today
+
+**Not measurable here:** the phone is not connected, there are no robot recordings in the repo,
+and the app does not log `steerRefX`. Expected from the code: back camera, portrait, forward = up,
+no mirroring, and `offsetTerm > 0` = turn right. A camera to the right of the robot centre sees
+the line to its **left**, so `steerRefX < 360`. This matches "line left of centre".
+**To confirm on the robot:** after calibration, the overlay draws the dashed vertical reference
+line at `steerRefX`. Check whether it is left of the image centre, and how far.
+
+### 4. Margins at the steering strip (frame 720 × 960, strip rows 696–720)
+
+Half width = 360 px. With the offset `d = 360 − steerRefX` px (line left of centre):
+
+| | left margin | right margin | worst case |
+|---|---|---|---|
+| today | 360 − d px | 360 + d px | 360 − d px (left turns lose the line first) |
+| offset 0 | 360 px (100 %) | 360 px (100 %) | 360 px |
+| gain | | | **+d px = +d/360 of half width** on the weaker side, −d px on the stronger side |
+
+Examples: d = 20 px → 94 % / 106 %, gain 5.6 %; d = 40 px → 89 % / 111 %, gain 11 %;
+d = 60 px → 83 % / 117 %, gain 17 %; d = 80 px → 78 % / 122 %, gain 22 %.
+The real d comes from the robot (item 3).
+
+### 5. Physical shift
+
+From the camera height 20 cm and tilt 45° (`ROBOT_TEST_CHECKLIST.md`), at the strip (row 708):
+
+| FOV used | cm per px | floor half width | strip distance ahead of camera |
+|---|---|---|---|
+| real vFOV 72.5° (logged on the phone) | **0.032 cm/px** | 11.5 cm | 9.7 cm |
+| config 60° (what the pipeline assumes) | 0.027 cm/px | 9.6 cm | |
+
+The robot centre's shift from the line after the change ≈ the camera's sideways distance from the
+robot centre line (about d × 0.032 cm, e.g. 40 px ≈ 1.3 cm, 60 px ≈ 1.9 cm). Measuring the
+camera-to-centre distance with a ruler gives it directly. Yaw adds 0.17 cm per degree.
+
+### 6. Report only: does the code slow down in sharp turns?
+
+Yes, but by **look-ahead lean and visible road**, not by the steering value:
+- `:2860–2869` and `farIntersection :4191`: intersection = |look-ahead X − trackRefX| /
+  (halfW × `trackOffsetFullFrac` = 1.0) × 100, raised by `trackLengthSlowdown` (true, with
+  `trackLengthFullFrac` = 0.8) when less road is visible. In v3 the curve sharpness `curveC` also
+  enters.
+- `:1494`: tracking = max(`trackingMinValue` = 5, 100 − intersection). README: hard turn → 5–30.
+- The robot's Blockly program uses it only with x = 1:
+  motor power = round(x × Power / 8 + 5). At x = 0 (the recommended mode at our speed), **power
+  is constant** and nothing slows down in turns. Which x runs on the robot is not in this repo.
+- Related: tracking uses `trackRefX`. If `steerRefX` changed without it, a straight line would
+  read as a lean and lower the power. That is why both must move together.
+
+### 7. Proposed minimal change for Phase 2
+
+The pipeline has no config value for the offset, so **one small pipeline change is needed**. It is
+done at the source, so all the uses above stay consistent:
+
+- Library `Config`: `public float steerRefOffsetScale = 1.0f;` (1 = the calibrated offset,
+  original; 0 = no offset, steer the line to the image centre).
+- Calibration, `:1442–1445` only:
+  `steerRefX = scale == 1f ? median : W/2 + (median − W/2) × scale;` and `trackRefX` from it, as
+  today. With 1.0, the code path is the original one, so the output is byte-identical.
+- `headingRefDeg` (the yaw zero), the colour, width and level calibration: **unchanged**.
+- App `MainActivity`: `CAMERA_OFFSET_SCALE_ORIGINAL = 1.0f`,
+  `CAMERA_OFFSET_SCALE = 0.0f`, passed as `cfg.steerRefOffsetScale`. To revert, set
+  `CAMERA_OFFSET_SCALE = CAMERA_OFFSET_SCALE_ORIGINAL`.
+
+**Rejected alternative:** changing only the steering formula (`offsetTerm`). The search
+preference, the edge-pin side, the glare take-back side and the power reference would still use
+the old column, and a straight line would read as a lean (lower power).
+
+---
+
+## Phase 2 Report (Offset Removed)
+
+### The change (3 + 3 lines)
+
+- Library `Config`: `public float steerRefOffsetScale = 1.0f;` (with a comment).
+- Library calibration, right after the median:
+  `if (cfg.steerRefOffsetScale != 1f) steerRefX = W/2 + (steerRefX − W/2) × scale;`
+  At 1.0 the original line runs alone. `trackRefX` is computed from `steerRefX` on the next line,
+  as before. `headingRefDeg` is unchanged.
+- App `MainActivity`: `CAMERA_OFFSET_SCALE_ORIGINAL = 1.0f`, `CAMERA_OFFSET_SCALE = 0.0f`,
+  `cfg.steerRefOffsetScale = CAMERA_OFFSET_SCALE`.
+
+### Verification in the simulator (robot configuration)
+
+Robot-like closed loop: frame 720 × 960, real vFOV 72.5° rendered (config 60°), 30 fps, camera
+20 cm high, 45°, 8 cm ahead of the axle, mounted 1, 2 or 3 cm right of the centre line.
+Row-wise base 48 and trend hold on. The robot calibrates with its centre over the line, then the
+lecturer's Blockly law drives it. Two colour schemes, with and without distractors, c = 0.5 / 1.0,
+x = 0 / 1. 144 runs per cell. Harness: `_investigation/harness` (copied to the scratchpad and
+extended with frame size, camera offset, FOV, fps, left/right turn tracks and pin counting).
+- **real:** 150 ms latency, 30 Hz, dead zone 2, power 5 ≈ 5 cm/s.
+- **stress:** 3× faster, 200 ms, 15 Hz, dead zone 3.
+- **glare:** real, plus glare over the strip in 3 lamp zones.
+
+**1. Original value (1.0): identical to the baseline tag.**
+- Closed loop: all 1,296 runs (3 regimes × 3 offsets × 144) give the same CSV as
+  `robot-approved-before-offset-removal`, timing column excluded.
+- Frame by frame: every FrameData field and every output, 304 drives, 320 × 240, 720 × 1280
+  and 720 × 960, gray and YUV, with glare and gaps, robot config: **byte-identical** to the baseline (152 drives at 320 × 240 / 720 × 1280 and 32 at 720 × 960, at the default and with 1.0 set explicitly). At 0 the same 180 HOLD frames occur in the 720 × 960 set.
+
+**2. Offset 0, before → after.** Cells: runs finished / runs, then line-lost events. Left 90° and
+right 90° are 90° corners of radius 4, 10 and 20 cm; S = two 25 cm 90° arcs.
+
+| Regime | cam offset | Left 90° | Right 90° | S, left first | S, right first | Straight (steer std / pins) |
+|---|---|---|---|---|---|---|
+| real | 1 cm | 41/48, 34 → 46/48, 17 | 47/48, 17 → 46/48, 20 | 16/16, 0 → 16/16, 0 | 16/16, 0 → 16/16, 0 | 0.56 / 0 → 0.85 / 0 |
+| real | 2 cm | 43/48, 41 → 43/48, 28 | 47/48, 17 → 46/48, 15 | 16/16, 0 → 16/16, 0 | 16/16, 0 → 16/16, 0 | 0.44 / 0 → 1.17 / 0 |
+| real | 3 cm | 43/48, 32 → 46/48, 14 | 48/48, 11 → 45/48, 18 | 16/16, 0 → 16/16, 0 | 16/16, 0 → 16/16, 0 | 0.30 / 0 → 1.50 / 0 |
+| stress | 1 cm | 36/48, 67 → 37/48, 53 | 36/48, 56 → 36/48, 62 | 15/16, 13 → 11/16, 19 | 14/16, 20 → 15/16, 30 | 4.15 / 3 → 11.05 / 28 |
+| stress | 2 cm | 34/48, 77 → 35/48, 62 | 37/48, 63 → 36/48, 69 | 13/16, 17 → 12/16, 29 | 12/16, 21 → 15/16, 33 | 4.00 / 4 → 12.37 / 28 |
+| stress | 3 cm | 32/48, 87 → 36/48, 53 | 37/48, 64 → 37/48, 64 | 13/16, 20 → 11/16, 22 | 12/16, 20 → 16/16, 22 | 4.08 / 3 → 13.40 / 36 |
+| glare | 1 cm | 20/48, 384 → 25/48, 366 | 28/48, 459 → 28/48, 474 | 8/16, 206 → 9/16, 271 | 9/16, 296 → 10/16, 277 | 0.73 / 0 → 0.94 / 0 |
+| glare | 2 cm | 21/48, 275 → 32/48, 295 | 38/48, 250 → 29/48, 248 | 9/16, 253 → 9/16, 223 | 6/16, 272 → 10/16, 241 | 0.60 / 0 → 1.23 / 0 |
+| glare | 3 cm | 18/48, 304 → 27/48, 384 | 33/48, 346 → 27/48, 457 | 11/16, 226 → 9/16, 227 | 8/16, 267 → 9/16, 293 | 0.48 / 0 → 1.55 / 0 |
+
+**What it shows**
+- **Left turns improve** (the side that had the small margin): in real, lost events fall by
+  32–56 % and finished runs go up at 1 and 3 cm. Under glare, finished runs go +5, +11 and +9.
+- **Right turns get somewhat worse** (the side that had the extra margin): in real, −1 to −3
+  finished runs. Under glare at 2–3 cm, −9 and −6. This is the trade-off the doc expected.
+- **Straight line:** the larger std is the **start-up correction** after calibration: the robot
+  moves the camera over the line, 1–3 cm sideways. Started with the camera already over the line,
+  the straight steady state equals the baseline:
+
+  | real, straight 2 m + 3 m | baseline | offset 0, camera over the line at start |
+  |---|---|---|
+  | 1 cm: steer std / max / sign changes per s | 0.58 / 1.16 / 0.12 | 0.59 / 1.20 / 0.13 |
+  | 2 cm | 0.46 / 0.90 / 0.04 | 0.57 / 1.01 / 0.07 |
+  | 3 cm | 0.32 / 0.73 / 0.01 | 0.47 / 0.92 / 0.03 |
+
+  The stress-regime straight weave (std 11–13, pins) appears only with x = 1 (power follows
+  Tracking, about 0.5 m/s). The **baseline weaves the same way** after the same 2 cm kick
+  (std 11–13 with c = 0.5, 35 with c = 1.0): the fast loop is marginal on its own (README: keep
+  x = 0 at that speed). The start-up correction only triggers it.
+- The robot centre runs parallel to the tape, shifted by the camera offset: mean lateral error on
+  the straight is 0.89 / 1.76 / 2.64 cm for 1 / 2 / 3 cm, as intended.
+- **Trend hold, glare coast, edge-exit pin:** unchanged code, and identical at 1.0. At 0 they keep
+  working: pins and holds still occur (pin events above).
+
+### Build and tests
+
+- App `assembleDebug`: builds.
+- Library tests: **64 tests, 63 pass, 1 skipped, 0 failures**, the same counts as the baseline (52 original + 5 SteeringBaseTest + 7 TrendHoldTest). No test assumes the original offset, and none needed changing.
+- Note: the first full run had 1 failure in `RecorderTest.recorderOffChangesNothingAndWritesNothing` (tracking 82 vs 83 on frame 71). It ran while 4 simulator jobs loaded the CPU. That test does not set `frameIntervalMs`, so its coast and hold clocks use the wall clock. It passed 3 / 3 alone and in the full run on an idle CPU. It is a pre-existing timing sensitivity, not caused by this change (the default path is byte-identical).
+
+---
+
 ## Progress Tracking
 
-- [ ] Phase 0: State saved and tagged, configuration recorded, approved
+- [x] Phase 0: State saved and tagged, configuration recorded, approved
   - [x] Working tree clean (latency code committed as `083518d`; `answer.txt` left untracked by choice)
   - [x] Configuration recorded (above)
   - [x] Tag `robot-approved-before-offset-removal` created on `083518d` and pushed
   - [x] Branch `offset-removal` created (one repo, so one branch)
-  - [ ] Approved
-- [ ] Phase 1: Discovery and measurement report delivered, change approved
-- [ ] Phase 2: Offset removed, verified in the simulator, approved
+  - [x] Approved
+- [x] Phase 1: Discovery and measurement report delivered, change approved
+  - [x] Report delivered (above)
+  - [ ] Real offset d and line side read from the robot overlay (optional, by you)
+  - [x] Proposed change approved
+- [x] Phase 2: Offset removed, verified in the simulator, approved
+  - [x] Change made (library 1 field + 2 lines, app 2 constants + 1 line)
+  - [x] 1.0 byte-identical to the baseline (closed loop and frame by frame)
+  - [x] Comparison table (left / right / straight) delivered
+  - [x] Build and tests pass (64: 63 pass, 1 skipped)
+  - [x] Approved
 - [ ] Phase 3: Docs, checklist, commit and push
+  - [x] Version: tag `v6.2.0` only (app `versionCode` stays 1, as in earlier rounds), as you chose
+  - [x] `CHANGES.md` created in the root (no CHANGES.md existed): what, why, values, margin gain, revert
+  - [x] Robot test checklist (in `CHANGES.md`)
+  - [x] Committed and pushed on `offset-removal`, tag `v6.2.0` pushed, not merged to main
+  - [ ] Approved

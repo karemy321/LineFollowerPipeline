@@ -119,6 +119,11 @@ public class MainActivity extends AppCompatActivity {
     //   USE_TREND_HOLD = false  exactly the original output
     private static final boolean USE_TREND_HOLD   = true;
     private static final float   HOLD_POWER_SCALE = 1.0f;   // < 1 = slower while holding
+    // Camera offset removal (OFFSET_REMOVAL.md): 1 = steer the robot centre over the line
+    // (calibrated offset, original), 0 = steer the camera over the line.
+    // To revert: CAMERA_OFFSET_SCALE = CAMERA_OFFSET_SCALE_ORIGINAL.
+    private static final float   CAMERA_OFFSET_SCALE_ORIGINAL = 1.0f;
+    private static final float   CAMERA_OFFSET_SCALE          = 0.0f;
     private volatile float     measuredVFovDeg = 0f;
     private volatile float     measuredHFovDeg = 0f;
     private boolean            fovRequested    = false;   // camera thread
@@ -516,6 +521,7 @@ public class MainActivity extends AppCompatActivity {
                 cfg.rowWiseBaseRows     = ROW_WISE_BASE_ROWS;       // Phase 1
                 cfg.useTrendHold        = USE_TREND_HOLD;           // Phase 2
                 cfg.holdPowerScale      = HOLD_POWER_SCALE;         // Phase 2
+                cfg.steerRefOffsetScale = CAMERA_OFFSET_SCALE;      // offset removal
                 cfg.vRoiHalfWidthPx  = 80;
                 cfg.cameraTiltDeg    = 45f;
                 cfg.verticalFovDeg   = APP_VFOV_DEG;   // still the guess; see computeFieldOfView()
