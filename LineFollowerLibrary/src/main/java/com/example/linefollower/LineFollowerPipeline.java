@@ -411,6 +411,12 @@ public final class LineFollowerPipeline {
         // the robot was then clearly not placed straight on a straight line.
         public float steerHeadingCalibMaxDeg = 10f;
 
+        // Camera offset (OFFSET_REMOVAL.md): how much of the calibrated straight-ahead column's
+        // distance from the image centre is kept. 1 = the calibrated column (original);
+        // 0 = the image centre, so the camera runs over the line and the robot centre parallel
+        // to it. The heading zero (yaw) above is kept either way.
+        public float steerRefOffsetScale = 1.0f;
+
         // ── Track value (look-ahead position) calibration ───────────────────
         // The tracking output is derived from STEERING applied to the LOOK-AHEAD —
         // the V-ROI in front of the robot — using the same band-lock memory as
@@ -1440,6 +1446,8 @@ public final class LineFollowerPipeline {
                     java.util.Arrays.sort(calibWidthSamples, 0, n);
                     java.util.Arrays.sort(calibLevelSamples, 0, n);
                     steerRefX    = calibSteerSamples[n / 2];                // robust median
+                    if (cfg.steerRefOffsetScale != 1f)                       // camera offset removal
+                        steerRefX = imgW * 0.5f + (steerRefX - imgW * 0.5f) * cfg.steerRefOffsetScale;
                     calibWidthPx = calibWidthSamples[n / 2];
                     calibLevel   = calibLevelSamples[n / 2];
                     trackRefX    = imgW * 0.5f + (steerRefX - imgW * 0.5f) * laPerspectiveRatio;
